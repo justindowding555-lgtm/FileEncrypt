@@ -39,6 +39,7 @@ function clearAlert() {
 
 function applyStatus(status, updatePath) {
   state.keyLoaded = Boolean(status.keyLoaded);
+  $("fingerprint").classList.toggle("is-loaded", state.keyLoaded);
   if (updatePath && status.keyPath) {
     $("key-path").value = status.keyPath;
   }
@@ -51,8 +52,8 @@ function applyStatus(status, updatePath) {
   $("key-message").textContent =
     status.message ||
     (status.keyLoaded
-      ? "This key is in memory for encrypt and decrypt."
-      : "Create a key file, or load one you already have.");
+      ? "Ready to encrypt or decrypt your files."
+      : "Choose a key to get started.");
   renderControls();
 }
 
@@ -72,6 +73,15 @@ function renderControls() {
   $("choose-output").disabled = state.busy;
   $("clear-output").disabled = state.busy || $("output-dir").value.trim() === "";
   $("file-count").textContent = noFiles ? "" : `(${state.files.length})`;
+  $("action-hint").textContent = state.busy
+    ? "Working. Please wait…"
+    : !state.keyLoaded && noFiles
+      ? "Load a key and add files to get started."
+      : !state.keyLoaded
+        ? "Load a key to continue."
+        : noFiles
+          ? "Add files to continue."
+          : `${state.files.length} ${state.files.length === 1 ? "file" : "files"} ready to encrypt or decrypt.`;
   renderOutputHint();
 }
 
@@ -111,6 +121,7 @@ function renderFiles() {
 
     const remove = document.createElement("button");
     remove.type = "button";
+    remove.className = "text-button";
     remove.textContent = "Remove";
     remove.disabled = state.busy;
     remove.setAttribute("aria-label", `Remove ${baseName(path)}`);

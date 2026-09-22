@@ -10,107 +10,109 @@
   <body>
     <div class="app">
       <header class="brand">
-        <span class="seal" aria-hidden="true">Fe</span>
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5" y="10" width="14" height="11" rx="2" />
+            <path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3" />
+          </svg>
+        </span>
         <div>
           <h1>FileEncrypt</h1>
-          <p class="lede">AEGIS-256 for the files you choose. The key lives in a file this window can write.</p>
+          <p class="lede">Your files. Only your key.</p>
         </div>
+        <span class="brand-note">Local file encryption</span>
       </header>
 
-      <div id="alert" class="alert" role="alert" hidden></div>
-
-      <div class="workspace">
-        <section class="panel" aria-labelledby="key-heading">
-          <h2 id="key-heading">Key</h2>
-          <p class="sub">Anyone who can read the key file can decrypt. There is no recovery if it is lost.</p>
-          <label class="field-label" for="key-path">Key file</label>
-          <div class="row">
-            <input
-              id="key-path"
-              type="text"
-              spellcheck="false"
-              autocomplete="off"
-              placeholder="Path the app should read and write"
-            />
-          </div>
-          <div class="row">
-            <button type="button" id="set-path">Set path…</button>
-            <button type="button" id="browse-load">Browse and load…</button>
-          </div>
-          <div class="row">
-            <button type="button" class="primary" id="generate">Generate and save</button>
-            <button type="button" id="load">Load</button>
-            <button type="button" id="unload">Unload</button>
-          </div>
-          <p id="fingerprint" class="fingerprint" aria-live="polite">No key loaded</p>
-          <p id="key-message" class="message" aria-live="polite"></p>
-
-          <details>
-            <summary>Set a specific key</summary>
-            <p class="sub">
-              Paste 32 bytes as 64 hex characters or standard base64. A typed key passes through this window, so prefer Generate and save.
-            </p>
-            <label class="field-label" for="key-text">Key</label>
-            <div class="row">
-              <input
-                id="key-text"
-                type="password"
-                spellcheck="false"
-                autocomplete="off"
-                autocapitalize="off"
-                autocorrect="off"
-              />
-              <button type="button" id="save-typed">Write key to file</button>
+      <main>
+        <div id="alert" class="alert" role="alert" hidden></div>
+        <div class="workspace">
+          <section class="panel key-panel" aria-labelledby="key-heading">
+            <div class="section-head">
+              <h2 id="key-heading">Encryption key</h2>
+              <span class="step" aria-hidden="true">01</span>
             </div>
-          </details>
-        </section>
+            <p class="sub section-description">Create a key or open an existing one.</p>
+            <div class="key-status">
+              <p id="fingerprint" class="fingerprint" aria-live="polite">No key loaded</p>
+              <p id="key-message" class="message" aria-live="polite"></p>
+            </div>
+            <div class="key-actions">
+              <button type="button" id="generate">Generate and save</button>
+              <button type="button" id="browse-load">Browse and load</button>
+            </div>
+            <p class="key-note">Keep your key file safe. Anyone with it can decrypt your files. A lost key cannot be recovered.</p>
+            <details class="key-options">
+              <summary>Key options</summary>
+              <div class="details-content">
+                <label class="field-label" for="key-path">Key file path</label>
+                <input id="key-path" type="text" spellcheck="false" autocomplete="off" placeholder="Choose or enter a path" />
+                <div class="row path-actions">
+                  <button type="button" id="set-path">Set path</button>
+                  <button type="button" id="load">Load</button>
+                  <button type="button" id="unload" disabled>Unload</button>
+                </div>
+                <details>
+                  <summary>Use a specific key</summary>
+                  <div class="details-content">
+                    <p class="sub">Enter 64 hex characters or 32 bytes in standard base64. Prefer generating a key to keep it out of this window.</p>
+                    <label class="field-label" for="key-text">Key</label>
+                    <input id="key-text" type="password" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" />
+                    <button type="button" class="typed-key-button" id="save-typed">Write key to file</button>
+                  </div>
+                </details>
+              </div>
+            </details>
+          </section>
 
-        <section class="panel" aria-labelledby="files-heading">
+          <section class="panel files-panel" aria-labelledby="files-heading">
+            <div class="section-head">
+              <h2 id="files-heading">Files <span id="file-count"></span></h2>
+              <span class="step" aria-hidden="true">02</span>
+            </div>
+            <div class="file-toolbar">
+              <p class="sub">Choose the files you want to protect or restore.</p>
+              <button type="button" id="add-files"><span aria-hidden="true">+</span> Add files</button>
+            </div>
+            <div id="file-empty" class="empty">
+              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9zM14 3v6h6M8 13h8M8 17h5" />
+              </svg>
+              <p>No files selected</p>
+              <span>Add one file or several at once.</span>
+            </div>
+            <ul id="file-list" class="file-list" aria-label="Selected files"></ul>
+            <div class="output-settings">
+              <div class="section-head output-heading">
+                <label class="field-label" for="output-dir">Save to</label>
+                <button type="button" class="text-button" id="clear-output" disabled>Reset to original folders</button>
+              </div>
+              <div class="row output-row">
+                <input id="output-dir" type="text" spellcheck="false" autocomplete="off" placeholder="Same folder as each file" aria-describedby="output-hint" />
+                <button type="button" id="choose-output">Choose folder</button>
+              </div>
+              <p id="output-hint" class="sub output-hint">Encrypted files get a random name. Decryption restores the original name.</p>
+            </div>
+            <div class="checks">
+              <label class="check"><input id="overwrite" type="checkbox" />Replace existing output files</label>
+              <label class="check"><input id="remove-original" type="checkbox" />Delete originals after success</label>
+            </div>
+            <div class="actions">
+              <button type="button" class="primary" id="encrypt" disabled>Encrypt files</button>
+              <button type="button" id="decrypt" disabled>Decrypt files</button>
+              <button type="button" class="text-button" id="clear-files" disabled>Clear list</button>
+            </div>
+            <p id="action-hint" class="action-hint" aria-live="polite">Load a key and add files to get started.</p>
+          </section>
+        </div>
+        <section class="results-panel" aria-labelledby="results-heading">
           <div class="section-head">
-            <h2 id="files-heading">Files <span id="file-count"></span></h2>
-            <button type="button" class="primary" id="add-files">Add files…</button>
+            <h2 id="results-heading">Activity</h2>
+            <p id="result-summary" class="sub" aria-live="polite">No activity yet</p>
           </div>
-          <p id="file-empty" class="empty">No files yet. Add several at once.</p>
-          <ul id="file-list" class="file-list"></ul>
-
-          <label class="field-label" for="output-dir">Save to</label>
-          <div class="row">
-            <input
-              id="output-dir"
-              type="text"
-              spellcheck="false"
-              autocomplete="off"
-              placeholder="Same folder as each file"
-            />
-            <button type="button" id="choose-output">Choose folder…</button>
-            <button type="button" id="clear-output">Beside originals</button>
-          </div>
-          <p id="output-hint" class="sub tight">Saved beside each original under a random name. Decrypt restores the original file name.</p>
-
-          <div class="checks">
-            <label class="check">
-              <input id="overwrite" type="checkbox" />
-              Replace an existing output file
-            </label>
-            <label class="check">
-              <input id="remove-original" type="checkbox" />
-              Delete originals after success
-            </label>
-          </div>
-
-          <div class="actions">
-            <button type="button" class="primary" id="encrypt" disabled>Encrypt</button>
-            <button type="button" class="decrypt" id="decrypt" disabled>Decrypt</button>
-            <button type="button" id="clear-files">Clear list</button>
-          </div>
+          <ul id="results" class="results"></ul>
         </section>
-      </div>
-
-      <section class="panel" aria-labelledby="results-heading">
-        <h2 id="results-heading">Results</h2>
-        <p id="result-summary" class="sub" aria-live="polite">Results appear here.</p>
-        <ul id="results" class="results"></ul>
-      </section>
+      </main>
+      <footer>Processed on your device <span aria-hidden="true">&middot;</span> AEGIS-256 encryption</footer>
     </div>
   </body>
 </html>
