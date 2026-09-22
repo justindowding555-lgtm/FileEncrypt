@@ -1,0 +1,37 @@
+[package]
+name = "file-encrypt"
+version = "0.1.0"
+description = "Encrypt files with a key stored on disk"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "file_encrypt_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes-gcm = { version = "0.10", features = ["stream", "zeroize"] }
+aegis = { version = "0.9", features = ["pure-rust"] }
+hkdf = "0.12"
+base64 = "0.22"
+sha2 = "0.10"
+zeroize = "1"
+thiserror = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

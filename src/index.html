@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FileEncrypt</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script type="module" src="/main.js" defer></script>
+  </head>
+  <body>
+    <div class="app">
+      <header class="brand">
+        <span class="seal" aria-hidden="true">Fe</span>
+        <div>
+          <h1>FileEncrypt</h1>
+          <p class="lede">AEGIS-256 for the files you choose. The key lives in a file this window can write.</p>
+        </div>
+      </header>
+
+      <div id="alert" class="alert" role="alert" hidden></div>
+
+      <div class="workspace">
+        <section class="panel" aria-labelledby="key-heading">
+          <h2 id="key-heading">Key</h2>
+          <p class="sub">Anyone who can read the key file can decrypt. There is no recovery if it is lost.</p>
+          <label class="field-label" for="key-path">Key file</label>
+          <div class="row">
+            <input
+              id="key-path"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="Path the app should read and write"
+            />
+          </div>
+          <div class="row">
+            <button type="button" id="set-path">Set path…</button>
+            <button type="button" id="browse-load">Browse and load…</button>
+          </div>
+          <div class="row">
+            <button type="button" class="primary" id="generate">Generate and save</button>
+            <button type="button" id="load">Load</button>
+            <button type="button" id="unload">Unload</button>
+          </div>
+          <p id="fingerprint" class="fingerprint" aria-live="polite">No key loaded</p>
+          <p id="key-message" class="message" aria-live="polite"></p>
+
+          <details>
+            <summary>Set a specific key</summary>
+            <p class="sub">
+              Paste 32 bytes as 64 hex characters or standard base64. A typed key passes through this window, so prefer Generate and save.
+            </p>
+            <label class="field-label" for="key-text">Key</label>
+            <div class="row">
+              <input
+                id="key-text"
+                type="password"
+                spellcheck="false"
+                autocomplete="off"
+                autocapitalize="off"
+                autocorrect="off"
+              />
+              <button type="button" id="save-typed">Write key to file</button>
+            </div>
+          </details>
+        </section>
+
+        <section class="panel" aria-labelledby="files-heading">
+          <div class="section-head">
+            <h2 id="files-heading">Files <span id="file-count"></span></h2>
+            <button type="button" class="primary" id="add-files">Add files…</button>
+          </div>
+          <p id="file-empty" class="empty">No files yet. Add several at once.</p>
+          <ul id="file-list" class="file-list"></ul>
+
+          <label class="field-label" for="output-dir">Save to</label>
+          <div class="row">
+            <input
+              id="output-dir"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="Same folder as each file"
+            />
+            <button type="button" id="choose-output">Choose folder…</button>
+            <button type="button" id="clear-output">Beside originals</button>
+          </div>
+          <p id="output-hint" class="sub tight">Saved beside each original under a random name. Decrypt restores the original file name.</p>
+
+          <div class="checks">
+            <label class="check">
+              <input id="overwrite" type="checkbox" />
+              Replace an existing output file
+            </label>
+            <label class="check">
+              <input id="remove-original" type="checkbox" />
+              Delete originals after success
+            </label>
+          </div>
+
+          <div class="actions">
+            <button type="button" class="primary" id="encrypt" disabled>Encrypt</button>
+            <button type="button" class="decrypt" id="decrypt" disabled>Decrypt</button>
+            <button type="button" id="clear-files">Clear list</button>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel" aria-labelledby="results-heading">
+        <h2 id="results-heading">Results</h2>
+        <p id="result-summary" class="sub" aria-live="polite">Results appear here.</p>
+        <ul id="results" class="results"></ul>
+      </section>
+    </div>
+  </body>
+</html>
