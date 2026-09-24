@@ -12,8 +12,10 @@ pub fn inspect_zip_bytes(bytes: &[u8]) -> Result<usize, String> {
         .map_err(|err| err.to_string())
 }
 
+#[cfg(not(fuzzing))]
 use tauri::Manager;
 
+#[cfg(not(fuzzing))]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
