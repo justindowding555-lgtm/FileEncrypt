@@ -4,12 +4,21 @@ mod commands;
 mod crypto;
 mod key_file;
 
+/// Parse an in-memory archive with the same checks used for files selected in the app.
+/// This entry point also lets the fuzz target exercise the parser without disk I/O.
+pub fn inspect_zip_bytes(bytes: &[u8]) -> Result<usize, String> {
+    archive_read::entries_from_reader(&mut std::io::Cursor::new(bytes))
+        .map(|entries| entries.len())
+        .map_err(|err| err.to_string())
+}
+
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(commands::AppState::default())
         .setup(|app| {
             commands::restore_saved_key(app.handle(), app.state::<commands::AppState>().inner());
@@ -33,6 +42,9 @@ pub fn run() {
             commands::preview_job,
             commands::run_job,
             commands::cancel_job,
+            commands::rotate_key,
+            commands::check_for_updates,
+            commands::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileEncrypt");

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_updater::UpdaterExt;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::archive;
@@ -46,6 +47,7 @@ pub struct AppStatus {
     output_dir: Option<String>,
     fingerprint: Option<String>,
     message: String,
+    updates_configured: bool,
 }
 
 #[derive(Serialize)]
@@ -56,15 +58,104 @@ pub struct FileOutcome {
     message: String,
 }
 
+#[derive(Serialize)]
+pub struct RotationReport {
+    results: Vec<FileOutcome>,
+    status: AppStatus,
+}
+
+const UPDATE_URL: &str =
+    "https://github.com/justindowding555-lgtm/FileEncrypt/releases/latest/download/latest.json";
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    version: String,
+    notes: Option<String>,
+}
+
+fn updater_key() -> Result<&'static str, String> {
+    option_env!("FILEENCRYPT_UPDATER_PUBKEY")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Signed updates are not configured in this build.".into())
+}
+
+#[tauri::command]
+pub async fn check_for_updates(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
+    let key = updater_key()?;
+    let endpoint = UPDATE_URL
+        .parse()
+        .map_err(|err| format!("Invalid update URL: {err}"))?;
+    let updater = app
+        .updater_builder()
+        .pubkey(key)
+        .endpoints(vec![endpoint])
+        .map_err(|err| err.to_string())?
+        .build()
+        .map_err(|err| err.to_string())?;
+    updater
+        .check()
+        .await
+        .map_err(|err| err.to_string())?
+        .map(|update| {
+            Ok(UpdateInfo {
+                version: update.version,
+                notes: update.body,
+            })
+        })
+        .transpose()
+}
+
+#[tauri::command]
+pub async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
+    if app.state::<AppState>().running.load(Ordering::Acquire) {
+        return Err("Finish the current file job before installing an update.".into());
+    }
+    let key = updater_key()?;
+    let endpoint = UPDATE_URL
+        .parse()
+        .map_err(|err| format!("Invalid update URL: {err}"))?;
+    let updater = app
+        .updater_builder()
+        .pubkey(key)
+        .endpoints(vec![endpoint])
+        .map_err(|err| err.to_string())?
+        .build()
+        .map_err(|err| err.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or("No newer signed update is available.")?;
+    let version = update.version.clone();
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(format!(
+        "Installed version {version}. Restart FileEncrypt to use it."
+    ))
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobRequest {
     paths: Vec<String>,
+    #[serde(default)]
+    folder_roots: HashMap<String, String>,
     output_dir: String,
     overwrite: bool,
     remove_original: bool,
     zip: bool,
+    #[serde(default)]
+    compress: bool,
     operation: String,
+}
+
+#[derive(Serialize)]
+pub struct SelectedPaths {
+    paths: Vec<String>,
+    roots: HashMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -153,7 +244,7 @@ pub async fn pick_input_files(app: tauri::AppHandle) -> Result<Vec<String>, Stri
 }
 
 #[tauri::command]
-pub async fn pick_input_folder(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+pub async fn pick_input_folder(app: tauri::AppHandle) -> Result<SelectedPaths, String> {
     let mut dialog = app.dialog().file();
     if let Some(window) = app.get_webview_window("main") {
         dialog = dialog.set_parent(&window);
@@ -162,15 +253,44 @@ pub async fn pick_input_folder(app: tauri::AppHandle) -> Result<Vec<String>, Str
         .set_title("Choose a folder of files")
         .blocking_pick_folder()
     else {
-        return Ok(Vec::new());
+        return Ok(SelectedPaths {
+            paths: Vec::new(),
+            roots: HashMap::new(),
+        });
     };
     let folder = picked.into_path().map_err(|err| err.to_string())?;
-    expand_paths(vec![folder.display().to_string()])
+    expand_paths_with_roots(vec![folder.display().to_string()])
 }
 
 #[tauri::command]
-pub fn expand_dropped_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
-    expand_paths(paths)
+pub fn expand_dropped_paths(paths: Vec<String>) -> Result<SelectedPaths, String> {
+    expand_paths_with_roots(paths)
+}
+
+fn expand_paths_with_roots(paths: Vec<String>) -> Result<SelectedPaths, String> {
+    let mut selection = SelectedPaths {
+        paths: Vec::new(),
+        roots: HashMap::new(),
+    };
+    for path in paths {
+        let root = PathBuf::from(&path);
+        let folder = fs::symlink_metadata(&root)
+            .map_err(|err| err.to_string())?
+            .is_dir();
+        let expanded = expand_paths(vec![path.clone()])?;
+        if folder {
+            for child in &expanded {
+                selection.roots.insert(child.clone(), path.clone());
+            }
+        }
+        selection.paths.extend(expanded);
+    }
+    selection.paths.sort();
+    selection.paths.dedup();
+    if selection.paths.len() > 10_000 {
+        return Err("Select fewer than 10,000 files at once.".into());
+    }
+    Ok(selection)
 }
 
 fn expand_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
@@ -234,8 +354,9 @@ pub async fn generate_key(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
-    mut passphrase: Option<String>,
+    passphrase: Option<String>,
 ) -> Result<AppStatus, String> {
+    let passphrase = passphrase.map(Zeroizing::new);
     let Some(path) = resolve_save_path(&app, &path)? else {
         set_message(&state, "Key file was not created.");
         return Ok(status(&state));
@@ -253,9 +374,6 @@ pub async fn generate_key(
     } else {
         key_file::write_key_file(&path, &key)
     };
-    if let Some(value) = passphrase.as_mut() {
-        value.zeroize();
-    }
     written.map_err(|err| err.to_string())?;
     let extra = remember_key(&app, &state, path, key);
     set_message(&state, format!("New key generated and saved.{extra}"));
@@ -268,8 +386,9 @@ pub async fn save_typed_key(
     state: tauri::State<'_, AppState>,
     path: String,
     mut key_text: String,
-    mut passphrase: Option<String>,
+    passphrase: Option<String>,
 ) -> Result<AppStatus, String> {
+    let passphrase = passphrase.map(Zeroizing::new);
     let parsed = key_file::parse_key_material(&key_text);
     key_text.zeroize();
     let key = parsed.map_err(|err| err.to_string())?;
@@ -289,9 +408,6 @@ pub async fn save_typed_key(
     } else {
         key_file::write_key_file(&path, &key)
     };
-    if let Some(value) = passphrase.as_mut() {
-        value.zeroize();
-    }
     written.map_err(|err| err.to_string())?;
     let extra = remember_key(&app, &state, path, key);
     set_message(&state, format!("Key written to the file.{extra}"));
@@ -303,51 +419,54 @@ pub async fn load_key(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
-    mut passphrase: Option<String>,
+    passphrase: Option<String>,
 ) -> Result<AppStatus, String> {
+    let passphrase = passphrase.map(Zeroizing::new);
     let path = path.trim().to_string();
     if path.is_empty() {
         return Err("Enter a key file path, or use Browse and load.".into());
     }
-    let result = finish_load(&app, &state, PathBuf::from(path), passphrase.as_deref());
-    if let Some(value) = passphrase.as_mut() {
-        value.zeroize();
-    }
-    result
+    finish_load(
+        &app,
+        &state,
+        PathBuf::from(path),
+        passphrase.as_deref().map(String::as_str),
+    )
 }
 
 #[tauri::command]
 pub async fn browse_key(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    mut passphrase: Option<String>,
+    passphrase: Option<String>,
 ) -> Result<AppStatus, String> {
+    let passphrase = passphrase.map(Zeroizing::new);
     let Some(path) = pick_open(&app)? else {
         set_message(&state, "No key file was opened.");
         return Ok(status(&state));
     };
-    let result = finish_load(&app, &state, path, passphrase.as_deref());
-    if let Some(value) = passphrase.as_mut() {
-        value.zeroize();
-    }
-    result
+    finish_load(
+        &app,
+        &state,
+        path,
+        passphrase.as_deref().map(String::as_str),
+    )
 }
 
 #[tauri::command]
 pub async fn backup_key(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    mut passphrase: Option<String>,
+    passphrase: Option<String>,
 ) -> Result<AppStatus, String> {
+    let passphrase = passphrase.map(Zeroizing::new);
     let source = lock(&state.key_path)
         .clone()
         .ok_or("Load a saved key first.")?;
     let current = lock(&state.key).clone().ok_or("Load a key first.")?;
-    let source_key = key_file::read_key_file_with_passphrase(&source, passphrase.as_deref())
-        .map_err(|err| err.to_string());
-    if let Some(value) = passphrase.as_mut() {
-        value.zeroize();
-    }
+    let source_key =
+        key_file::read_key_file_with_passphrase(&source, passphrase.as_deref().map(String::as_str))
+            .map_err(|err| err.to_string());
     if source_key?.as_slice() != current.as_slice() {
         return Err(
             "The key file changed since it was loaded. Load it again before backing it up.".into(),
@@ -365,12 +484,14 @@ pub async fn backup_key(
     if fs::metadata(&source).map_err(|err| err.to_string())?.len() > 4096 {
         return Err("The selected key file is too large.".into());
     }
-    let bytes = fs::read(&source).map_err(|err| err.to_string())?;
+    let bytes = Zeroizing::new(fs::read(&source).map_err(|err| err.to_string())?);
     crypto::write_transformed(&destination, false, |writer| {
-        writer.write_all(&bytes).map_err(CryptoError::from)
+        writer
+            .write_all(bytes.as_slice())
+            .map_err(CryptoError::from)
     })
     .map_err(|err| err.to_string())?;
-    let copied = fs::read(&destination).map_err(|err| err.to_string())?;
+    let copied = Zeroizing::new(fs::read(&destination).map_err(|err| err.to_string())?);
     if copied != bytes {
         return Err("Backup verification failed.".into());
     }
@@ -390,18 +511,16 @@ pub async fn backup_key(
 pub async fn check_key_backup(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    mut passphrase: Option<String>,
+    passphrase: Option<String>,
 ) -> Result<AppStatus, String> {
+    let passphrase = passphrase.map(Zeroizing::new);
     let current = lock(&state.key).clone().ok_or("Load a key first.")?;
     let Some(path) = pick_open(&app)? else {
         return Ok(status(&state));
     };
-    let opened = key_file::read_key_file_with_passphrase(&path, passphrase.as_deref())
-        .map_err(|err| err.to_string());
-    if let Some(value) = passphrase.as_mut() {
-        value.zeroize();
-    }
-    let opened = opened?;
+    let opened =
+        key_file::read_key_file_with_passphrase(&path, passphrase.as_deref().map(String::as_str))
+            .map_err(|err| err.to_string())?;
     if opened.as_slice() != current.as_slice() {
         return Err("This backup contains a different key.".into());
     }
@@ -476,10 +595,113 @@ pub fn cancel_job(state: tauri::State<'_, AppState>) -> bool {
     true
 }
 
+#[tauri::command]
+pub async fn rotate_key(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+    output_dir: String,
+    remove_original: bool,
+    passphrase: Option<String>,
+) -> Result<Option<RotationReport>, String> {
+    let passphrase = passphrase.map(Zeroizing::new);
+    if paths.is_empty() || paths.len() > 10_000 {
+        return Err("Select between 1 and 10,000 encrypted files or FileEncrypt ZIPs.".into());
+    }
+    let Some(new_path) = pick_save(&app)? else {
+        return Ok(None);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        if state.running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return Err("A job is already running.".into());
+        }
+        struct Running<'a>(&'a AppState);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) { self.0.running.store(false, Ordering::Release); }
+        }
+        let _running = Running(&state);
+        state.cancelled.store(false, Ordering::Release);
+        let old_key = lock(&state.key).clone().ok_or("Load the current key first.")?;
+        let old_path = lock(&state.key_path).clone().ok_or("Load the current key file first.")?;
+        if new_path.exists() || comparison_path(&new_path) == comparison_path(&old_path)
+            || paths.iter().any(|path| comparison_path(Path::new(path)) == comparison_path(&new_path)) {
+            return Err("Choose a new key-file path that does not exist or overlap an input.".into());
+        }
+        let dir = output_directory(&output_dir)?;
+        if dir.as_ref().is_some_and(|dir| comparison_path(dir) == comparison_path(&new_path)) {
+            return Err("The key-file path cannot be the output folder.".into());
+        }
+        let mut seen = HashSet::new();
+        let mut total = 0u64;
+        for path in &paths {
+            let input = Path::new(path);
+            if !seen.insert(comparison_path(input)) {
+                return Err("The same input was selected more than once.".into());
+            }
+            let meta = fs::metadata(input).map_err(|err| err.to_string())?;
+            if !meta.is_file() { return Err(format!("Not a file: {}", input.display())); }
+            if input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
+                let entries = archive_read::entries(input).map_err(|err| err.to_string())?;
+                archive_read::inspect_names(input, &old_key, &entries).map_err(|err| err.to_string())?;
+                total = total.saturating_add(meta.len().saturating_mul(2));
+            } else {
+                crypto::inspect_output_name(&old_key, input).map_err(|err| err.to_string())?;
+                total = total.saturating_add(meta.len());
+            }
+        }
+        let new_key = key_file::generate_key();
+        let written = if let Some(value) = passphrase.as_deref().filter(|value| !value.is_empty()) {
+            key_file::write_protected_key_file(&new_path, &new_key, value)
+        } else { key_file::write_key_file(&new_path, &new_key) };
+        written.map_err(|err| err.to_string())?;
+        let options = JobOptions {
+            overwrite: false, remove_original, key_file: Some(old_path), output_dir: dir,
+        };
+        let processed = AtomicU64::new(0);
+        let mut results = Vec::with_capacity(paths.len());
+        for (index, path) in paths.into_iter().enumerate() {
+            if state.cancelled.load(Ordering::Acquire) { break; }
+            let input = PathBuf::from(&path);
+            let progress = |bytes: u64| -> io::Result<()> {
+                if state.cancelled.load(Ordering::Acquire) {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"));
+                }
+                let done = processed.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
+                let _ = app.emit("job-progress", JobProgress {
+                    processed_bytes: done, total_bytes: total, current_file: path.clone(),
+                    file_index: index + 1, file_count: seen.len(), stage: "Rotating key".into(),
+                });
+                Ok(())
+            };
+            let rotated = if input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
+                archive::rotate_zip_with_progress(&old_key, &new_key, &input, &options, Some(&progress))
+            } else {
+                crypto::rotate_file_with_progress(&old_key, &new_key, &input, &options, Some(&progress))
+            };
+            results.push(match rotated {
+                Ok(output) => FileOutcome { input: path, output: Some(output.display().to_string()),
+                    ok: true, message: "Rotated to new key".into() },
+                Err(CryptoError::OriginalRemains { output, source }) => FileOutcome {
+                    input: path, output: Some(output), ok: false,
+                    message: format!("Rotated, but old encrypted file remains: {source}") },
+                Err(err) => FileOutcome { input: path, output: None, ok: false, message: err.to_string() },
+            });
+        }
+        let success = results.len() == seen.len() && results.iter().all(|item| item.ok);
+        if success {
+            let extra = remember_key(&app, &state, new_path.clone(), new_key);
+            set_message(&state, format!("Selected files rotated. New key: {}. Keep the old key for any files you did not select.{extra}", new_path.display()));
+        } else {
+            set_message(&state, format!("Rotation was incomplete. The old key remains loaded. The new key file is at {} for any successful outputs.", new_path.display()));
+        }
+        Ok(Some(RotationReport { results, status: status(&state) }))
+    }).await.map_err(|err| err.to_string())?
+}
+
 fn planned_output(input: &Path, dir: Option<&Path>, name: &std::ffi::OsStr) -> PathBuf {
     match dir {
         Some(dir) => dir.join(name),
-        None => input.with_file_name(name),
+        None => input.parent().unwrap_or_else(|| Path::new(".")).join(name),
     }
 }
 
@@ -497,6 +719,15 @@ fn comparison_path(path: &Path) -> PathBuf {
     }
 }
 
+fn bundle_root(request: &JobRequest) -> Option<PathBuf> {
+    let first = request.folder_roots.get(request.paths.first()?)?;
+    request
+        .paths
+        .iter()
+        .all(|path| request.folder_roots.get(path) == Some(first))
+        .then(|| PathBuf::from(first))
+}
+
 fn plan_job(state: &AppState, request: &JobRequest) -> Result<JobPreview, String> {
     if !matches!(request.operation.as_str(), "encrypt" | "decrypt" | "verify") {
         return Err("Unknown operation.".into());
@@ -510,6 +741,15 @@ fn plan_job(state: &AppState, request: &JobRequest) -> Result<JobPreview, String
     let key = lock(&state.key)
         .clone()
         .ok_or("Load or create an encryption key first.")?;
+    if request.operation == "encrypt" && request.zip {
+        let paths = request.paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let names = archive::relative_names(&paths, bundle_root(request).as_deref())
+            .map_err(|err| err.to_string())?;
+        let mut seen = HashSet::new();
+        if names.iter().any(|name| !seen.insert(name.to_lowercase())) {
+            return Err("Two selected files would restore to the same bundle path.".into());
+        }
+    }
     let dir = output_directory(&request.output_dir)?;
     let zip_destination = dir.clone().unwrap_or_else(|| {
         Path::new(&request.paths[0])
@@ -649,9 +889,7 @@ fn preview_issue(
     if key_path.is_some_and(|key| comparison_path(key) == comparison_path(input)) {
         return Some("This is the key file.".into());
     }
-    let Some(output) = output else {
-        return None;
-    };
+    let output = output?;
     if !seen_outputs.insert(comparison_path(output)) {
         return Some("Another selected file has the same output path.".into());
     }
@@ -660,8 +898,17 @@ fn preview_issue(
     {
         return Some("Output conflicts with an input or key file.".into());
     }
-    if output.exists() && !overwrite {
-        return Some("Output already exists. Choose a folder or enable replacement.".into());
+    match fs::symlink_metadata(output) {
+        Ok(_) if !overwrite => {
+            return Some("Output already exists. Choose a folder or enable replacement.".into())
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Some("Existing output is not a regular file.".into())
+        }
+        Err(err) if err.kind() != io::ErrorKind::NotFound => {
+            return Some(format!("Cannot inspect output: {err}"))
+        }
+        _ => {}
     }
     None
 }
@@ -739,6 +986,8 @@ fn execute_job(
             &key,
             &paths,
             &options,
+            bundle_root(&request).as_deref(),
+            request.compress,
             Some(&progress),
             Some(&on_entry),
         );
@@ -943,6 +1192,7 @@ fn status(state: &AppState) -> AppStatus {
         output_dir,
         fingerprint,
         message,
+        updates_configured: updater_key().is_ok(),
     }
 }
 
@@ -1102,10 +1352,12 @@ mod tests {
         *lock(&state.key) = Some(Zeroizing::new(key));
         let request = JobRequest {
             paths: vec![one.display().to_string(), two.display().to_string()],
+            folder_roots: HashMap::new(),
             output_dir: destination.display().to_string(),
             overwrite: true,
             remove_original: false,
             zip: false,
+            compress: false,
             operation: "decrypt".into(),
         };
         let preview = plan_job(&state, &request).unwrap();
@@ -1114,6 +1366,34 @@ mod tests {
             .issue
             .as_deref()
             .is_some_and(|issue| issue.contains("same output path"))));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preview_blocks_replacing_a_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "fileencrypt-plan-test-{}",
+            crypto::opaque_file_name().to_string_lossy()
+        ));
+        fs::create_dir(&root).unwrap();
+        let input = root.join("input.fenc");
+        let output = root.join("restored.txt");
+        fs::write(&input, b"input").unwrap();
+        fs::create_dir(&output).unwrap();
+
+        let issue = preview_issue(
+            &input,
+            Some(&output),
+            None,
+            true,
+            false,
+            &HashSet::from([comparison_path(&input)]),
+            &mut HashSet::new(),
+        );
+        assert_eq!(
+            issue.as_deref(),
+            Some("Existing output is not a regular file.")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1130,6 +1410,12 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.iter().any(|name| name.ends_with("one.txt")));
         assert!(files.iter().any(|name| name.ends_with("two.txt")));
+        let selection = expand_paths_with_roots(vec![root.display().to_string()]).unwrap();
+        assert_eq!(selection.paths, files);
+        assert!(selection
+            .roots
+            .values()
+            .all(|path| path == &root.display().to_string()));
         fs::remove_dir_all(root).unwrap();
     }
 }

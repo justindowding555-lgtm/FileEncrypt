@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FileEncrypt</title>
+    <link rel="icon" type="image/svg+xml" href="icon.svg" />
     <link rel="stylesheet" href="styles.css" />
     <script type="module" src="/main.js" defer></script>
   </head>
@@ -11,10 +12,7 @@
     <div class="app">
       <header class="brand">
         <span class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="5" y="10" width="14" height="11" rx="2" />
-            <path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3" />
-          </svg>
+          <img src="icon.svg" alt="" width="42" height="42" />
         </span>
         <div>
           <h1>FileEncrypt</h1>
@@ -58,6 +56,8 @@
                   <button type="button" id="backup-key">Back up key</button>
                   <button type="button" id="check-backup">Check backup</button>
                 </div>
+                <button type="button" id="rotate-key">Rotate selected encrypted files to a new key</button>
+                <p class="sub">Choose a new key-file path when prompted. The old key file stays available for other encrypted files.</p>
                 <details>
                   <summary>Use a specific key</summary>
                   <div class="details-content">
@@ -106,8 +106,9 @@
               <label class="check"><input id="overwrite" type="checkbox" />Replace existing output files</label>
               <label class="check"><input id="remove-original" type="checkbox" />Delete originals after success</label>
               <p class="sub zip-hint">This is normal file deletion, not secure erasure.</p>
-              <label class="check"><input id="zip" type="checkbox" aria-describedby="zip-hint" />Group encrypted files into one ZIP</label>
-              <p id="zip-hint" class="sub zip-hint">ZIPs contain encrypted .fenc files and can be decrypted directly here.</p>
+              <label class="check"><input id="zip" type="checkbox" aria-describedby="zip-hint" />Bundle encrypted files into one ZIP</label>
+              <p id="zip-hint" class="sub zip-hint">The encrypted files keep their relative folder paths when restored. Older ZIPs still open.</p>
+              <label class="check"><input id="compress" type="checkbox" />Compress files before encryption (bundle only)</label>
               <label class="check"><input id="review-first" type="checkbox" />Review plan before starting</label>
             </div>
             <div class="actions">
@@ -142,7 +143,12 @@
           <ul id="results" class="results"></ul>
         </section>
       </main>
-      <footer>Processed on your device <span aria-hidden="true">&middot;</span> AEGIS-256 encryption</footer>
+      <footer>
+        Processed on your device <span aria-hidden="true">&middot;</span> AEGIS-256 encryption
+        <button type="button" id="check-update" class="text-button" disabled>Check for updates</button>
+        <button type="button" id="install-update" class="text-button" hidden>Install update</button>
+        <span id="update-status" aria-live="polite"></span>
+      </footer>
     </div>
   </body>
 </html>

@@ -1,0 +1,27 @@
+name: ZIP parser fuzz smoke test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  zip-parser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install Tauri Linux libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz FileEncrypt ZIP directory parser
+        working-directory: fuzz
+        run: cargo fuzz run zip_reader -- -max_total_time=60 -max_len=262144
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: zip-fuzz-findings
+          path: fuzz/artifacts

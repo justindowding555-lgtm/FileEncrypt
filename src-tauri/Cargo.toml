@@ -30,6 +30,8 @@ hmac = "0.12"
 zeroize = "1"
 thiserror = "2"
 crc32fast = "1.5.2"
+flate2 = "1.1"
+tauri-plugin-updater = "2"
 
 [profile.release]
 codegen-units = 1

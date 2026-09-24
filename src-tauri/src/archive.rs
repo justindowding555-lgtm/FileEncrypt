@@ -5,6 +5,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::archive_read;
 use crate::crypto::{self, CryptoError, JobOptions};
 
 struct RemoveDir(PathBuf);
@@ -20,6 +21,8 @@ pub struct ArchiveOutcome {
     pub delete_errors: Vec<Option<String>>,
 }
 
+type EntryCallback<'a> = dyn Fn(usize, &Path) + 'a;
+
 /// Encrypt every input before publishing the ZIP. Originals are removed only
 /// after the finished archive has been committed to its destination.
 #[cfg(test)]
@@ -28,15 +31,65 @@ pub fn encrypt_to_zip(
     inputs: &[PathBuf],
     options: &JobOptions,
 ) -> Result<ArchiveOutcome, CryptoError> {
-    encrypt_to_zip_with_progress(key, inputs, options, None, None)
+    encrypt_to_zip_with_progress(key, inputs, options, None, false, None, None)
+}
+
+pub fn relative_names(
+    inputs: &[PathBuf],
+    root_hint: Option<&Path>,
+) -> Result<Vec<String>, CryptoError> {
+    let mut root = root_hint.map(Path::to_path_buf).unwrap_or_else(|| {
+        inputs
+            .first()
+            .and_then(|path| path.parent())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    });
+    if inputs.is_empty() {
+        return Err(CryptoError::NotAFile("add at least one file".into()));
+    }
+    if root_hint.is_some() && !inputs.iter().all(|path| path.starts_with(&root)) {
+        return Err(CryptoError::BadEncryptedName);
+    }
+    while !inputs.iter().all(|path| path.starts_with(&root)) {
+        if !root.pop() {
+            return Err(CryptoError::NotAFile(
+                "files must share a filesystem root".into(),
+            ));
+        }
+    }
+    inputs
+        .iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(&root)
+                .map_err(|_| CryptoError::BadEncryptedName)?;
+            let parts = relative
+                .components()
+                .map(|part| {
+                    part.as_os_str()
+                        .to_str()
+                        .ok_or(CryptoError::BadEncryptedName)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if parts.is_empty() {
+                return Err(CryptoError::BadEncryptedName);
+            }
+            let name = parts.join("/");
+            crypto::validate_relative_name(&name)?;
+            Ok(name)
+        })
+        .collect()
 }
 
 pub fn encrypt_to_zip_with_progress(
     key: &[u8; 32],
     inputs: &[PathBuf],
     options: &JobOptions,
+    root_hint: Option<&Path>,
+    compress: bool,
     progress: Option<&crypto::ProgressCallback<'_>>,
-    on_entry: Option<&dyn Fn(usize, &Path)>,
+    on_entry: Option<&EntryCallback<'_>>,
 ) -> Result<ArchiveOutcome, CryptoError> {
     let first = inputs
         .first()
@@ -84,6 +137,7 @@ pub fn encrypt_to_zip_with_progress(
         key_file: options.key_file.clone(),
         output_dir: Some(work_dir),
     };
+    let relative_names = relative_names(inputs, root_hint)?;
     let encrypted: Vec<PathBuf> = inputs
         .iter()
         .enumerate()
@@ -91,11 +145,14 @@ pub fn encrypt_to_zip_with_progress(
             if let Some(on_entry) = on_entry {
                 on_entry(index, input);
             }
-            if let Some(progress) = progress {
-                crypto::encrypt_file_with_progress(key, input, &staging, progress)
-            } else {
-                crypto::encrypt_file(key, input, &staging)
-            }
+            crypto::encrypt_bundle_entry_with_progress(
+                key,
+                input,
+                &relative_names[index],
+                compress,
+                &staging,
+                progress,
+            )
         })
         .collect::<Result<_, _>>()?;
     if let Some(on_entry) = on_entry {
@@ -126,6 +183,61 @@ fn same_file(left: &Path, right: &Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
+}
+
+pub fn rotate_zip_with_progress(
+    old_key: &[u8; 32],
+    new_key: &[u8; 32],
+    input: &Path,
+    options: &JobOptions,
+    progress: Option<&crypto::ProgressCallback<'_>>,
+) -> Result<PathBuf, CryptoError> {
+    let entries = archive_read::entries(input)?;
+    let destination = options.output_dir.clone().unwrap_or_else(|| {
+        input
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    });
+    fs::create_dir_all(&destination)?;
+    let archive = (0..8)
+        .map(|_| {
+            let mut name = PathBuf::from(crypto::opaque_file_name());
+            name.set_extension("zip");
+            destination.join(name)
+        })
+        .find(|path| !path.exists())
+        .ok_or(CryptoError::EncryptFailed)?;
+    crypto::ensure_distinct(input, &archive, options.key_file.as_deref())?;
+    let work_dir = archive.with_extension("zip.work");
+    fs::create_dir(&work_dir)?;
+    let _cleanup = RemoveDir(work_dir.clone());
+    let new_dir = work_dir.join("new");
+    fs::create_dir(&new_dir)?;
+    let staging = JobOptions {
+        overwrite: false,
+        remove_original: false,
+        key_file: options.key_file.clone(),
+        output_dir: Some(new_dir),
+    };
+    let mut rotated = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let old_file = work_dir.join(&entry.name);
+        archive_read::extract_entry(input, &entry, &old_file, progress)?;
+        rotated.push(crypto::rotate_file_with_progress(
+            old_key, new_key, &old_file, &staging, progress,
+        )?);
+    }
+    crypto::write_transformed(&archive, false, |writer| {
+        write_zip(writer, &rotated, progress).map_err(Into::into)
+    })?;
+    if options.remove_original {
+        fs::remove_file(input).map_err(|source| CryptoError::OriginalRemains {
+            output: archive.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(archive)
 }
 
 struct Entry {
@@ -322,6 +434,7 @@ fn write_zip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive_read;
     use std::process::Command;
 
     struct TestDir(PathBuf);
@@ -420,6 +533,128 @@ mod tests {
                 [0, 1, 2, 255]
             );
         }
+    }
+
+    #[test]
+    fn bundle_restores_nested_paths_with_and_without_compression() {
+        for compress in [false, true] {
+            let dir = TestDir::new();
+            let root = dir.0.join("source");
+            let first = root.join("north").join("same.txt");
+            let second = root.join("south").join("same.txt");
+            fs::create_dir_all(first.parent().unwrap()).unwrap();
+            fs::create_dir_all(second.parent().unwrap()).unwrap();
+            fs::write(&first, vec![b'A'; 200_000]).unwrap();
+            fs::write(&second, b"south").unwrap();
+            let options = JobOptions {
+                overwrite: false,
+                remove_original: false,
+                key_file: None,
+                output_dir: Some(dir.0.join("archives")),
+            };
+            let key = [91u8; 32];
+            let archive = encrypt_to_zip_with_progress(
+                &key,
+                &[first, second],
+                &options,
+                None,
+                compress,
+                None,
+                None,
+            )
+            .unwrap()
+            .path;
+            let entries = archive_read::entries(&archive).unwrap();
+            let names = archive_read::inspect_names(&archive, &key, &entries).unwrap();
+            assert_eq!(names, ["north/same.txt", "south/same.txt"]);
+            let staging = dir.0.join("staging");
+            fs::create_dir_all(&staging).unwrap();
+            let restored = dir.0.join("restored");
+            let restore_options = JobOptions {
+                overwrite: false,
+                remove_original: false,
+                key_file: None,
+                output_dir: Some(restored.clone()),
+            };
+            for entry in entries {
+                let encrypted = staging.join(&entry.name);
+                archive_read::extract_entry(&archive, &entry, &encrypted, None).unwrap();
+                crypto::verify_file(&key, &encrypted, None).unwrap();
+                crypto::decrypt_file(&key, &encrypted, &restore_options).unwrap();
+            }
+            assert_eq!(
+                fs::read(restored.join("north/same.txt")).unwrap(),
+                vec![b'A'; 200_000]
+            );
+            assert_eq!(fs::read(restored.join("south/same.txt")).unwrap(), b"south");
+        }
+    }
+
+    #[test]
+    fn compressed_bundle_rotates_and_retains_relative_paths() {
+        let dir = TestDir::new();
+        let source = dir.0.join("folder").join("child.txt");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, vec![b'Z'; 180_000]).unwrap();
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: false,
+            key_file: None,
+            output_dir: Some(dir.0.join("out")),
+        };
+        let old = [1u8; 32];
+        let new = [2u8; 32];
+        let archive =
+            encrypt_to_zip_with_progress(&old, &[source], &options, None, true, None, None)
+                .unwrap()
+                .path;
+        let rotated = rotate_zip_with_progress(&old, &new, &archive, &options, None).unwrap();
+        let entries = archive_read::entries(&rotated).unwrap();
+        let names = archive_read::inspect_names(&rotated, &new, &entries).unwrap();
+        assert_eq!(names, ["child.txt"]);
+        assert!(archive_read::inspect_names(&rotated, &old, &entries).is_err());
+        let staged = dir.0.join(&entries[0].name);
+        archive_read::extract_entry(&rotated, &entries[0], &staged, None).unwrap();
+        let restore = JobOptions {
+            output_dir: Some(dir.0.join("restored")),
+            ..options
+        };
+        let plain = crypto::decrypt_file(&new, &staged, &restore).unwrap();
+        assert_eq!(fs::read(plain).unwrap(), vec![b'Z'; 180_000]);
+    }
+
+    #[test]
+    fn selected_folder_root_is_kept_for_a_single_nested_file() {
+        let dir = TestDir::new();
+        let root = dir.0.join("selected");
+        let source = root.join("nested").join("only.txt");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"only file").unwrap();
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: false,
+            key_file: None,
+            output_dir: Some(dir.0.join("out")),
+        };
+        let key = [8u8; 32];
+        let zipped =
+            encrypt_to_zip_with_progress(&key, &[source], &options, Some(&root), false, None, None)
+                .unwrap()
+                .path;
+        let entries = archive_read::entries(&zipped).unwrap();
+        assert_eq!(
+            archive_read::inspect_names(&zipped, &key, &entries).unwrap(),
+            ["nested/only.txt"]
+        );
+        let staged = dir.0.join(&entries[0].name);
+        archive_read::extract_entry(&zipped, &entries[0], &staged, None).unwrap();
+        let restore = JobOptions {
+            output_dir: Some(dir.0.join("restored")),
+            ..options
+        };
+        let plain = crypto::decrypt_file(&key, &staged, &restore).unwrap();
+        assert_eq!(plain, dir.0.join("restored/nested/only.txt"));
+        assert_eq!(fs::read(plain).unwrap(), b"only file");
     }
 
     #[test]

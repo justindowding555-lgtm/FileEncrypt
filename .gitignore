@@ -11,6 +11,9 @@ node_modules
 src-tauri/target
 dist
 dist-ssr
+fuzz/artifacts
+fuzz/coverage
+fuzz/target
 *.local
 
 # Editor directories and files

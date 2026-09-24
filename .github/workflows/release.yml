@@ -1,0 +1,48 @@
+name: Draft signed Windows release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check signing configuration
+        shell: pwsh
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+            throw 'Set both TAURI_SIGNING_PRIVATE_KEY secrets before running this workflow.'
+          }
+      - name: Set updater public key
+        shell: pwsh
+        run: |
+          $public = (Get-Content src-tauri/tauri.release.conf.json -Raw | ConvertFrom-Json).plugins.updater.pubkey
+          if (-not $public) { throw 'The release public key is missing.' }
+          "FILEENCRYPT_UPDATER_PUBKEY=$public" >> $env:GITHUB_ENV
+      - run: npm ci
+      - name: Build signed NSIS updater artifact
+        run: npm run tauri build -- --config src-tauri/tauri.release.conf.json --bundles nsis
+      - name: Prepare update manifest and draft release
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $installer = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer was not generated.' }
+          .\scripts\create-update-manifest.ps1 -Version $version -InstallerPath $installer.FullName
+          $signature = "$($installer.FullName).sig"
+          $manifest = Join-Path $installer.DirectoryName 'latest.json'
+          gh release create "v$version" $installer.FullName $signature $manifest --target $env:GITHUB_SHA --draft --generate-notes

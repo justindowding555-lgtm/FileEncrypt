@@ -1,10 +1,13 @@
 const state = {
   files: [],
+  folderRoots: new Map(),
   busy: false,
   keyLoaded: false,
   keyFingerprint: null,
   pendingJob: null,
   jobRunning: false,
+  updatesConfigured: false,
+  updateAvailable: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -20,11 +23,8 @@ function invoke(command, args) {
 async function invokeWithPassphrase(command, args = {}) {
   const field = $("key-passphrase");
   const passphrase = field.value;
-  try {
-    return await invoke(command, { ...args, passphrase });
-  } finally {
-    field.value = "";
-  }
+  field.value = "";
+  return invoke(command, { ...args, passphrase });
 }
 
 function normalizeError(error) {
@@ -55,9 +55,15 @@ function invalidatePreview() {
   $("preview-panel").hidden = true;
 }
 
-function addSelectedFiles(paths) {
+function addSelectedFiles(selected) {
+  const paths = Array.isArray(selected) ? selected : selected.paths;
+  const roots = Array.isArray(selected) ? {} : selected.roots;
   let changed = false;
   for (const path of paths) {
+    if (roots[path] && state.folderRoots.get(path) !== roots[path]) {
+      state.folderRoots.set(path, roots[path]);
+      changed = true;
+    }
     if (!state.files.includes(path)) {
       state.files.push(path);
       changed = true;
@@ -73,6 +79,8 @@ function applyStatus(status, updatePath) {
   }
   state.keyFingerprint = status.fingerprint;
   state.keyLoaded = Boolean(status.keyLoaded);
+  state.updatesConfigured = Boolean(status.updatesConfigured);
+  if (!state.updatesConfigured) $("update-status").textContent = "Signed updates are not configured in this build.";
   $("fingerprint").classList.toggle("is-loaded", state.keyLoaded);
   if (updatePath && status.keyPath) {
     $("key-path").value = status.keyPath;
@@ -107,16 +115,20 @@ function renderControls() {
   $("browse-load").disabled = state.busy;
   $("backup-key").disabled = state.busy || !state.keyLoaded;
   $("check-backup").disabled = state.busy || !state.keyLoaded;
+  $("rotate-key").disabled = blocked;
   $("save-typed").disabled = state.busy;
   $("choose-output").disabled = state.busy;
   $("clear-output").disabled = state.busy || $("output-dir").value.trim() === "";
   $("zip").disabled = state.busy;
+  $("compress").disabled = state.busy || !$("zip").checked;
   $("review-first").disabled = state.busy;
   $("overwrite").disabled = state.busy;
   $("remove-original").disabled = state.busy;
   $("output-dir").disabled = state.busy;
   $("start-job").disabled = state.busy || !state.pendingJob?.preview?.canRun;
   $("cancel-job").disabled = !state.jobRunning;
+  $("check-update").disabled = state.busy || !state.updatesConfigured;
+  $("install-update").disabled = state.busy || !state.updateAvailable;
   $("file-count").textContent = noFiles ? "" : `(${state.files.length})`;
   $("action-hint").textContent = state.busy
     ? "Working. Please wait…"
@@ -179,6 +191,7 @@ function renderFiles() {
     remove.setAttribute("aria-label", `Remove ${baseName(path)}`);
     remove.addEventListener("click", () => {
       state.files.splice(index, 1);
+      state.folderRoots.delete(path);
       invalidatePreview();
       renderFiles();
       renderControls();
@@ -306,6 +319,32 @@ async function init() {
   $("check-backup").addEventListener("click", () =>
     run(() => invokeWithPassphrase("check_key_backup"), false));
 
+  $("rotate-key").addEventListener("click", async () => {
+    if (state.busy || !state.keyLoaded || !state.files.length) return;
+    state.jobRunning = true;
+    $("progress-panel").hidden = false;
+    $("job-progress").value = 0;
+    $("progress-label").textContent = "Choose a new key-file path...";
+    try {
+      await run(async () => {
+        const report = await invokeWithPassphrase("rotate_key", {
+          paths: [...state.files],
+          outputDir: $("output-dir").value,
+          removeOriginal: $("remove-original").checked,
+        });
+        if (report) {
+          renderResults(report.results);
+          applyStatus(report.status, true);
+        }
+        return null;
+      }, false);
+    } finally {
+      state.jobRunning = false;
+      $("progress-panel").hidden = true;
+      renderControls();
+    }
+  });
+
   $("output-dir").addEventListener("input", () => {
     invalidatePreview();
     renderControls();
@@ -315,6 +354,8 @@ async function init() {
     invalidatePreview();
     renderFiles();
   });
+
+  $("compress").addEventListener("change", invalidatePreview);
 
   for (const id of ["overwrite", "remove-original"]) {
     $(id).addEventListener("change", invalidatePreview);
@@ -353,6 +394,7 @@ async function init() {
 
   $("clear-files").addEventListener("click", () => {
     state.files = [];
+    state.folderRoots.clear();
     invalidatePreview();
     renderFiles();
   });
@@ -364,6 +406,23 @@ async function init() {
   $("dismiss-preview").addEventListener("click", invalidatePreview);
   $("cancel-job").addEventListener("click", async () => {
     if (await invoke("cancel_job")) $("progress-label").textContent = "Cancelling after the current chunk...";
+  });
+
+  $("check-update").addEventListener("click", async () => {
+    const checked = await run(async () => ({ update: await invoke("check_for_updates") }), false);
+    if (!checked) return;
+    const { update } = checked;
+    state.updateAvailable = Boolean(update);
+    $("install-update").hidden = !update;
+    $("update-status").textContent = update
+      ? `Version ${update.version} is available.${update.notes ? ` ${update.notes}` : ""}`
+      : "You are up to date.";
+    renderControls();
+  });
+
+  $("install-update").addEventListener("click", async () => {
+    const message = await run(() => invoke("install_update"), false);
+    if (message) $("update-status").textContent = message;
   });
 
   try {
@@ -378,10 +437,12 @@ async function init() {
 async function prepareJob(operation) {
   const request = {
       paths: [...state.files],
+      folderRoots: Object.fromEntries(state.folderRoots),
       outputDir: $("output-dir").value,
       overwrite: $("overwrite").checked,
       removeOriginal: $("remove-original").checked,
       zip: $("zip").checked,
+      compress: $("zip").checked && $("compress").checked,
       operation,
   };
   const preview = await run(() => invoke("preview_job", { request }), false);

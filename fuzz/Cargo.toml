@@ -1,0 +1,21 @@
+[package]
+name = "file-encrypt-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+file-encrypt = { path = "../src-tauri" }
+
+[[bin]]
+name = "zip_reader"
+path = "fuzz_targets/zip_reader.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

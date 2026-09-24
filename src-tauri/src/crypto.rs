@@ -21,9 +21,11 @@
 //! 16      …     AES-256-GCM STREAM chunks, each with a 16-byte tag
 //! ```
 
+use std::cell::Cell;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
 use aegis::aegis256::Aegis256;
 use aes_gcm::aead::generic_array::GenericArray;
@@ -42,6 +44,8 @@ const MAGIC: &[u8; 4] = b"FENC";
 const LEGACY_VERSION: u8 = 1;
 const AEGIS_VERSION: u8 = 2;
 const NAMED_VERSION: u8 = 3;
+const BUNDLE_VERSION: u8 = 4;
+const COMPRESSED_BUNDLE_VERSION: u8 = 5;
 const AEGIS_TAG_LEN: usize = 32;
 const STREAM_PREFIX_LEN: usize = 24;
 const AEGIS_HEADER_LEN: usize = 4 + 1 + 4 + 32 + 32 + AEGIS_TAG_LEN + STREAM_PREFIX_LEN;
@@ -128,6 +132,7 @@ enum Direction {
     Decrypt,
 }
 
+#[cfg(test)]
 pub fn encrypt_file(
     key: &[u8; 32],
     input: &Path,
@@ -145,11 +150,25 @@ pub fn decrypt_file(
     transform(Direction::Decrypt, key, input, options, None)
 }
 
-pub type ProgressCallback<'a> = dyn Fn(u64) -> io::Result<()> + 'a;
+pub type ProgressCallback<'a> = dyn Fn(u64) -> io::Result<()> + Sync + 'a;
 
 struct ProgressReader<'a, R> {
     inner: R,
     callback: &'a ProgressCallback<'a>,
+}
+
+struct CountingReader<'a, R> {
+    inner: R,
+    count: &'a Cell<u64>,
+}
+
+impl<R: Read> Read for CountingReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.count
+            .set(self.count.get().saturating_add(count as u64));
+        Ok(count)
+    }
 }
 
 impl<R: Read> Read for ProgressReader<'_, R> {
@@ -172,6 +191,228 @@ pub fn encrypt_file_with_progress(
     transform(Direction::Encrypt, key, input, options, Some(callback))
 }
 
+pub fn encrypt_bundle_entry_with_progress(
+    key: &[u8; 32],
+    input: &Path,
+    relative_name: &str,
+    compress: bool,
+    options: &JobOptions,
+    callback: Option<&ProgressCallback<'_>>,
+) -> Result<PathBuf, CryptoError> {
+    validate_relative_name(relative_name)?;
+    let input_size = fs::metadata(input)?.len();
+    let output = opaque_output_path(input, options.output_dir.as_deref(), options.overwrite)?;
+    finish_job(input, output, options, |destination| {
+        write_transformed(destination, options.overwrite, |writer| {
+            let count = Cell::new(0u64);
+            let reader = CountingReader {
+                inner: BufReader::new(File::open(input)?),
+                count: &count,
+            };
+            let mut reader: Box<dyn Read + '_> = if let Some(callback) = callback {
+                Box::new(ProgressReader {
+                    inner: reader,
+                    callback,
+                })
+            } else {
+                Box::new(reader)
+            };
+            if compress {
+                let mut compressed =
+                    flate2::read::ZlibEncoder::new(&mut reader, flate2::Compression::default());
+                encrypt_aegis(
+                    key,
+                    relative_name,
+                    &mut compressed,
+                    writer,
+                    COMPRESSED_BUNDLE_VERSION,
+                    Some(input_size),
+                )?;
+            } else {
+                encrypt_aegis(
+                    key,
+                    relative_name,
+                    &mut reader,
+                    writer,
+                    BUNDLE_VERSION,
+                    None,
+                )?;
+            }
+            if count.get() != input_size || fs::metadata(input)?.len() != input_size {
+                return Err(CryptoError::NotAFile(format!(
+                    "source file changed while encrypting: {}",
+                    input.display()
+                )));
+            }
+            check_progress(callback)
+        })
+    })
+}
+
+enum PipeMessage {
+    Data(SecretBytes),
+    Done,
+    Failed(String),
+}
+
+struct PipeWriter(SyncSender<PipeMessage>);
+
+impl Write for PipeWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .send(PipeMessage::Data(SecretBytes(bytes.to_vec())))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "rotation stopped"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct PipeReader {
+    receiver: Receiver<PipeMessage>,
+    pending: SecretBytes,
+    offset: usize,
+    done: bool,
+}
+
+impl Read for PipeReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if self.done {
+            return Ok(0);
+        }
+        loop {
+            if self.offset < self.pending.0.len() {
+                let count = bytes.len().min(self.pending.0.len() - self.offset);
+                bytes[..count].copy_from_slice(&self.pending.0[self.offset..self.offset + count]);
+                self.pending.0[self.offset..self.offset + count].zeroize();
+                self.offset += count;
+                return Ok(count);
+            }
+            self.pending.0.clear();
+            self.offset = 0;
+            match self.receiver.recv() {
+                Ok(PipeMessage::Data(data)) => self.pending = data,
+                Ok(PipeMessage::Done) => {
+                    self.done = true;
+                    return Ok(0);
+                }
+                Ok(PipeMessage::Failed(message)) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, message))
+                }
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "rotation stopped",
+                    ))
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PipeReader {
+    fn drop(&mut self) {
+        self.pending.0.zeroize();
+    }
+}
+
+pub fn rotate_file_with_progress(
+    old_key: &[u8; 32],
+    new_key: &[u8; 32],
+    input: &Path,
+    options: &JobOptions,
+    callback: Option<&ProgressCallback<'_>>,
+) -> Result<PathBuf, CryptoError> {
+    let version = legacy_version(input)?.ok_or(CryptoError::NotEncrypted)?;
+    let output = opaque_output_path(input, options.output_dir.as_deref(), false)?;
+    finish_job(input, output, options, |destination| {
+        let source = BufReader::new(File::open(input)?);
+        let mut source: Box<dyn Read + Send + '_> = if let Some(callback) = callback {
+            Box::new(ProgressReader {
+                inner: source,
+                callback,
+            })
+        } else {
+            Box::new(source)
+        };
+        let opened = if matches!(
+            version,
+            NAMED_VERSION | BUNDLE_VERSION | COMPRESSED_BUNDLE_VERSION
+        ) {
+            Some(open_named(&mut source, old_key)?)
+        } else {
+            None
+        };
+        let (name, size, target_version) = if let Some(opened) = &opened {
+            (opened.name.clone(), opened.original_size, opened.version)
+        } else if matches!(version, LEGACY_VERSION | AEGIS_VERSION) {
+            (
+                decrypted_file_name(file_name(input)?)?
+                    .to_str()
+                    .ok_or(CryptoError::BadEncryptedName)?
+                    .to_string(),
+                None,
+                NAMED_VERSION,
+            )
+        } else {
+            return Err(CryptoError::UnsupportedVersion(version));
+        };
+        let result = write_transformed(destination, false, |writer| {
+            std::thread::scope(|scope| {
+                let (sender, receiver) = sync_channel(2);
+                let reader = PipeReader {
+                    receiver,
+                    pending: SecretBytes(Vec::new()),
+                    offset: 0,
+                    done: false,
+                };
+                let worker = scope.spawn(move || {
+                    let result = {
+                        let mut sink = PipeWriter(sender.clone());
+                        match opened {
+                            Some(opened) => decrypt_named_body(&mut source, &mut sink, &opened),
+                            None if version == AEGIS_VERSION => {
+                                decrypt_aegis(old_key, &mut source, &mut sink)
+                            }
+                            None => decrypt_stream(old_key, &mut source, &mut sink),
+                        }
+                    };
+                    let _ = sender.send(match &result {
+                        Ok(()) => PipeMessage::Done,
+                        Err(err) => PipeMessage::Failed(err.to_string()),
+                    });
+                    result
+                });
+                let mut reader = reader;
+                let encrypted = if target_version == COMPRESSED_BUNDLE_VERSION {
+                    let mut compressed =
+                        flate2::read::ZlibEncoder::new(&mut reader, flate2::Compression::default());
+                    encrypt_aegis(
+                        new_key,
+                        &name,
+                        &mut compressed,
+                        writer,
+                        target_version,
+                        size,
+                    )
+                } else {
+                    encrypt_aegis(new_key, &name, &mut reader, writer, target_version, None)
+                };
+                drop(reader);
+                let decrypted = worker.join().map_err(|_| CryptoError::EncryptFailed)?;
+                decrypted?;
+                encrypted?;
+                check_progress(callback)
+            })
+        });
+        result
+    })
+}
+
 pub fn decrypt_file_with_progress(
     key: &[u8; 32],
     input: &Path,
@@ -186,7 +427,7 @@ pub fn inspect_output_name(
     input: &Path,
 ) -> Result<std::ffi::OsString, CryptoError> {
     match legacy_version(input)? {
-        Some(NAMED_VERSION) => {
+        Some(NAMED_VERSION | BUNDLE_VERSION | COMPRESSED_BUNDLE_VERSION) => {
             let mut reader = BufReader::new(File::open(input)?);
             Ok(open_named(&mut reader, key)?.name.into())
         }
@@ -229,16 +470,9 @@ fn verify_reader(
     sink: &mut dyn Write,
 ) -> Result<(), CryptoError> {
     match legacy_version(input)? {
-        Some(NAMED_VERSION) => {
+        Some(NAMED_VERSION | BUNDLE_VERSION | COMPRESSED_BUNDLE_VERSION) => {
             let opened = open_named(reader, key)?;
-            decrypt_chunks(
-                reader,
-                sink,
-                &opened.file_key,
-                &opened.prefix,
-                opened.chunk_size,
-                &opened.body_aad,
-            )
+            decrypt_named_body(reader, sink, &opened)
         }
         Some(AEGIS_VERSION) => decrypt_aegis(key, reader, sink),
         Some(LEGACY_VERSION) => decrypt_stream(key, reader, sink),
@@ -301,9 +535,23 @@ fn transform(
                             inner: reader,
                             callback,
                         };
-                        encrypt_aegis(key, &original_name, &mut reader, writer)
+                        encrypt_aegis(
+                            key,
+                            &original_name,
+                            &mut reader,
+                            writer,
+                            NAMED_VERSION,
+                            None,
+                        )
                     } else {
-                        encrypt_aegis(key, &original_name, &mut reader, writer)
+                        encrypt_aegis(
+                            key,
+                            &original_name,
+                            &mut reader,
+                            writer,
+                            NAMED_VERSION,
+                            None,
+                        )
                     };
                     result?;
                     check_progress(callback)
@@ -351,7 +599,9 @@ fn transform(
                     })
                 })
             }
-            Some(NAMED_VERSION) => decrypt_named(key, input, options, callback),
+            Some(NAMED_VERSION | BUNDLE_VERSION | COMPRESSED_BUNDLE_VERSION) => {
+                decrypt_named(key, input, options, callback)
+            }
             Some(version) => Err(CryptoError::UnsupportedVersion(version)),
             None => Err(CryptoError::NotEncrypted),
         },
@@ -372,8 +622,18 @@ fn finish_job(
     write: impl FnOnce(&Path) -> Result<(), CryptoError>,
 ) -> Result<PathBuf, CryptoError> {
     ensure_distinct(input, &output, options.key_file.as_deref())?;
-    if output.exists() && !options.overwrite {
-        return Err(CryptoError::OutputExists(output.display().to_string()));
+    match fs::symlink_metadata(&output) {
+        Ok(_) if !options.overwrite => {
+            return Err(CryptoError::OutputExists(output.display().to_string()))
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(CryptoError::NotAFile(format!(
+                "existing output is not a regular file: {}",
+                output.display()
+            )))
+        }
+        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
+        _ => {}
     }
     write(&output)?;
     if options.remove_original {
@@ -409,16 +669,17 @@ fn decrypt_named(
         options.output_dir.as_deref(),
         std::ffi::OsStr::new(&opened.name),
     )?;
+    if opened.version != NAMED_VERSION {
+        let root = options
+            .output_dir
+            .as_deref()
+            .or_else(|| input.parent())
+            .ok_or(CryptoError::BadEncryptedName)?;
+        ensure_no_linked_parent(root, &output)?;
+    }
     finish_job(input, output, options, |destination| {
         write_transformed(destination, options.overwrite, |writer| {
-            decrypt_chunks(
-                &mut reader,
-                writer,
-                &opened.file_key,
-                &opened.prefix,
-                opened.chunk_size,
-                &opened.body_aad,
-            )?;
+            decrypt_named_body(&mut reader, writer, &opened)?;
             check_progress(callback)
         })
     })
@@ -487,6 +748,8 @@ fn encrypt_aegis(
     original_name: &str,
     reader: &mut dyn Read,
     writer: &mut dyn Write,
+    version: u8,
+    original_size: Option<u64>,
 ) -> Result<(), CryptoError> {
     let wrap_key = wrap_key(master)?;
     let file_key = random_key();
@@ -498,7 +761,7 @@ fn encrypt_aegis(
 
     let mut header = [0u8; AEGIS_HEADER_LEN];
     header[0..4].copy_from_slice(MAGIC);
-    header[4] = NAMED_VERSION;
+    header[4] = version;
     header[5..9].copy_from_slice(&CHUNK_SIZE.to_be_bytes());
     header[9..41].copy_from_slice(wrap_nonce.as_slice());
     let mut wrapped = file_key.to_vec();
@@ -509,7 +772,7 @@ fn encrypt_aegis(
     header[105..AEGIS_HEADER_LEN].copy_from_slice(&prefix);
     wrapped.zeroize();
 
-    let mut slot = pack_name(original_name)?;
+    let mut slot = pack_name(original_name, original_size)?;
     let sealed_name = seal(&file_key, &name_nonce, &header, slot.as_slice());
     slot.zeroize();
 
@@ -542,6 +805,8 @@ struct OpenedNamed {
     chunk_size: usize,
     body_aad: Vec<u8>,
     name: String,
+    original_size: Option<u64>,
+    version: u8,
 }
 
 fn open_named(reader: &mut dyn Read, master: &[u8; 32]) -> Result<OpenedNamed, CryptoError> {
@@ -550,7 +815,10 @@ fn open_named(reader: &mut dyn Read, master: &[u8; 32]) -> Result<OpenedNamed, C
     if &header[0..4] != MAGIC {
         return Err(CryptoError::NotEncrypted);
     }
-    if header[4] != NAMED_VERSION {
+    if !matches!(
+        header[4],
+        NAMED_VERSION | BUNDLE_VERSION | COMPRESSED_BUNDLE_VERSION
+    ) {
         return Err(CryptoError::UnsupportedVersion(header[4]));
     }
     let chunk_size = u32::from_be_bytes([header[5], header[6], header[7], header[8]]);
@@ -569,7 +837,7 @@ fn open_named(reader: &mut dyn Read, master: &[u8; 32]) -> Result<OpenedNamed, C
     body_aad.extend_from_slice(&name_nonce);
     body_aad.extend_from_slice(&sealed_name);
     open_sealed(&file_key, &name_nonce, &header, &mut sealed_name)?;
-    let name = unpack_name(&sealed_name)?;
+    let (name, original_size) = unpack_name(&sealed_name, header[4])?;
     sealed_name.zeroize();
 
     Ok(OpenedNamed {
@@ -578,6 +846,8 @@ fn open_named(reader: &mut dyn Read, master: &[u8; 32]) -> Result<OpenedNamed, C
         chunk_size: chunk_size as usize,
         body_aad,
         name,
+        original_size,
+        version: header[4],
     })
 }
 
@@ -589,7 +859,7 @@ fn unwrap_file_key(
     let mut wrap_nonce = [0u8; 32];
     wrap_nonce.copy_from_slice(&header[9..41]);
     let mut wrapped = header[41..105].to_vec();
-    open_sealed(&*wrap_key, &wrap_nonce, &header[..9], &mut wrapped)?;
+    open_sealed(&wrap_key, &wrap_nonce, &header[..9], &mut wrapped)?;
     if wrapped.len() != 32 {
         wrapped.zeroize();
         return Err(CryptoError::AuthenticationFailed);
@@ -600,9 +870,13 @@ fn unwrap_file_key(
     Ok(file_key)
 }
 
-fn pack_name(name: &str) -> Result<Zeroizing<[u8; NAME_SLOT]>, CryptoError> {
+fn pack_name(
+    name: &str,
+    original_size: Option<u64>,
+) -> Result<Zeroizing<[u8; NAME_SLOT]>, CryptoError> {
     let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.len() > NAME_SLOT - 2 {
+    let trailing = if original_size.is_some() { 8 } else { 0 };
+    if bytes.is_empty() || bytes.len() > NAME_SLOT - 2 - trailing {
         return Err(CryptoError::NotAFile(format!(
             "cannot encrypt this file name: {name}"
         )));
@@ -611,23 +885,145 @@ fn pack_name(name: &str) -> Result<Zeroizing<[u8; NAME_SLOT]>, CryptoError> {
     let len = u16::try_from(bytes.len()).map_err(|_| CryptoError::EncryptFailed)?;
     slot[0..2].copy_from_slice(&len.to_be_bytes());
     slot[2..2 + bytes.len()].copy_from_slice(bytes);
+    if let Some(size) = original_size {
+        slot[2 + bytes.len()..2 + bytes.len() + 8].copy_from_slice(&size.to_be_bytes());
+    }
     Ok(slot)
 }
 
-fn unpack_name(slot: &[u8]) -> Result<String, CryptoError> {
+fn unpack_name(slot: &[u8], version: u8) -> Result<(String, Option<u64>), CryptoError> {
     if slot.len() != NAME_SLOT {
         return Err(CryptoError::AuthenticationFailed);
     }
     let len = u16::from_be_bytes([slot[0], slot[1]]) as usize;
-    if len > NAME_SLOT - 2 {
+    let trailing = if version == COMPRESSED_BUNDLE_VERSION {
+        8
+    } else {
+        0
+    };
+    if len > NAME_SLOT - 2 - trailing {
         return Err(CryptoError::AuthenticationFailed);
     }
-    if slot[2 + len..].iter().any(|byte| *byte != 0) {
+    if slot[2 + len + trailing..].iter().any(|byte| *byte != 0) {
         return Err(CryptoError::AuthenticationFailed);
     }
     let name = std::str::from_utf8(&slot[2..2 + len]).map_err(|_| CryptoError::BadEncryptedName)?;
-    validate_file_name(name)?;
-    Ok(name.to_string())
+    if version == NAMED_VERSION {
+        validate_file_name(name)?;
+    } else {
+        validate_relative_name(name)?;
+    }
+    let size = if trailing == 8 {
+        Some(u64::from_be_bytes(
+            slot[2 + len..2 + len + 8].try_into().unwrap(),
+        ))
+    } else {
+        None
+    };
+    Ok((name.to_string(), size))
+}
+
+pub(crate) fn validate_relative_name(name: &str) -> Result<(), CryptoError> {
+    if name.is_empty()
+        || name.len() > NAME_SLOT - 10
+        || name.starts_with('/')
+        || name.split('/').any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || part.ends_with([' ', '.'])
+                || part.chars().any(|ch| matches!(ch, '\\' | '\0' | ':'))
+        })
+    {
+        return Err(CryptoError::BadEncryptedName);
+    }
+    Ok(())
+}
+
+fn ensure_no_linked_parent(root: &Path, output: &Path) -> Result<(), CryptoError> {
+    let relative = output
+        .strip_prefix(root)
+        .map_err(|_| CryptoError::BadEncryptedName)?;
+    let mut parent = root.to_path_buf();
+    for part in relative
+        .components()
+        .take(relative.components().count().saturating_sub(1))
+    {
+        parent.push(part);
+        match fs::symlink_metadata(&parent) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(CryptoError::NotAFile(format!(
+                    "unsafe output folder: {}",
+                    parent.display()
+                )))
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+struct BoundedWriter<'a> {
+    inner: &'a mut dyn Write,
+    remaining: u64,
+}
+
+impl Write for BoundedWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() as u64 > self.remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compressed file exceeds its stored size",
+            ));
+        }
+        let written = self.inner.write(bytes)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn decrypt_named_body(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    opened: &OpenedNamed,
+) -> Result<(), CryptoError> {
+    if opened.version == COMPRESSED_BUNDLE_VERSION {
+        let mut bounded = BoundedWriter {
+            inner: writer,
+            remaining: opened
+                .original_size
+                .ok_or(CryptoError::AuthenticationFailed)?,
+        };
+        let mut decoder = flate2::write::ZlibDecoder::new(&mut bounded);
+        decrypt_chunks(
+            reader,
+            &mut decoder,
+            &opened.file_key,
+            &opened.prefix,
+            opened.chunk_size,
+            &opened.body_aad,
+        )?;
+        decoder.finish()?;
+        if bounded.remaining != 0 {
+            return Err(CryptoError::Truncated);
+        }
+        Ok(())
+    } else {
+        decrypt_chunks(
+            reader,
+            writer,
+            &opened.file_key,
+            &opened.prefix,
+            opened.chunk_size,
+            &opened.body_aad,
+        )
+    }
 }
 
 fn validate_file_name(name: &str) -> Result<(), CryptoError> {
@@ -903,10 +1299,21 @@ pub(crate) fn write_transformed(
 }
 
 fn commit_partial(partial: &Path, output: &Path, overwrite: bool) -> Result<(), CryptoError> {
-    if output.exists() && !overwrite {
-        return Err(CryptoError::OutputExists(output.display().to_string()));
-    }
-    if output.exists() {
+    let existing = match fs::symlink_metadata(output) {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
+    if let Some(metadata) = existing {
+        if !overwrite {
+            return Err(CryptoError::OutputExists(output.display().to_string()));
+        }
+        if !metadata.is_file() {
+            return Err(CryptoError::NotAFile(format!(
+                "existing output is not a regular file: {}",
+                output.display()
+            )));
+        }
         let backup = sibling(
             output,
             &format!(".fileencrypt-bak-{}", opaque_file_name().to_string_lossy()),
@@ -1149,6 +1556,30 @@ mod tests {
     }
 
     #[test]
+    fn rotation_streams_plaintext_without_publishing_a_partial_file() {
+        let dir = TempDir::new();
+        let source = dir.path().join("payload.txt");
+        let body = vec![b'R'; 250_000];
+        fs::write(&source, &body).unwrap();
+        let old = test_key(16);
+        let new = test_key(17);
+        let encrypted = encrypt_file(&old, &source, &options(false, false)).unwrap();
+        fs::remove_file(&source).unwrap();
+        assert!(
+            rotate_file_with_progress(&new, &old, &encrypted, &options(false, false), None)
+                .is_err()
+        );
+        let rotated =
+            rotate_file_with_progress(&old, &new, &encrypted, &options(false, false), None)
+                .unwrap();
+        assert!(encrypted.exists());
+        assert!(verify_file(&old, &rotated, None).is_err());
+        verify_file(&new, &rotated, None).unwrap();
+        let restored = decrypt_file(&new, &rotated, &options(false, false)).unwrap();
+        assert_eq!(fs::read(restored).unwrap(), body);
+    }
+
+    #[test]
     fn ciphertext_hides_a_plaintext_marker_and_changes_nonce() {
         let dir = TempDir::new();
         let input = dir.path().join("secret.txt");
@@ -1254,6 +1685,24 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_never_replaces_an_output_directory() {
+        let dir = TempDir::new();
+        let input = dir.path().join("report.txt");
+        fs::write(&input, b"secret").unwrap();
+        let key = test_key(4);
+        let encrypted = encrypt_file(&key, &input, &options(false, false)).unwrap();
+        fs::remove_file(&input).unwrap();
+        fs::create_dir(&input).unwrap();
+        let child = input.join("keep.txt");
+        fs::write(&child, b"keep").unwrap();
+
+        let err = decrypt_file(&key, &encrypted, &options(true, true)).unwrap_err();
+        assert!(matches!(err, CryptoError::NotAFile(_)));
+        assert_eq!(fs::read(&child).unwrap(), b"keep");
+        assert!(encrypted.exists());
+    }
+
+    #[test]
     fn output_dir_collects_results_and_keeps_names_distinct() {
         let dir = TempDir::new();
         let out = dir.path().join("collected");
@@ -1321,7 +1770,7 @@ mod tests {
         slot[0..2].copy_from_slice(&(sneaky.len() as u16).to_be_bytes());
         slot[2..2 + sneaky.len()].copy_from_slice(sneaky);
         assert!(matches!(
-            unpack_name(&slot),
+            unpack_name(&slot, NAMED_VERSION),
             Err(CryptoError::BadEncryptedName)
         ));
     }

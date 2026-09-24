@@ -164,12 +164,13 @@ pub fn read_key_file_with_passphrase(
 }
 
 pub fn parse_key_material(text: &str) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
-    let compact: String = text
-        .trim()
-        .trim_start_matches('\u{feff}')
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect();
+    let compact = Zeroizing::new(
+        text.trim()
+            .trim_start_matches('\u{feff}')
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>(),
+    );
     if compact.is_empty() {
         return Err(CryptoError::InvalidKeyMaterial);
     }
@@ -203,11 +204,12 @@ fn parse_key_file(
         let nonce = STANDARD
             .decode(lines[3])
             .map_err(|_| CryptoError::InvalidKeyFile("invalid key nonce".into()))?;
-        let mut sealed = STANDARD
-            .decode(lines[4])
-            .map_err(|_| CryptoError::InvalidKeyFile("invalid protected key".into()))?;
+        let mut sealed = Zeroizing::new(
+            STANDARD
+                .decode(lines[4])
+                .map_err(|_| CryptoError::InvalidKeyFile("invalid protected key".into()))?,
+        );
         if salt.len() != 16 || nonce.len() != 32 || sealed.len() != 64 {
-            sealed.zeroize();
             return Err(CryptoError::InvalidKeyFile(
                 "invalid protected key length".into(),
             ));
@@ -224,7 +226,6 @@ fn parse_key_file(
             })?;
         let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&sealed);
-        sealed.zeroize();
         return Ok(key);
     }
     if lines.len() != 2 || lines[0] != HEADER {

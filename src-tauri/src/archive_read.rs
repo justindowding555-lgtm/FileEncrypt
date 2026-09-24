@@ -29,7 +29,7 @@ fn u64le(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
 }
 
-fn read_at(file: &mut File, offset: u64, bytes: &mut [u8]) -> Result<(), CryptoError> {
+fn read_at<R: Read + Seek>(file: &mut R, offset: u64, bytes: &mut [u8]) -> Result<(), CryptoError> {
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(bytes)
         .map_err(|_| invalid("truncated archive"))
@@ -37,7 +37,11 @@ fn read_at(file: &mut File, offset: u64, bytes: &mut [u8]) -> Result<(), CryptoE
 
 pub fn entries(path: &Path) -> Result<Vec<Entry>, CryptoError> {
     let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
+    entries_from_reader(&mut file)
+}
+
+pub fn entries_from_reader<R: Read + Seek>(mut file: &mut R) -> Result<Vec<Entry>, CryptoError> {
+    let file_len = file.seek(SeekFrom::End(0))?;
     if file_len < 22 {
         return Err(invalid("missing ZIP directory"));
     }
@@ -267,6 +271,20 @@ mod tests {
     use super::*;
     use crate::archive;
     use crate::crypto::JobOptions;
+
+    #[test]
+    fn fuzz_seed_parses_and_truncations_do_not_panic() {
+        let seed = include_bytes!("../../fuzz/corpus/zip_reader/one-entry.zip");
+        assert_eq!(
+            entries_from_reader(&mut std::io::Cursor::new(seed))
+                .unwrap()
+                .len(),
+            1
+        );
+        for len in 0..seed.len() {
+            let _ = entries_from_reader(&mut std::io::Cursor::new(&seed[..len]));
+        }
+    }
 
     #[test]
     fn app_zip_can_be_inspected_extracted_and_decrypted() {
