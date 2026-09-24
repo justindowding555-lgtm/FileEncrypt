@@ -30,9 +30,9 @@ use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::stream::DecryptorBE32;
 #[cfg(test)]
 use aes_gcm::aead::stream::EncryptorBE32;
-use aes_gcm::aead::{KeyInit, OsRng};
 #[cfg(test)]
 use aes_gcm::aead::AeadCore;
+use aes_gcm::aead::{KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -85,10 +85,7 @@ pub enum CryptoError {
     #[error("the stored file name is not a single file name")]
     BadEncryptedName,
     #[error("wrote {output}, but could not delete the original file: {source}")]
-    OriginalRemains {
-        output: String,
-        source: io::Error,
-    },
+    OriginalRemains { output: String, source: io::Error },
 }
 
 #[derive(Debug, Clone)]
@@ -136,15 +133,118 @@ pub fn encrypt_file(
     input: &Path,
     options: &JobOptions,
 ) -> Result<PathBuf, CryptoError> {
-    transform(Direction::Encrypt, key, input, options)
+    transform(Direction::Encrypt, key, input, options, None)
 }
 
+#[cfg(test)]
 pub fn decrypt_file(
     key: &[u8; 32],
     input: &Path,
     options: &JobOptions,
 ) -> Result<PathBuf, CryptoError> {
-    transform(Direction::Decrypt, key, input, options)
+    transform(Direction::Decrypt, key, input, options, None)
+}
+
+pub type ProgressCallback<'a> = dyn Fn(u64) -> io::Result<()> + 'a;
+
+struct ProgressReader<'a, R> {
+    inner: R,
+    callback: &'a ProgressCallback<'a>,
+}
+
+impl<R: Read> Read for ProgressReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        (self.callback)(0)?;
+        let count = self.inner.read(buffer)?;
+        if count > 0 {
+            (self.callback)(count as u64)?;
+        }
+        Ok(count)
+    }
+}
+
+pub fn encrypt_file_with_progress(
+    key: &[u8; 32],
+    input: &Path,
+    options: &JobOptions,
+    callback: &ProgressCallback<'_>,
+) -> Result<PathBuf, CryptoError> {
+    transform(Direction::Encrypt, key, input, options, Some(callback))
+}
+
+pub fn decrypt_file_with_progress(
+    key: &[u8; 32],
+    input: &Path,
+    options: &JobOptions,
+    callback: &ProgressCallback<'_>,
+) -> Result<PathBuf, CryptoError> {
+    transform(Direction::Decrypt, key, input, options, Some(callback))
+}
+
+pub fn inspect_output_name(
+    key: &[u8; 32],
+    input: &Path,
+) -> Result<std::ffi::OsString, CryptoError> {
+    match legacy_version(input)? {
+        Some(NAMED_VERSION) => {
+            let mut reader = BufReader::new(File::open(input)?);
+            Ok(open_named(&mut reader, key)?.name.into())
+        }
+        Some(LEGACY_VERSION | AEGIS_VERSION) => decrypted_file_name(file_name(input)?),
+        Some(version) => Err(CryptoError::UnsupportedVersion(version)),
+        None => Err(CryptoError::NotEncrypted),
+    }
+}
+
+pub(crate) fn named_file_name_from_reader(
+    key: &[u8; 32],
+    reader: &mut dyn Read,
+) -> Result<String, CryptoError> {
+    Ok(open_named(reader, key)?.name)
+}
+
+pub fn verify_file(
+    key: &[u8; 32],
+    input: &Path,
+    callback: Option<&ProgressCallback<'_>>,
+) -> Result<(), CryptoError> {
+    let file = File::open(input)?;
+    let mut reader = BufReader::new(file);
+    let mut sink = io::sink();
+    if let Some(callback) = callback {
+        let mut reader = ProgressReader {
+            inner: reader,
+            callback,
+        };
+        verify_reader(key, input, &mut reader, &mut sink)
+    } else {
+        verify_reader(key, input, &mut reader, &mut sink)
+    }
+}
+
+fn verify_reader(
+    key: &[u8; 32],
+    input: &Path,
+    reader: &mut dyn Read,
+    sink: &mut dyn Write,
+) -> Result<(), CryptoError> {
+    match legacy_version(input)? {
+        Some(NAMED_VERSION) => {
+            let opened = open_named(reader, key)?;
+            decrypt_chunks(
+                reader,
+                sink,
+                &opened.file_key,
+                &opened.prefix,
+                opened.chunk_size,
+                &opened.body_aad,
+            )
+        }
+        Some(AEGIS_VERSION) => decrypt_aegis(key, reader, sink),
+        Some(LEGACY_VERSION) => decrypt_stream(key, reader, sink),
+        Some(version) => Err(CryptoError::UnsupportedVersion(version)),
+        None => Err(CryptoError::NotEncrypted),
+    }
 }
 
 pub(crate) fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<(), CryptoError> {
@@ -153,10 +253,13 @@ pub(crate) fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<(), Crypt
             fs::create_dir_all(parent)?;
         }
     }
-    let partial = sibling(destination, ".partial")?;
+    let partial = sibling(
+        destination,
+        &format!(".partial-{}", opaque_file_name().to_string_lossy()),
+    )?;
     let _guard = DeleteOnDrop { path: &partial };
     {
-        let mut file = File::create(&partial)?;
+        let mut file = create_private_file(&partial)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
@@ -169,6 +272,7 @@ fn transform(
     key: &[u8; 32],
     input: &Path,
     options: &JobOptions,
+    callback: Option<&ProgressCallback<'_>>,
 ) -> Result<PathBuf, CryptoError> {
     if !input.exists() {
         return Err(CryptoError::NotAFile(format!(
@@ -185,13 +289,24 @@ fn transform(
 
     match direction {
         Direction::Encrypt => {
-            let output = opaque_output_path(input, options.output_dir.as_deref(), options.overwrite)?;
+            let output =
+                opaque_output_path(input, options.output_dir.as_deref(), options.overwrite)?;
             let original_name = file_name_utf8(input)?;
             finish_job(input, output, options, |destination| {
                 let input_file = File::open(input)?;
                 let mut reader = BufReader::new(input_file);
                 write_transformed(destination, options.overwrite, |writer| {
-                    encrypt_aegis(key, &original_name, &mut reader, writer)
+                    let result = if let Some(callback) = callback {
+                        let mut reader = ProgressReader {
+                            inner: reader,
+                            callback,
+                        };
+                        encrypt_aegis(key, &original_name, &mut reader, writer)
+                    } else {
+                        encrypt_aegis(key, &original_name, &mut reader, writer)
+                    };
+                    result?;
+                    check_progress(callback)
                 })
             })
         }
@@ -202,7 +317,17 @@ fn transform(
                     let input_file = File::open(input)?;
                     let mut reader = BufReader::new(input_file);
                     write_transformed(destination, options.overwrite, |writer| {
-                        decrypt_stream(key, &mut reader, writer)
+                        let result = if let Some(callback) = callback {
+                            let mut reader = ProgressReader {
+                                inner: reader,
+                                callback,
+                            };
+                            decrypt_stream(key, &mut reader, writer)
+                        } else {
+                            decrypt_stream(key, &mut reader, writer)
+                        };
+                        result?;
+                        check_progress(callback)
                     })
                 })
             }
@@ -212,15 +337,32 @@ fn transform(
                     let input_file = File::open(input)?;
                     let mut reader = BufReader::new(input_file);
                     write_transformed(destination, options.overwrite, |writer| {
-                        decrypt_aegis(key, &mut reader, writer)
+                        let result = if let Some(callback) = callback {
+                            let mut reader = ProgressReader {
+                                inner: reader,
+                                callback,
+                            };
+                            decrypt_aegis(key, &mut reader, writer)
+                        } else {
+                            decrypt_aegis(key, &mut reader, writer)
+                        };
+                        result?;
+                        check_progress(callback)
                     })
                 })
             }
-            Some(NAMED_VERSION) => decrypt_named(key, input, options),
+            Some(NAMED_VERSION) => decrypt_named(key, input, options, callback),
             Some(version) => Err(CryptoError::UnsupportedVersion(version)),
             None => Err(CryptoError::NotEncrypted),
         },
     }
+}
+
+fn check_progress(callback: Option<&ProgressCallback<'_>>) -> Result<(), CryptoError> {
+    if let Some(callback) = callback {
+        callback(0)?;
+    }
+    Ok(())
 }
 
 fn finish_job(
@@ -245,9 +387,22 @@ fn finish_job(
     Ok(output)
 }
 
-fn decrypt_named(key: &[u8; 32], input: &Path, options: &JobOptions) -> Result<PathBuf, CryptoError> {
+fn decrypt_named(
+    key: &[u8; 32],
+    input: &Path,
+    options: &JobOptions,
+    callback: Option<&ProgressCallback<'_>>,
+) -> Result<PathBuf, CryptoError> {
     let input_file = File::open(input)?;
-    let mut reader = BufReader::new(input_file);
+    let reader = BufReader::new(input_file);
+    let mut reader: Box<dyn Read + '_> = if let Some(callback) = callback {
+        Box::new(ProgressReader {
+            inner: reader,
+            callback,
+        })
+    } else {
+        Box::new(reader)
+    };
     let opened = open_named(&mut reader, key)?;
     let output = place(
         input,
@@ -263,7 +418,8 @@ fn decrypt_named(key: &[u8; 32], input: &Path, options: &JobOptions) -> Result<P
                 &opened.prefix,
                 opened.chunk_size,
                 &opened.body_aad,
-            )
+            )?;
+            check_progress(callback)
         })
     })
 }
@@ -284,7 +440,11 @@ fn wrap_key(master: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     Ok(key)
 }
 
-fn chunk_nonce(prefix: &[u8; STREAM_PREFIX_LEN], index: u64, last: bool) -> Result<[u8; 32], CryptoError> {
+fn chunk_nonce(
+    prefix: &[u8; STREAM_PREFIX_LEN],
+    index: u64,
+    last: bool,
+) -> Result<[u8; 32], CryptoError> {
     if index & (1 << 63) != 0 {
         return Err(CryptoError::EncryptFailed);
     }
@@ -421,7 +581,10 @@ fn open_named(reader: &mut dyn Read, master: &[u8; 32]) -> Result<OpenedNamed, C
     })
 }
 
-fn unwrap_file_key(master: &[u8; 32], header: &[u8; AEGIS_HEADER_LEN]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+fn unwrap_file_key(
+    master: &[u8; 32],
+    header: &[u8; AEGIS_HEADER_LEN],
+) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     let wrap_key = wrap_key(master)?;
     let mut wrap_nonce = [0u8; 32];
     wrap_nonce.copy_from_slice(&header[9..41]);
@@ -492,7 +655,11 @@ fn read_exact_vec(reader: &mut dyn Read, len: usize) -> Result<Vec<u8>, CryptoEr
     Ok(buf)
 }
 
-fn decrypt_aegis(master: &[u8; 32], reader: &mut dyn Read, writer: &mut dyn Write) -> Result<(), CryptoError> {
+fn decrypt_aegis(
+    master: &[u8; 32],
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+) -> Result<(), CryptoError> {
     let mut header = [0u8; AEGIS_HEADER_LEN];
     reader.read_exact(&mut header).map_err(|err| {
         if err.kind() == io::ErrorKind::UnexpectedEof {
@@ -578,8 +745,7 @@ fn encrypt_stream(
     writer.write_all(&header)?;
 
     let nonce = GenericArray::from_slice(&nonce_prefix);
-    let mut encryptor =
-        EncryptorBE32::<Aes256Gcm>::new(Key::<Aes256Gcm>::from_slice(key), nonce);
+    let mut encryptor = EncryptorBE32::<Aes256Gcm>::new(Key::<Aes256Gcm>::from_slice(key), nonce);
     let aad = &header[..AAD_LEN];
     let chunk = CHUNK_SIZE as usize;
 
@@ -609,8 +775,7 @@ fn decrypt_stream(
 ) -> Result<(), CryptoError> {
     let header = read_header(reader)?;
     let nonce = GenericArray::from_slice(&header.nonce);
-    let mut decryptor =
-        DecryptorBE32::<Aes256Gcm>::new(Key::<Aes256Gcm>::from_slice(key), nonce);
+    let mut decryptor = DecryptorBE32::<Aes256Gcm>::new(Key::<Aes256Gcm>::from_slice(key), nonce);
     let frame = header.chunk_size + TAG_LEN;
     let aad = header.aad.as_slice();
 
@@ -694,7 +859,14 @@ fn read_up_to(reader: &mut dyn Read, max: usize) -> Result<Vec<u8>, CryptoError>
     let mut buf = vec![0u8; max];
     let mut filled = 0;
     while filled < max {
-        match reader.read(&mut buf[filled..])? {
+        let read = match reader.read(&mut buf[filled..]) {
+            Ok(read) => read,
+            Err(err) => {
+                buf.zeroize();
+                return Err(err.into());
+            }
+        };
+        match read {
             0 => break,
             n => filled += n,
         }
@@ -713,10 +885,13 @@ pub(crate) fn write_transformed(
             fs::create_dir_all(parent)?;
         }
     }
-    let partial = sibling(output, ".partial")?;
+    let partial = sibling(
+        output,
+        &format!(".partial-{}", opaque_file_name().to_string_lossy()),
+    )?;
     let _guard = DeleteOnDrop { path: &partial };
     {
-        let file = File::create(&partial)?;
+        let file = create_private_file(&partial)?;
         let mut writer = BufWriter::new(file);
         produce(&mut writer)?;
         writer.flush()?;
@@ -732,8 +907,10 @@ fn commit_partial(partial: &Path, output: &Path, overwrite: bool) -> Result<(), 
         return Err(CryptoError::OutputExists(output.display().to_string()));
     }
     if output.exists() {
-        let backup = sibling(output, ".fileencrypt-bak")?;
-        let _ = fs::remove_file(&backup);
+        let backup = sibling(
+            output,
+            &format!(".fileencrypt-bak-{}", opaque_file_name().to_string_lossy()),
+        )?;
         fs::rename(output, &backup)?;
         if let Err(err) = fs::rename(partial, output) {
             let _ = fs::rename(&backup, output);
@@ -742,11 +919,32 @@ fn commit_partial(partial: &Path, output: &Path, overwrite: bool) -> Result<(), 
         let _ = fs::remove_file(&backup);
         return Ok(());
     }
-    fs::rename(partial, output)?;
+    if overwrite {
+        fs::rename(partial, output)?;
+    } else {
+        // Creating the hard link fails if another process created the output after preflight.
+        fs::hard_link(partial, output)?;
+        fs::remove_file(partial)?;
+    }
     Ok(())
 }
 
-fn output_path(input: &Path, output_dir: Option<&Path>, direction: Direction) -> Result<PathBuf, CryptoError> {
+fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn output_path(
+    input: &Path,
+    output_dir: Option<&Path>,
+    direction: Direction,
+) -> Result<PathBuf, CryptoError> {
     let name = match direction {
         Direction::Encrypt => opaque_file_name(),
         Direction::Decrypt => decrypted_file_name(file_name(input)?)?,
@@ -770,7 +968,11 @@ fn opaque_output_path(
 
 pub(crate) fn opaque_file_name() -> std::ffi::OsString {
     let bytes = random_key();
-    let hex: String = bytes.iter().take(16).map(|byte| format!("{byte:02x}")).collect();
+    let hex: String = bytes
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let mut name = std::ffi::OsString::from(hex);
     name.push(".fenc");
     name
@@ -778,12 +980,16 @@ pub(crate) fn opaque_file_name() -> std::ffi::OsString {
 
 fn file_name_utf8(path: &Path) -> Result<String, CryptoError> {
     let name = file_name(path)?;
-    name.to_str()
-        .map(str::to_string)
-        .ok_or_else(|| CryptoError::NotAFile(format!("file name is not valid text: {}", path.display())))
+    name.to_str().map(str::to_string).ok_or_else(|| {
+        CryptoError::NotAFile(format!("file name is not valid text: {}", path.display()))
+    })
 }
 
-fn place(input: &Path, output_dir: Option<&Path>, name: &std::ffi::OsStr) -> Result<PathBuf, CryptoError> {
+fn place(
+    input: &Path,
+    output_dir: Option<&Path>,
+    name: &std::ffi::OsStr,
+) -> Result<PathBuf, CryptoError> {
     match output_dir {
         Some(dir) if !dir.as_os_str().is_empty() => {
             if dir.exists() && !dir.is_dir() {
@@ -895,7 +1101,9 @@ mod tests {
         let name = path.file_name().unwrap().to_string_lossy();
         name.len() == 32 + 5
             && name.ends_with(".fenc")
-            && name.as_bytes()[..32].iter().all(|byte| byte.is_ascii_hexdigit())
+            && name.as_bytes()[..32]
+                .iter()
+                .all(|byte| byte.is_ascii_hexdigit())
     }
 
     fn options(overwrite: bool, remove_original: bool) -> JobOptions {
@@ -952,7 +1160,9 @@ mod tests {
         assert!(!first.windows(marker.len()).any(|window| window == marker));
         assert!(first.starts_with(b"FENC"));
         assert_eq!(first[4], NAMED_VERSION);
-        assert!(!first.windows(b"secret.txt".len()).any(|window| window == b"secret.txt"));
+        assert!(!first
+            .windows(b"secret.txt".len())
+            .any(|window| window == b"secret.txt"));
 
         let again = encrypt_file(&key, &input, &options(true, false)).unwrap();
         let second = fs::read(&again).unwrap();
@@ -1099,7 +1309,9 @@ mod tests {
         fs::write(&input, b"numbers").unwrap();
         let encrypted = encrypt_file(&test_key(12), &input, &options(false, false)).unwrap();
         let stored = fs::read(&encrypted).unwrap();
-        assert!(!stored.windows(b"quarterly-report.txt".len()).any(|window| window == b"quarterly-report.txt"));
+        assert!(!stored
+            .windows(b"quarterly-report.txt".len())
+            .any(|window| window == b"quarterly-report.txt"));
         fs::remove_file(&input).unwrap();
         let decrypted = decrypt_file(&test_key(12), &encrypted, &options(false, false)).unwrap();
         assert_eq!(decrypted.file_name().unwrap(), "quarterly-report.txt");
@@ -1108,7 +1320,10 @@ mod tests {
         let sneaky = b"../secret.txt";
         slot[0..2].copy_from_slice(&(sneaky.len() as u16).to_be_bytes());
         slot[2..2 + sneaky.len()].copy_from_slice(sneaky);
-        assert!(matches!(unpack_name(&slot), Err(CryptoError::BadEncryptedName)));
+        assert!(matches!(
+            unpack_name(&slot),
+            Err(CryptoError::BadEncryptedName)
+        ));
     }
 
     #[cfg(windows)]
@@ -1134,5 +1349,25 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(fs::read(&input).unwrap(), b"data");
+    }
+
+    #[test]
+    fn cancelled_encryption_does_not_publish_partial_output() {
+        let dir = TempDir::new();
+        let input = dir.path().join("large.bin");
+        fs::write(&input, vec![4u8; CHUNK_SIZE as usize * 3]).unwrap();
+        let callback = |bytes: u64| -> io::Result<()> {
+            if bytes > 0 {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(
+            encrypt_file_with_progress(&[1u8; 32], &input, &options(false, false), &callback)
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(input.exists());
     }
 }

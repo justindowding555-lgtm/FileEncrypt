@@ -1,4 +1,5 @@
 mod archive;
+mod archive_read;
 mod commands;
 mod crypto;
 mod key_file;
@@ -17,6 +18,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
             commands::pick_input_files,
+            commands::pick_input_folder,
+            commands::expand_dropped_paths,
             commands::pick_save_path,
             commands::pick_output_dir,
             commands::set_output_dir,
@@ -24,9 +27,12 @@ pub fn run() {
             commands::save_typed_key,
             commands::load_key,
             commands::browse_key,
+            commands::backup_key,
+            commands::check_key_backup,
             commands::unload_key,
-            commands::encrypt_files,
-            commands::decrypt_files,
+            commands::preview_job,
+            commands::run_job,
+            commands::cancel_job,
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileEncrypt");

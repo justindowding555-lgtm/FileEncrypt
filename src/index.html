@@ -40,16 +40,23 @@
               <button type="button" id="generate">Generate and save</button>
               <button type="button" id="browse-load">Browse and load</button>
             </div>
-            <p class="key-note">Keep your key file safe. Anyone with it can decrypt your files. A lost key cannot be recovered.</p>
+            <p class="key-note">Back up your key file separately. A lost key cannot be recovered. A passphrase can protect a newly saved key file.</p>
             <details class="key-options">
               <summary>Key options</summary>
               <div class="details-content">
+                <label class="field-label" for="key-passphrase">Key file passphrase (optional for new keys; required to open protected keys)</label>
+                <input id="key-passphrase" type="password" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" placeholder="Leave blank for an unprotected key file" />
+                <p class="sub">The passphrase protects the key file. Losing both the key file and its backup makes encrypted files unrecoverable.</p>
                 <label class="field-label" for="key-path">Key file path</label>
                 <input id="key-path" type="text" spellcheck="false" autocomplete="off" placeholder="Choose or enter a path" />
                 <div class="row path-actions">
                   <button type="button" id="set-path">Set path</button>
                   <button type="button" id="load">Load</button>
                   <button type="button" id="unload" disabled>Unload</button>
+                </div>
+                <div class="row path-actions">
+                  <button type="button" id="backup-key">Back up key</button>
+                  <button type="button" id="check-backup">Check backup</button>
                 </div>
                 <details>
                   <summary>Use a specific key</summary>
@@ -71,14 +78,17 @@
             </div>
             <div class="file-toolbar">
               <p class="sub">Choose the files you want to protect or restore.</p>
-              <button type="button" id="add-files"><span aria-hidden="true">+</span> Add files</button>
+              <div class="row">
+                <button type="button" id="add-files"><span aria-hidden="true">+</span> Add files</button>
+                <button type="button" id="add-folder">Add folder</button>
+              </div>
             </div>
             <div id="file-empty" class="empty">
               <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9zM14 3v6h6M8 13h8M8 17h5" />
               </svg>
               <p>No files selected</p>
-              <span>Add one file or several at once.</span>
+              <span>Add files, a folder, or drop them here.</span>
             </div>
             <ul id="file-list" class="file-list" aria-label="Selected files"></ul>
             <div class="output-settings">
@@ -95,15 +105,33 @@
             <div class="checks">
               <label class="check"><input id="overwrite" type="checkbox" />Replace existing output files</label>
               <label class="check"><input id="remove-original" type="checkbox" />Delete originals after success</label>
+              <p class="sub zip-hint">This is normal file deletion, not secure erasure.</p>
               <label class="check"><input id="zip" type="checkbox" aria-describedby="zip-hint" />Group encrypted files into one ZIP</label>
-              <p id="zip-hint" class="sub zip-hint">The ZIP contains encrypted .fenc files. Extract them before decrypting.</p>
+              <p id="zip-hint" class="sub zip-hint">ZIPs contain encrypted .fenc files and can be decrypted directly here.</p>
+              <label class="check"><input id="review-first" type="checkbox" />Review plan before starting</label>
             </div>
             <div class="actions">
               <button type="button" class="primary" id="encrypt" disabled>Encrypt files</button>
               <button type="button" id="decrypt" disabled>Decrypt files</button>
+              <button type="button" id="verify" disabled>Verify files</button>
               <button type="button" class="text-button" id="clear-files" disabled>Clear list</button>
             </div>
             <p id="action-hint" class="action-hint" aria-live="polite">Load a key and add files to get started.</p>
+            <section id="preview-panel" class="preview-panel" aria-label="Job preview" hidden>
+              <h3 id="preview-heading">Review operation</h3>
+              <p id="preview-summary" class="sub"></p>
+              <ul id="preview-list" class="preview-list"></ul>
+              <ul id="preview-warnings" class="preview-warnings"></ul>
+              <div class="row preview-actions">
+                <button type="button" id="start-job" class="primary">Start job</button>
+                <button type="button" id="dismiss-preview">Cancel</button>
+              </div>
+            </section>
+            <section id="progress-panel" class="progress-panel" aria-label="Job progress" hidden>
+              <p id="progress-label" aria-live="polite">Preparing...</p>
+              <progress id="job-progress" max="100" value="0"></progress>
+              <button type="button" id="cancel-job">Cancel job</button>
+            </section>
           </section>
         </div>
         <section class="results-panel" aria-labelledby="results-heading">

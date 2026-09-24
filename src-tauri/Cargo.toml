@@ -26,6 +26,7 @@ aegis = { version = "0.9", features = ["pure-rust"] }
 hkdf = "0.12"
 base64 = "0.22"
 sha2 = "0.10"
+hmac = "0.12"
 zeroize = "1"
 thiserror = "2"
 crc32fast = "1.5.2"

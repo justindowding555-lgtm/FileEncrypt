@@ -22,10 +22,21 @@ pub struct ArchiveOutcome {
 
 /// Encrypt every input before publishing the ZIP. Originals are removed only
 /// after the finished archive has been committed to its destination.
+#[cfg(test)]
 pub fn encrypt_to_zip(
     key: &[u8; 32],
     inputs: &[PathBuf],
     options: &JobOptions,
+) -> Result<ArchiveOutcome, CryptoError> {
+    encrypt_to_zip_with_progress(key, inputs, options, None, None)
+}
+
+pub fn encrypt_to_zip_with_progress(
+    key: &[u8; 32],
+    inputs: &[PathBuf],
+    options: &JobOptions,
+    progress: Option<&crypto::ProgressCallback<'_>>,
+    on_entry: Option<&dyn Fn(usize, &Path)>,
 ) -> Result<ArchiveOutcome, CryptoError> {
     let first = inputs
         .first()
@@ -75,10 +86,23 @@ pub fn encrypt_to_zip(
     };
     let encrypted: Vec<PathBuf> = inputs
         .iter()
-        .map(|input| crypto::encrypt_file(key, input, &staging))
+        .enumerate()
+        .map(|(index, input)| {
+            if let Some(on_entry) = on_entry {
+                on_entry(index, input);
+            }
+            if let Some(progress) = progress {
+                crypto::encrypt_file_with_progress(key, input, &staging, progress)
+            } else {
+                crypto::encrypt_file(key, input, &staging)
+            }
+        })
         .collect::<Result<_, _>>()?;
+    if let Some(on_entry) = on_entry {
+        on_entry(inputs.len(), &archive);
+    }
     crypto::write_transformed(&archive, false, |writer| {
-        write_zip(writer, &encrypted).map_err(Into::into)
+        write_zip(writer, &encrypted, progress).map_err(Into::into)
     })?;
 
     let delete_errors = inputs
@@ -128,7 +152,11 @@ impl Write for CountingWriter<'_> {
     }
 }
 
-fn write_zip(writer: &mut dyn Write, paths: &[PathBuf]) -> io::Result<()> {
+fn write_zip(
+    writer: &mut dyn Write,
+    paths: &[PathBuf],
+    progress: Option<&crypto::ProgressCallback<'_>>,
+) -> io::Result<()> {
     let mut writer = CountingWriter {
         inner: writer,
         position: 0,
@@ -178,6 +206,9 @@ fn write_zip(writer: &mut dyn Write, paths: &[PathBuf]) -> io::Result<()> {
         let mut copied = 0u64;
         let mut buffer = [0u8; 64 * 1024];
         loop {
+            if let Some(progress) = progress {
+                progress(0)?;
+            }
             let count = reader.read(&mut buffer)?;
             if count == 0 {
                 break;
@@ -282,6 +313,9 @@ fn write_zip(writer: &mut dyn Write, paths: &[PathBuf]) -> io::Result<()> {
     writer.write_all(&(central_size.min(u32::MAX as u64) as u32).to_le_bytes())?;
     writer.write_all(&(central_offset.min(u32::MAX as u64) as u32).to_le_bytes())?;
     writer.write_all(&0u16.to_le_bytes())?;
+    if let Some(progress) = progress {
+        progress(0)?;
+    }
     Ok(())
 }
 
