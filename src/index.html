@@ -14,107 +14,103 @@
         <span class="brand-mark" aria-hidden="true">
           <img src="icon.svg" alt="" width="42" height="42" />
         </span>
-        <div>
+        <div class="brand-copy">
           <h1>FileEncrypt</h1>
           <p class="lede">Your files. Only your key.</p>
         </div>
-        <span class="brand-note">Local file encryption</span>
+        <span class="brand-note"><span class="brand-note-dot" aria-hidden="true"></span> Local file encryption</span>
       </header>
 
       <main>
         <div id="alert" class="alert" role="alert" hidden></div>
         <div class="workspace">
           <section class="panel key-panel" aria-labelledby="key-heading">
-            <div class="section-head">
-              <h2 id="key-heading">Encryption key</h2>
-              <span class="step" aria-hidden="true">01</span>
-            </div>
-            <p class="sub section-description">Create a key or open an existing one.</p>
-            <div class="key-status">
-              <p id="fingerprint" class="fingerprint" aria-live="polite">No key loaded</p>
-              <p id="key-message" class="message" aria-live="polite"></p>
-            </div>
-            <div class="key-actions">
-              <button type="button" id="generate">Generate and save</button>
-              <button type="button" id="browse-load">Browse and load</button>
-            </div>
-            <p class="key-note">Back up your key file separately. A lost key cannot be recovered. A passphrase can protect a newly saved key file.</p>
-            <details class="key-options">
-              <summary>Key options</summary>
-              <div class="details-content">
-                <label class="field-label" for="key-passphrase">Key file passphrase (optional for new keys; required to open protected keys)</label>
-                <input id="key-passphrase" type="password" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" placeholder="Leave blank for an unprotected key file" />
-                <p class="sub">The passphrase protects the key file. Losing both the key file and its backup makes encrypted files unrecoverable.</p>
-                <label class="field-label" for="key-path">Key file path</label>
-                <input id="key-path" type="text" spellcheck="false" autocomplete="off" placeholder="Choose or enter a path" />
-                <div class="row path-actions">
-                  <button type="button" id="set-path">Set path</button>
-                  <button type="button" id="load">Load</button>
-                  <button type="button" id="unload" disabled>Unload</button>
-                </div>
-                <div class="row path-actions">
-                  <button type="button" id="backup-key">Back up key</button>
-                  <button type="button" id="check-backup">Check backup</button>
-                </div>
-                <button type="button" id="rotate-key">Rotate selected encrypted files to a new key</button>
-                <p class="sub">Choose a new key-file path when prompted. The old key file stays available for other encrypted files.</p>
-                <details>
-                  <summary>Use a specific key</summary>
-                  <div class="details-content">
-                    <p class="sub">Enter 64 hex characters or 32 bytes in standard base64. Prefer generating a key to keep it out of this window.</p>
-                    <label class="field-label" for="key-text">Key</label>
-                    <input id="key-text" type="password" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" />
-                    <button type="button" class="typed-key-button" id="save-typed">Write key to file</button>
-                  </div>
-                </details>
+            <div class="key-main">
+              <div class="key-intro">
+                <span class="step">STEP 01</span>
+                <h2 id="key-heading">Encryption key</h2>
+                <p class="sub section-description">Create a key or open an existing one.</p>
+                <button type="button" class="text-button key-options-button" id="open-key-options" aria-haspopup="dialog" aria-controls="key-dialog">Key options <span aria-hidden="true">↗</span></button>
               </div>
-            </details>
+              <div class="key-status">
+                <span class="status-label">CURRENT KEY</span>
+                <p id="fingerprint" class="fingerprint" aria-live="polite">No key loaded</p>
+                <p id="key-message" class="message" aria-live="polite"></p>
+              </div>
+              <div class="key-actions">
+                <button type="button" class="primary" id="generate">Generate and save</button>
+                <button type="button" id="browse-load">Browse and load</button>
+              </div>
+            </div>
           </section>
 
           <section class="panel files-panel" aria-labelledby="files-heading">
-            <div class="section-head">
-              <h2 id="files-heading">Files <span id="file-count"></span></h2>
-              <span class="step" aria-hidden="true">02</span>
-            </div>
-            <div class="file-toolbar">
-              <p class="sub">Choose the files you want to protect or restore.</p>
+            <div class="files-head">
+              <div>
+                <span class="step">STEP 02</span>
+                <h2 id="files-heading">Files <span id="file-count"></span></h2>
+                <p class="sub">Choose the files you want to protect or restore.</p>
+              </div>
               <div class="row">
                 <button type="button" id="add-files"><span aria-hidden="true">+</span> Add files</button>
                 <button type="button" id="add-folder">Add folder</button>
               </div>
             </div>
-            <div id="file-empty" class="empty">
-              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9zM14 3v6h6M8 13h8M8 17h5" />
-              </svg>
-              <p>No files selected</p>
-              <span>Add files, a folder, or drop them here.</span>
-            </div>
-            <ul id="file-list" class="file-list" aria-label="Selected files"></ul>
-            <div class="output-settings">
-              <div class="section-head output-heading">
-                <label class="field-label" for="output-dir">Save to</label>
-                <button type="button" class="text-button" id="clear-output" disabled>Reset to original folders</button>
+            <div class="files-body">
+              <div id="selection-area" class="selection-area">
+                <div id="file-empty" class="empty" role="button" tabindex="0" aria-label="Choose files or drop files here">
+                  <div class="empty-icon">
+                    <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9zM14 3v6h6M8 13h8M8 17h5" />
+                    </svg>
+                  </div>
+                  <div class="empty-copy">
+                    <p>Choose files or drop them here</p>
+                    <span>Add a folder with the button above</span>
+                  </div>
+                </div>
+                <ul id="file-list" class="file-list" aria-label="Selected files"></ul>
               </div>
-              <div class="row output-row">
-                <input id="output-dir" type="text" spellcheck="false" autocomplete="off" placeholder="Same folder as each file" aria-describedby="output-hint" />
-                <button type="button" id="choose-output">Choose folder</button>
+              <div class="settings-group">
+                <div class="output-settings">
+                  <div class="section-head output-heading">
+                    <label class="field-label" for="output-dir">Save to</label>
+                    <button type="button" class="text-button" id="clear-output" disabled>Reset to original folders</button>
+                  </div>
+                  <div class="row output-row">
+                    <input id="output-dir" type="text" spellcheck="false" autocomplete="off" placeholder="Same folder as each file" aria-describedby="output-hint" />
+                    <button type="button" id="choose-output">Choose folder</button>
+                  </div>
+                  <p id="output-hint" class="sub output-hint">Encrypted files get a random name. Decryption restores the original name.</p>
+                </div>
+                <div class="checks">
+                  <h3>Options</h3>
+                  <div class="options-grid">
+                    <label class="option-card">
+                      <input id="overwrite" type="checkbox" />
+                      <span class="option-copy"><span class="option-title">Replace existing output files</span><span class="option-detail">Allow outputs to overwrite files with the same name.</span></span>
+                    </label>
+                    <label class="option-card">
+                      <input id="remove-original" type="checkbox" />
+                      <span class="option-copy"><span class="option-title">Delete originals after success</span><span class="option-detail">Normal deletion, not secure erasure.</span></span>
+                    </label>
+                    <label class="option-card">
+                      <input id="zip" type="checkbox" />
+                      <span class="option-copy"><span class="option-title">Bundle into one ZIP</span><span class="option-detail">Keeps folder paths; older ZIPs still open.</span></span>
+                    </label>
+                    <label class="option-card">
+                      <input id="compress" type="checkbox" />
+                      <span class="option-copy"><span class="option-title">Compress before encryption</span><span class="option-detail">Available only with ZIP bundles.</span></span>
+                    </label>
+                  </div>
+                </div>
               </div>
-              <p id="output-hint" class="sub output-hint">Encrypted files get a random name. Decryption restores the original name.</p>
-            </div>
-            <div class="checks">
-              <label class="check"><input id="overwrite" type="checkbox" />Replace existing output files</label>
-              <label class="check"><input id="remove-original" type="checkbox" />Delete originals after success</label>
-              <p class="sub zip-hint">This is normal file deletion, not secure erasure.</p>
-              <label class="check"><input id="zip" type="checkbox" aria-describedby="zip-hint" />Bundle encrypted files into one ZIP</label>
-              <p id="zip-hint" class="sub zip-hint">The encrypted files keep their relative folder paths when restored. Older ZIPs still open.</p>
-              <label class="check"><input id="compress" type="checkbox" />Compress files before encryption (bundle only)</label>
-              <label class="check"><input id="review-first" type="checkbox" />Review plan before starting</label>
             </div>
             <div class="actions">
               <button type="button" class="primary" id="encrypt" disabled>Encrypt files</button>
               <button type="button" id="decrypt" disabled>Decrypt files</button>
               <button type="button" id="verify" disabled>Verify files</button>
+              <label class="check review-option"><input id="review-first" type="checkbox" />Review plan first</label>
               <button type="button" class="text-button" id="clear-files" disabled>Clear list</button>
             </div>
             <p id="action-hint" class="action-hint" aria-live="polite">Load a key and add files to get started.</p>
@@ -135,19 +131,72 @@
             </section>
           </section>
         </div>
-        <section class="results-panel" aria-labelledby="results-heading">
+        <section id="results-panel" class="results-panel" aria-labelledby="results-heading" hidden>
           <div class="section-head">
-            <h2 id="results-heading">Activity</h2>
+            <div>
+              <span class="step">RECENT JOB</span>
+              <h2 id="results-heading">Activity</h2>
+            </div>
             <p id="result-summary" class="sub" aria-live="polite">No activity yet</p>
           </div>
           <ul id="results" class="results"></ul>
         </section>
       </main>
+      <dialog id="key-dialog" class="key-dialog" aria-labelledby="key-dialog-heading" aria-describedby="key-dialog-description">
+        <div class="dialog-head">
+          <div>
+            <span class="step">KEY MANAGEMENT</span>
+            <h2 id="key-dialog-heading">Key options</h2>
+            <p id="key-dialog-description" class="sub">Manage the key file used for this workspace.</p>
+          </div>
+          <button type="button" class="dialog-close" id="close-key-options" aria-label="Close key options">×</button>
+        </div>
+        <div id="key-dialog-alert" class="alert" role="alert" hidden></div>
+        <div class="dialog-shared">
+          <div class="dialog-field">
+            <label class="field-label" for="key-passphrase">Key file passphrase</label>
+            <input id="key-passphrase" type="password" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" placeholder="Optional for new keys" />
+            <p class="sub">Required to open protected keys. The passphrase is cleared after use.</p>
+          </div>
+          <div class="dialog-field">
+            <label class="field-label" for="key-path">Key file path</label>
+            <input id="key-path" type="text" spellcheck="false" autocomplete="off" placeholder="Choose or enter a path" />
+            <div class="row path-actions">
+              <button type="button" id="set-path">Set path</button>
+              <button type="button" id="load">Load</button>
+              <button type="button" id="unload" disabled>Unload</button>
+            </div>
+          </div>
+        </div>
+        <div id="key-management-view" class="dialog-view">
+          <div class="dialog-section">
+            <h3>Backup and rotation</h3>
+            <p class="sub">Keep a backup in a separate location. A lost key cannot be recovered.</p>
+            <div class="row dialog-actions">
+              <button type="button" id="backup-key">Back up key</button>
+              <button type="button" id="check-backup">Check backup</button>
+            </div>
+            <button type="button" class="rotate-button" id="rotate-key">Rotate selected encrypted files to a new key</button>
+            <p class="sub">The old key file remains available for other encrypted files.</p>
+          </div>
+          <button type="button" class="specific-key-link" id="open-specific-key">Use a specific key <span aria-hidden="true">→</span></button>
+        </div>
+        <div id="specific-key-view" class="dialog-view" hidden>
+          <button type="button" class="text-button back-button" id="back-to-key-options">← Back to key options</button>
+          <h3>Write a specific key to a file</h3>
+          <p class="sub">Enter 64 hex characters or 32 bytes in standard base64. Generating a key keeps it out of this window.</p>
+          <label class="field-label" for="key-text">Key</label>
+          <input id="key-text" type="password" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" />
+          <button type="button" class="primary typed-key-button" id="save-typed">Write key to file</button>
+        </div>
+      </dialog>
       <footer>
-        Processed on your device <span aria-hidden="true">&middot;</span> AEGIS-256 encryption
-        <button type="button" id="check-update" class="text-button" disabled>Check for updates</button>
-        <button type="button" id="install-update" class="text-button" hidden>Install update</button>
-        <span id="update-status" aria-live="polite"></span>
+        <p class="footer-security">Processed on your device <span aria-hidden="true">&middot;</span> AEGIS-256 encryption</p>
+        <div class="footer-updates">
+          <button type="button" id="check-update" class="text-button" disabled>Check for updates</button>
+          <button type="button" id="install-update" class="text-button" hidden>Install update</button>
+          <span id="update-status" aria-live="polite"></span>
+        </div>
       </footer>
     </div>
   </body>

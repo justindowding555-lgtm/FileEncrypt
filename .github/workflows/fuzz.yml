@@ -19,7 +19,7 @@ jobs:
         run: cargo install cargo-fuzz --locked
       - name: Fuzz FileEncrypt ZIP directory parser
         working-directory: fuzz
-        run: cargo fuzz run zip_reader -- -max_total_time=60 -max_len=262144
+        run: cargo fuzz run zip_reader --fuzz-dir . -- -max_total_time=60 -max_len=262144
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

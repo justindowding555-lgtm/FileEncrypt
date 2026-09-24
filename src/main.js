@@ -39,15 +39,32 @@ function baseName(path) {
 }
 
 function showAlert(message) {
-  const alert = $("alert");
+  const alert = $("key-dialog").open ? $("key-dialog-alert") : $("alert");
   alert.hidden = false;
   alert.textContent = message;
 }
 
 function clearAlert() {
-  const alert = $("alert");
-  alert.hidden = true;
-  alert.textContent = "";
+  for (const id of ["alert", "key-dialog-alert"]) {
+    const alert = $(id);
+    alert.hidden = true;
+    alert.textContent = "";
+  }
+}
+
+function showSpecificKeyView(show) {
+  $("key-management-view").hidden = show;
+  $("specific-key-view").hidden = !show;
+  $("key-dialog-heading").textContent = show ? "Use a specific key" : "Key options";
+  $("key-dialog-description").textContent = show
+    ? "Write existing key material to a key file."
+    : "Manage the key file used for this workspace.";
+  if (show) {
+    $("key-text").focus();
+  } else {
+    $("key-text").value = "";
+    $("open-specific-key").focus();
+  }
 }
 
 function invalidatePreview() {
@@ -102,6 +119,7 @@ function applyStatus(status, updatePath) {
 function renderControls() {
   const noFiles = state.files.length === 0;
   const blocked = state.busy || !state.keyLoaded || noFiles;
+  $("generate").classList.toggle("primary", !state.keyLoaded);
   $("encrypt").disabled = blocked;
   $("decrypt").disabled = blocked;
   $("verify").disabled = blocked;
@@ -117,6 +135,8 @@ function renderControls() {
   $("check-backup").disabled = state.busy || !state.keyLoaded;
   $("rotate-key").disabled = blocked;
   $("save-typed").disabled = state.busy;
+  $("open-key-options").disabled = state.busy;
+  $("open-specific-key").disabled = state.busy;
   $("choose-output").disabled = state.busy;
   $("clear-output").disabled = state.busy || $("output-dir").value.trim() === "";
   $("zip").disabled = state.busy;
@@ -155,11 +175,11 @@ function plannedName(path) {
 function renderOutputHint() {
   const dir = $("output-dir").value.trim();
   if ($("zip").checked) {
-    const where = dir ? `in ${dir}` : "beside the first selected file";
-    $("output-hint").textContent = `When encrypting, one randomly named ZIP is saved ${where}. Add that ZIP later to decrypt its files directly.`;
+    const where = dir ? "to the chosen folder" : "beside the first selected file";
+    $("output-hint").textContent = `One randomly named ZIP is saved ${where}. Add it later to decrypt its files.`;
   } else {
-    const where = dir ? `in ${dir}` : "beside each original";
-    $("output-hint").textContent = `Saved ${where} under a random name. Decrypt restores the original file name.`;
+    const where = dir ? "to the chosen folder" : "beside each original";
+    $("output-hint").textContent = `Saved ${where} with a random name. Decrypt restores the original name.`;
   }
 }
 
@@ -168,6 +188,7 @@ function renderFiles() {
   const empty = $("file-empty");
   list.replaceChildren();
   empty.hidden = state.files.length > 0;
+  $("selection-area").classList.toggle("has-files", state.files.length > 0);
   for (const [index, path] of state.files.entries()) {
     const item = document.createElement("li");
     item.className = "file-row";
@@ -206,6 +227,7 @@ function renderFiles() {
 function renderResults(results) {
   const list = $("results");
   list.replaceChildren();
+  $("results-panel").hidden = results.length === 0;
   const succeeded = results.filter((result) => result.ok).length;
   $("result-summary").textContent = `${succeeded} succeeded, ${results.length - succeeded} failed`;
   for (const result of results) {
@@ -256,6 +278,12 @@ async function run(work, updatePathOnSuccess) {
   }
 }
 
+async function runKeyOption(work, updatePathOnSuccess) {
+  const result = await run(work, updatePathOnSuccess);
+  if (result) $("key-dialog").close();
+  return result;
+}
+
 async function init() {
   try {
     await window.__TAURI__?.event?.listen("job-progress", ({ payload }) => {
@@ -276,6 +304,22 @@ async function init() {
   } catch (error) {
     showAlert(normalizeError(error));
   }
+  $("open-key-options").addEventListener("click", () => {
+    clearAlert();
+    $("key-management-view").hidden = false;
+    $("specific-key-view").hidden = true;
+    $("key-dialog-heading").textContent = "Key options";
+    $("key-dialog-description").textContent = "Manage the key file used for this workspace.";
+    $("key-dialog").showModal();
+    $("close-key-options").focus();
+  });
+  $("close-key-options").addEventListener("click", () => $("key-dialog").close());
+  $("key-dialog").addEventListener("close", () => {
+    $("key-text").value = "";
+    $("open-key-options").focus();
+  });
+  $("open-specific-key").addEventListener("click", () => showSpecificKeyView(true));
+  $("back-to-key-options").addEventListener("click", () => showSpecificKeyView(false));
   $("set-path").addEventListener("click", () => {
     run(async () => {
       const picked = await invoke("pick_save_path");
@@ -296,15 +340,15 @@ async function init() {
   });
 
   $("load").addEventListener("click", () => {
-    run(() => invokeWithPassphrase("load_key", { path: $("key-path").value }), true);
+    runKeyOption(() => invokeWithPassphrase("load_key", { path: $("key-path").value }), true);
   });
 
   $("unload").addEventListener("click", () => {
-    run(() => invoke("unload_key"), false);
+    runKeyOption(() => invoke("unload_key"), false);
   });
 
   $("save-typed").addEventListener("click", () => {
-    run(async () => {
+    runKeyOption(async () => {
       const keyText = $("key-text").value;
       $("key-text").value = "";
       const status = await invokeWithPassphrase("save_typed_key", {
@@ -315,12 +359,13 @@ async function init() {
     }, true);
   });
 
-  $("backup-key").addEventListener("click", () => run(() => invokeWithPassphrase("backup_key"), false));
+  $("backup-key").addEventListener("click", () => runKeyOption(() => invokeWithPassphrase("backup_key"), false));
   $("check-backup").addEventListener("click", () =>
-    run(() => invokeWithPassphrase("check_key_backup"), false));
+    runKeyOption(() => invokeWithPassphrase("check_key_backup"), false));
 
   $("rotate-key").addEventListener("click", async () => {
     if (state.busy || !state.keyLoaded || !state.files.length) return;
+    $("key-dialog").close();
     state.jobRunning = true;
     $("progress-panel").hidden = false;
     $("job-progress").value = 0;
@@ -383,6 +428,14 @@ async function init() {
       addSelectedFiles(picked);
       return null;
     }, false);
+  });
+
+  $("file-empty").addEventListener("click", () => $("add-files").click());
+  $("file-empty").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      $("add-files").click();
+    }
   });
 
   $("add-folder").addEventListener("click", () => {
