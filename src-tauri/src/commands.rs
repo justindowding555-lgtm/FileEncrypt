@@ -7,6 +7,7 @@ use tauri::Manager;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::archive;
 use crate::crypto::{self, CryptoError, JobOptions};
 use crate::key_file;
 
@@ -224,8 +225,9 @@ pub fn encrypt_files(
     output_dir: String,
     overwrite: bool,
     remove_original: bool,
+    zip: bool,
 ) -> Result<Vec<FileOutcome>, String> {
-    process(&app, &state, paths, &output_dir, overwrite, remove_original, true)
+    process(&app, &state, paths, &output_dir, overwrite, remove_original, true, zip)
 }
 
 #[tauri::command]
@@ -244,6 +246,7 @@ pub fn decrypt_files(
         &output_dir,
         overwrite,
         remove_original,
+        false,
         false,
     )
 }
@@ -267,6 +270,7 @@ fn process(
     overwrite: bool,
     remove_original: bool,
     encrypt: bool,
+    zip: bool,
 ) -> Result<Vec<FileOutcome>, String> {
     if paths.is_empty() {
         return Err("Add at least one file.".into());
@@ -282,6 +286,24 @@ fn process(
         key_file: lock(&state.key_path).clone(),
         output_dir,
     };
+    if encrypt && zip {
+        let inputs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        let outcome = archive::encrypt_to_zip(&key, &inputs, &options)
+            .map_err(|err| err.to_string())?;
+        let output = outcome.path.display().to_string();
+        return Ok(paths.into_iter().zip(outcome.delete_errors).map(|(input, error)| {
+            let ok = error.is_none();
+            FileOutcome {
+                input,
+                output: Some(output.clone()),
+                ok,
+                message: match error {
+                    Some(err) => format!("Added to ZIP, but the original could not be deleted: {err}"),
+                    None => "Encrypted into ZIP".into(),
+                },
+            }
+        }).collect());
+    }
     Ok(paths
         .into_iter()
         .map(|path| one_file(&key, path, &options, encrypt))

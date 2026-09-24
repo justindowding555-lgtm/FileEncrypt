@@ -854,6 +854,7 @@ dependencies = [
  "aegis",
  "aes-gcm",
  "base64 0.22.1",
+ "crc32fast",
  "hkdf",
  "serde",
  "serde_json",

@@ -17,7 +17,8 @@ Windows needs the WebView2 runtime, which is already present on Windows 11.
 
 - **Add files…** selects several files.
 - **Encrypt** writes a random `.fenc` name. The original file name is encrypted inside the file, so it is not visible on disk. **Decrypt** restores that name.
-- Leave **Save to** empty and each result stays in the same folder as its original. Choose a folder to put every result there. The choice is remembered for the next launch.
+- **Group encrypted files into one ZIP** puts all selected files into a single randomly named `.zip`. Each entry is an encrypted `.fenc` file; extract the ZIP before selecting those entries for decryption. With **Save to** empty, the ZIP is placed beside the first selected file.
+- Without ZIP, leave **Save to** empty and each result stays in the same folder as its original. Choose a folder to put every result there. The choice is remembered for the next launch.
 - Older files, whose names were visible, still decrypt. A `.fenc` file from the first version restores the name with that suffix removed.
 - Originals stay on disk unless **Delete original files after success** is checked. Deletion happens only after the new file is written.
 - Decrypt uses the original filename, so turn on **Replace an existing output file** when that file is still there.

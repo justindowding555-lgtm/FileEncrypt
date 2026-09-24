@@ -95,6 +95,8 @@
             <div class="checks">
               <label class="check"><input id="overwrite" type="checkbox" />Replace existing output files</label>
               <label class="check"><input id="remove-original" type="checkbox" />Delete originals after success</label>
+              <label class="check"><input id="zip" type="checkbox" aria-describedby="zip-hint" />Group encrypted files into one ZIP</label>
+              <p id="zip-hint" class="sub zip-hint">The ZIP contains encrypted .fenc files. Extract them before decrypting.</p>
             </div>
             <div class="actions">
               <button type="button" class="primary" id="encrypt" disabled>Encrypt files</button>

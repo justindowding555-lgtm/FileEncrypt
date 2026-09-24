@@ -72,6 +72,7 @@ function renderControls() {
   $("save-typed").disabled = state.busy;
   $("choose-output").disabled = state.busy;
   $("clear-output").disabled = state.busy || $("output-dir").value.trim() === "";
+  $("zip").disabled = state.busy;
   $("file-count").textContent = noFiles ? "" : `(${state.files.length})`;
   $("action-hint").textContent = state.busy
     ? "Working. Please wait…"
@@ -90,13 +91,19 @@ function plannedName(path) {
   if (name.length > 5 && name.toLowerCase().endsWith(".fenc")) {
     return "original name from inside the file";
   }
+  if ($("zip").checked) return "an encrypted file inside the ZIP";
   return "a random .fenc name";
 }
 
 function renderOutputHint() {
   const dir = $("output-dir").value.trim();
-  const where = dir ? `in ${dir}` : "beside each original";
-  $("output-hint").textContent = `Saved ${where} under a random name. Decrypt restores the original file name.`;
+  if ($("zip").checked) {
+    const where = dir ? `in ${dir}` : "beside the first selected file";
+    $("output-hint").textContent = `When encrypting, one randomly named ZIP is saved ${where}. Extract its .fenc files to decrypt them.`;
+  } else {
+    const where = dir ? `in ${dir}` : "beside each original";
+    $("output-hint").textContent = `Saved ${where} under a random name. Decrypt restores the original file name.`;
+  }
 }
 
 function renderFiles() {
@@ -235,6 +242,10 @@ async function init() {
     renderControls();
   });
 
+  $("zip").addEventListener("change", () => {
+    renderFiles();
+  });
+
   $("choose-output").addEventListener("click", () => {
     run(async () => {
       const picked = await invoke("pick_output_dir");
@@ -283,6 +294,7 @@ function processFiles(command) {
       outputDir: $("output-dir").value,
       overwrite: $("overwrite").checked,
       removeOriginal: $("remove-original").checked,
+      ...(command === "encrypt_files" ? { zip: $("zip").checked } : {}),
     });
     renderResults(results);
     return invoke("get_status");

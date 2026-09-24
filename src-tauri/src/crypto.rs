@@ -703,7 +703,7 @@ fn read_up_to(reader: &mut dyn Read, max: usize) -> Result<Vec<u8>, CryptoError>
     Ok(buf)
 }
 
-fn write_transformed(
+pub(crate) fn write_transformed(
     output: &Path,
     overwrite: bool,
     produce: impl FnOnce(&mut dyn Write) -> Result<(), CryptoError>,
@@ -768,7 +768,7 @@ fn opaque_output_path(
     Err(CryptoError::EncryptFailed)
 }
 
-fn opaque_file_name() -> std::ffi::OsString {
+pub(crate) fn opaque_file_name() -> std::ffi::OsString {
     let bytes = random_key();
     let hex: String = bytes.iter().take(16).map(|byte| format!("{byte:02x}")).collect();
     let mut name = std::ffi::OsString::from(hex);
@@ -817,7 +817,7 @@ fn file_name(path: &Path) -> Result<&std::ffi::OsStr, CryptoError> {
         .ok_or_else(|| CryptoError::NotAFile(path.display().to_string()))
 }
 
-fn ensure_distinct(
+pub(crate) fn ensure_distinct(
     input: &Path,
     output: &Path,
     key_file: Option<&Path>,

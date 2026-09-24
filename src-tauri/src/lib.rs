@@ -1,3 +1,4 @@
+mod archive;
 mod commands;
 mod crypto;
 mod key_file;
