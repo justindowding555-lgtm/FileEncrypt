@@ -3,6 +3,7 @@ const state = {
   folderRoots: new Map(),
   busy: false,
   keyLoaded: false,
+  keyHasFile: false,
   keyFingerprint: null,
   pendingJob: null,
   jobRunning: false,
@@ -57,7 +58,7 @@ function showSpecificKeyView(show) {
   $("specific-key-view").hidden = !show;
   $("key-dialog-heading").textContent = show ? "Use a specific key" : "Key options";
   $("key-dialog-description").textContent = show
-    ? "Write existing key material to a key file."
+    ? "Use an existing key for this session or save it to a file."
     : "Manage the key file used for this workspace.";
   if (show) {
     $("key-text").focus();
@@ -96,17 +97,18 @@ function applyStatus(status, updatePath) {
   }
   state.keyFingerprint = status.fingerprint;
   state.keyLoaded = Boolean(status.keyLoaded);
+  state.keyHasFile = state.keyLoaded && Boolean(status.keyPath);
   state.updatesConfigured = Boolean(status.updatesConfigured);
   if (!state.updatesConfigured) $("update-status").textContent = "Signed updates are not configured in this build.";
   $("fingerprint").classList.toggle("is-loaded", state.keyLoaded);
-  if (updatePath && status.keyPath) {
-    $("key-path").value = status.keyPath;
+  if (updatePath) {
+    $("key-path").value = status.keyPath || "";
   }
   if (updatePath && typeof status.outputDir === "string") {
     $("output-dir").value = status.outputDir;
   }
   $("fingerprint").textContent = status.keyLoaded
-    ? `Key loaded · ${status.fingerprint}`
+    ? `${state.keyHasFile ? "Key loaded" : "Session key"} · ${status.fingerprint}`
     : "No key loaded";
   $("key-message").textContent =
     status.message ||
@@ -131,10 +133,14 @@ function renderControls() {
   $("unload").disabled = state.busy || !state.keyLoaded;
   $("set-path").disabled = state.busy;
   $("browse-load").disabled = state.busy;
-  $("backup-key").disabled = state.busy || !state.keyLoaded;
+  $("backup-key").disabled = state.busy || !state.keyHasFile;
+  $("backup-key").title = state.keyLoaded && !state.keyHasFile
+    ? "Session keys have no file to back up."
+    : "";
   $("check-backup").disabled = state.busy || !state.keyLoaded;
   $("rotate-key").disabled = blocked;
   $("save-typed").disabled = state.busy;
+  $("use-typed").disabled = state.busy;
   $("open-key-options").disabled = state.busy;
   $("open-specific-key").disabled = state.busy;
   $("choose-output").disabled = state.busy;
@@ -314,6 +320,16 @@ async function init() {
     $("close-key-options").focus();
   });
   $("close-key-options").addEventListener("click", () => $("key-dialog").close());
+  for (const id of ["close-startup-key", "dismiss-startup-key"]) {
+    $(id).addEventListener("click", () => $("startup-key-dialog").close());
+  }
+  $("startup-key-dialog").addEventListener("close", () => {
+    if (!$("key-dialog").open) $("open-key-options").focus();
+  });
+  $("startup-key-options").addEventListener("click", () => {
+    $("startup-key-dialog").close();
+    $("open-key-options").click();
+  });
   $("key-dialog").addEventListener("close", () => {
     $("key-text").value = "";
     $("open-key-options").focus();
@@ -356,6 +372,19 @@ async function init() {
         keyText,
       });
       return status;
+    }, true);
+  });
+
+  $("use-typed").addEventListener("click", () => {
+    runKeyOption(async () => {
+      let keyText = $("key-text").value;
+      $("key-text").value = "";
+      $("key-passphrase").value = "";
+      try {
+        return await invoke("use_typed_key", { keyText });
+      } finally {
+        keyText = "";
+      }
     }, true);
   });
 
@@ -479,7 +508,13 @@ async function init() {
   });
 
   try {
-    applyStatus(await invoke("get_status"), true);
+    const initialStatus = await invoke("get_status");
+    applyStatus(initialStatus, true);
+    if (initialStatus.startupKeyUnavailable) {
+      $("startup-key-path").textContent = initialStatus.keyPath || "Unknown location";
+      $("startup-key-dialog").showModal();
+      $("startup-key-options").focus();
+    }
   } catch (error) {
     showAlert(normalizeError(error));
     renderControls();

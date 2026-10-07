@@ -44,11 +44,15 @@ FileEncrypt-Key-v1
 
 A 64-character hex line is also accepted. The app remembers the path, not the key itself, under its config directory so the next launch can load the same file.
 
+If the remembered key file is missing at startup, a **Key file unavailable** dialog inside the app asks you to reconnect its USB drive. **Key options** opens the saved path so you can click **Load**, or use **Browse and load** if the location changed. The remembered path stays available and file operations remain disabled until a key is loaded.
+
 Protected key files use `FileEncrypt-Key-v2`, PBKDF2-HMAC-SHA256 with 600,000 iterations and a random salt, then AEGIS-256 to seal the same 256-bit master key. Existing v1 key files remain readable. A protected key is not loaded automatically at startup because its passphrase is not saved.
 
 Anyone who can read the key file can decrypt. Losing the file means the encrypted files cannot be opened. Replacing a key file does not re-encrypt older files; they still need the previous key.
 
 Typed keys pass through the window. Prefer **Generate and save** when you do not already have a key.
+
+Under **Key options → Use a specific key**, **Use in app only** loads a manually entered key for the current session without writing a key file. The input is cleared after use, and the key is kept in a zeroizing memory buffer that is cleared when the main window closes or the app exits. The previous remembered key-file path is cleared, so reopening starts without a key. The saved output-folder preference is retained. **Write key to file** remains available if you want a saved copy instead. Session keys support encryption, decryption, verification, and rotation; **Back up key** requires a saved key file.
 
 ## Tests
 

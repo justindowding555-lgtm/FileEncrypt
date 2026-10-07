@@ -22,6 +22,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(commands::AppState::default())
+        .on_window_event(|window, event| {
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
+                commands::clear_key_on_close(window.state::<commands::AppState>().inner());
+            }
+        })
         .setup(|app| {
             commands::restore_saved_key(app.handle(), app.state::<commands::AppState>().inner());
             Ok(())
@@ -36,6 +41,7 @@ pub fn run() {
             commands::set_output_dir,
             commands::generate_key,
             commands::save_typed_key,
+            commands::use_typed_key,
             commands::load_key,
             commands::browse_key,
             commands::backup_key,
@@ -48,6 +54,11 @@ pub fn run() {
             commands::check_for_updates,
             commands::install_update,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running FileEncrypt");
+        .build(tauri::generate_context!())
+        .expect("error while building FileEncrypt")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                commands::clear_key_on_close(app.state::<commands::AppState>().inner());
+            }
+        });
 }

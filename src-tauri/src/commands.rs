@@ -22,6 +22,7 @@ pub struct AppState {
     key_path: Mutex<Option<PathBuf>>,
     output_dir: Mutex<Option<PathBuf>>,
     message: Mutex<String>,
+    startup_key_unavailable: AtomicBool,
     running: AtomicBool,
     cancelled: AtomicBool,
 }
@@ -33,6 +34,7 @@ impl Default for AppState {
             key_path: Mutex::new(None),
             output_dir: Mutex::new(None),
             message: Mutex::new(String::new()),
+            startup_key_unavailable: AtomicBool::new(false),
             running: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
         }
@@ -47,6 +49,7 @@ pub struct AppStatus {
     output_dir: Option<String>,
     fingerprint: Option<String>,
     message: String,
+    startup_key_unavailable: bool,
     updates_configured: bool,
 }
 
@@ -203,17 +206,39 @@ pub fn restore_saved_key(app: &tauri::AppHandle, state: &AppState) {
     let Some(settings) = read_settings(app) else {
         return;
     };
+    restore_saved_settings(state, settings);
+}
+
+fn restore_saved_settings(state: &AppState, settings: Settings) {
     *lock(&state.output_dir) = settings.output_dir;
     let Some(path) = settings.key_path else {
         return;
     };
-    *lock(&state.key_path) = Some(path.clone());
-    match key_file::read_key_file(&path) {
+    restore_saved_key_from_path(state, &path);
+}
+
+fn restore_saved_key_from_path(state: &AppState, path: &Path) {
+    state.startup_key_unavailable.store(false, Ordering::Release);
+    *lock(&state.key_path) = Some(path.to_path_buf());
+    *lock(&state.key) = None;
+    match key_file::read_key_file(path) {
         Ok(key) => {
             *lock(&state.key) = Some(key);
             set_message(state, "Key loaded from the saved location.");
         }
-        Err(err) => set_message(state, format!("Could not load the saved key: {err}")),
+        Err(err) => {
+            // Check the path separately: protected or damaged keys must not be
+            // reported as a disconnected drive.
+            if matches!(fs::metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound) {
+                state.startup_key_unavailable.store(true, Ordering::Release);
+                set_message(
+                    state,
+                    "Your saved key file is unavailable. Reconnect its drive and load the key, or use Browse and load if its location changed.",
+                );
+                return;
+            }
+            set_message(state, format!("Could not load the saved key: {err}"));
+        }
     }
 }
 
@@ -415,6 +440,45 @@ pub async fn save_typed_key(
 }
 
 #[tauri::command]
+pub fn use_typed_key(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    key_text: String,
+) -> Result<AppStatus, String> {
+    let key_text = Zeroizing::new(key_text);
+    if state.running.load(Ordering::Acquire) {
+        return Err("Finish the current file job before changing keys.".into());
+    }
+    let parsed = key_file::parse_key_material(&key_text);
+    drop(key_text);
+    let key = parsed.map_err(|err| err.to_string())?;
+    activate_session_key(&state, key, &settings_path(&app)?)?;
+    Ok(status(&state))
+}
+
+fn activate_session_key(
+    state: &AppState,
+    key: Zeroizing<[u8; 32]>,
+    settings_path: &Path,
+) -> Result<(), String> {
+    // Remember only preferences and clear the old file path before activating
+    // this key, so a later launch cannot silently restore a previous file key.
+    let settings = Settings {
+        key_path: None,
+        output_dir: lock(&state.output_dir).clone(),
+    };
+    write_settings_file(settings_path, &settings)?;
+    *lock(&state.key) = Some(key);
+    *lock(&state.key_path) = None;
+    state.startup_key_unavailable.store(false, Ordering::Release);
+    set_message(
+        state,
+        "Key loaded for this session only. It will be cleared when you close the app.",
+    );
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn load_key(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -537,11 +601,14 @@ pub async fn check_key_backup(
 #[tauri::command]
 pub fn unload_key(state: tauri::State<'_, AppState>) -> AppStatus {
     *lock(&state.key) = None;
-    set_message(
-        &state,
-        "Key unloaded from memory. The key file was not deleted.",
-    );
+    set_message(&state, "Key unloaded from memory.");
     status(&state)
+}
+
+pub fn clear_key_on_close(state: &AppState) {
+    state.cancelled.store(true, Ordering::Release);
+    // Dropping Zeroizing overwrites the stored key bytes before releasing them.
+    *lock(&state.key) = None;
 }
 
 #[tauri::command]
@@ -622,8 +689,8 @@ pub async fn rotate_key(
         let _running = Running(&state);
         state.cancelled.store(false, Ordering::Release);
         let old_key = lock(&state.key).clone().ok_or("Load the current key first.")?;
-        let old_path = lock(&state.key_path).clone().ok_or("Load the current key file first.")?;
-        if new_path.exists() || comparison_path(&new_path) == comparison_path(&old_path)
+        let old_path = lock(&state.key_path).clone();
+        if new_path.exists() || old_path.as_ref().is_some_and(|path| comparison_path(&new_path) == comparison_path(path))
             || paths.iter().any(|path| comparison_path(Path::new(path)) == comparison_path(&new_path)) {
             return Err("Choose a new key-file path that does not exist or overlap an input.".into());
         }
@@ -655,7 +722,7 @@ pub async fn rotate_key(
         } else { key_file::write_key_file(&new_path, &new_key) };
         written.map_err(|err| err.to_string())?;
         let options = JobOptions {
-            overwrite: false, remove_original, key_file: Some(old_path), output_dir: dir,
+            overwrite: false, remove_original, key_file: old_path, output_dir: dir,
         };
         let processed = AtomicU64::new(0);
         let mut results = Vec::with_capacity(paths.len());
@@ -1192,6 +1259,7 @@ fn status(state: &AppState) -> AppStatus {
         output_dir,
         fingerprint,
         message,
+        startup_key_unavailable: state.startup_key_unavailable.load(Ordering::Acquire),
         updates_configured: updater_key().is_ok(),
     }
 }
@@ -1225,6 +1293,7 @@ fn remember_key(
 ) -> String {
     *lock(&state.key) = Some(key);
     *lock(&state.key_path) = Some(path.clone());
+    state.startup_key_unavailable.store(false, Ordering::Release);
     match write_settings(app, state) {
         Ok(()) => String::new(),
         Err(err) => format!(" The path could not be remembered for next launch: {err}"),
@@ -1310,8 +1379,12 @@ fn write_settings(app: &tauri::AppHandle, state: &AppState) -> Result<(), String
         key_path: lock(&state.key_path).clone(),
         output_dir: lock(&state.output_dir).clone(),
     };
-    let json = serde_json::to_string_pretty(&settings).map_err(|err| err.to_string())?;
-    fs::write(settings_path(app)?, json).map_err(|err| err.to_string())
+    write_settings_file(&settings_path(app)?, &settings)
+}
+
+fn write_settings_file(path: &Path, settings: &Settings) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(settings).map_err(|err| err.to_string())?;
+    crypto::atomic_write(path, json.as_bytes()).map_err(|err| err.to_string())
 }
 
 fn read_settings(app: &tauri::AppHandle) -> Option<Settings> {
@@ -1323,6 +1396,175 @@ fn read_settings(app: &tauri::AppHandle) -> Option<Settings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_key_is_not_saved_or_restored_and_supports_file_jobs() {
+        let root = std::env::temp_dir().join(format!(
+            "fileencrypt-session-key-{}",
+            crypto::opaque_file_name().to_string_lossy()
+        ));
+        fs::create_dir(&root).unwrap();
+        let old_path = root.join("previous.key");
+        let settings_path = root.join("settings.json");
+        let output_dir = root.join("outputs");
+        let old_key = [3; 32];
+        key_file::write_key_file(&old_path, &old_key).unwrap();
+        let original_key_file = fs::read(&old_path).unwrap();
+        let state = AppState::default();
+        *lock(&state.key) = Some(Zeroizing::new(old_key));
+        *lock(&state.key_path) = Some(old_path.clone());
+        *lock(&state.output_dir) = Some(output_dir.clone());
+        state.startup_key_unavailable.store(true, Ordering::Release);
+        write_settings_file(
+            &settings_path,
+            &Settings {
+                key_path: Some(old_path.clone()),
+                output_dir: Some(output_dir.clone()),
+            },
+        )
+        .unwrap();
+
+        let key = [7; 32];
+        activate_session_key(&state, Zeroizing::new(key), &settings_path).unwrap();
+        let current = status(&state);
+        assert!(current.key_loaded);
+        assert!(current.key_path.is_none());
+        assert!(!current.startup_key_unavailable);
+        assert_eq!(current.fingerprint, Some(key_file::fingerprint(&key)));
+        assert_eq!(fs::read(&old_path).unwrap(), original_key_file);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+
+        let settings: Settings =
+            serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        assert!(settings.key_path.is_none());
+        assert_eq!(settings.output_dir, Some(output_dir.clone()));
+        let reopened = AppState::default();
+        restore_saved_settings(&reopened, settings);
+        assert!(!status(&reopened).key_loaded);
+        assert!(status(&reopened).key_path.is_none());
+        assert!(!status(&reopened).startup_key_unavailable);
+        assert_eq!(*lock(&reopened.output_dir), Some(output_dir));
+
+        let input = root.join("payload.txt");
+        fs::write(&input, b"session-only payload").unwrap();
+        let mut request = JobRequest {
+            paths: vec![input.display().to_string()],
+            folder_roots: HashMap::new(),
+            output_dir: String::new(),
+            overwrite: false,
+            remove_original: false,
+            zip: false,
+            compress: false,
+            operation: "encrypt".into(),
+        };
+        assert!(plan_job(&state, &request).unwrap().can_run);
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: false,
+            key_file: lock(&state.key_path).clone(),
+            output_dir: None,
+        };
+        let active_key = lock(&state.key).clone().unwrap();
+        let encrypted = crypto::encrypt_file(&active_key, &input, &options).unwrap();
+        request.paths = vec![encrypted.display().to_string()];
+        request.operation = "verify".into();
+        assert!(plan_job(&state, &request).unwrap().can_run);
+        crypto::verify_file(&active_key, &encrypted, None).unwrap();
+        fs::remove_file(&input).unwrap();
+        request.operation = "decrypt".into();
+        assert!(plan_job(&state, &request).unwrap().can_run);
+        let restored = crypto::decrypt_file(&active_key, &encrypted, &options).unwrap();
+        assert_eq!(fs::read(restored).unwrap(), b"session-only payload");
+        drop(active_key);
+
+        clear_key_on_close(&state);
+        assert!(!status(&state).key_loaded);
+        assert!(status(&state).fingerprint.is_none());
+        assert!(state.cancelled.load(Ordering::Acquire));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_session_preferences_write_preserves_the_loaded_key() {
+        let root = std::env::temp_dir().join(format!(
+            "fileencrypt-session-key-{}",
+            crypto::opaque_file_name().to_string_lossy()
+        ));
+        fs::create_dir(&root).unwrap();
+        let blocked = root.join("settings.json");
+        fs::create_dir(&blocked).unwrap();
+        let state = AppState::default();
+        let old_key = [3; 32];
+        let old_path = root.join("previous.key");
+        *lock(&state.key) = Some(Zeroizing::new(old_key));
+        *lock(&state.key_path) = Some(old_path.clone());
+
+        assert!(activate_session_key(&state, Zeroizing::new([7; 32]), &blocked).is_err());
+        assert_eq!(status(&state).fingerprint, Some(key_file::fingerprint(&old_key)));
+        assert_eq!(*lock(&state.key_path), Some(old_path));
+        assert!(blocked.is_dir());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_saved_key_warns_and_can_be_loaded_after_reconnecting() {
+        let root = std::env::temp_dir().join(format!(
+            "fileencrypt-startup-key-{}",
+            crypto::opaque_file_name().to_string_lossy()
+        ));
+        let path = root.join("usb.key");
+        let state = AppState::default();
+        *lock(&state.key) = Some(Zeroizing::new([9; 32]));
+
+        restore_saved_key_from_path(&state, &path);
+        let current = status(&state);
+        assert!(!current.key_loaded);
+        assert!(current.fingerprint.is_none());
+        assert_eq!(current.key_path.as_deref(), path.to_str());
+        assert!(current.startup_key_unavailable);
+        assert!(current.message.contains("saved key file is unavailable"));
+        let payload = serde_json::to_value(&current).unwrap();
+        assert_eq!(payload["startupKeyUnavailable"], true);
+
+        fs::create_dir(&root).unwrap();
+        let key = [7; 32];
+        key_file::write_key_file(&path, &key).unwrap();
+        restore_saved_key_from_path(&state, &path);
+        let current = status(&state);
+        assert!(current.key_loaded);
+        assert!(!current.startup_key_unavailable);
+        assert_eq!(current.fingerprint, Some(key_file::fingerprint(&key)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_protected_or_invalid_key_does_not_show_disconnected_warning() {
+        let root = std::env::temp_dir().join(format!(
+            "fileencrypt-startup-key-{}",
+            crypto::opaque_file_name().to_string_lossy()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("protected.key");
+        // A v2 header reaches the passphrase check before decoding the sealed key.
+        fs::write(
+            &path,
+            "FileEncrypt-Key-v2\npbkdf2-sha256:600000\nunused\nunused\nunused\n",
+        )
+        .unwrap();
+        let state = AppState::default();
+        restore_saved_key_from_path(&state, &path);
+        assert!(!status(&state).startup_key_unavailable);
+        assert!(!status(&state).key_loaded);
+        assert!(status(&state).message.contains("needs its passphrase"));
+
+        fs::write(&path, "not a key file").unwrap();
+        restore_saved_key_from_path(&state, &path);
+        assert!(!status(&state).startup_key_unavailable);
+        assert!(!status(&state).key_loaded);
+        assert!(status(&state).message.contains("Could not load the saved key"));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn preview_blocks_two_decryptions_with_the_same_output() {

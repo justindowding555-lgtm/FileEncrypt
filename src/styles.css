@@ -223,6 +223,19 @@ h3 { margin-bottom: 0; font-size: 0.9rem; letter-spacing: -0.01em; }
 .dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 21px 24px 16px; border-bottom: 1px solid var(--line); }
 .dialog-head .sub { margin-top: 4px; }
 .dialog-close { width: 32px; min-height: 32px; padding: 0; flex: none; font-size: 1.35rem; font-weight: 400; }
+.startup-key-dialog { width: min(520px, calc(100% - 32px)); }
+.startup-key-body { padding: 20px 24px 24px; }
+.startup-key-path {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--inset);
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+.startup-key-actions { margin-top: 20px; }
 .key-dialog .alert { margin: 16px 24px 0; }
 .dialog-shared { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 18px 24px; }
 .dialog-field { min-width: 0; }
@@ -251,7 +264,8 @@ input::placeholder { color: var(--muted); opacity: 1; }
 .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .path-actions { margin-top: 8px; }
 .path-actions button { flex: 1; padding-inline: 8px; }
-.typed-key-button { width: 100%; margin-top: 8px; }
+.typed-key-actions { margin-top: 12px; }
+.typed-key-actions button { flex: 1; white-space: normal; }
 .files-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
 .files-head .sub { margin-top: 3px; }
 .files-head .row { flex: none; }

@@ -183,11 +183,35 @@
         </div>
         <div id="specific-key-view" class="dialog-view" hidden>
           <button type="button" class="text-button back-button" id="back-to-key-options">← Back to key options</button>
-          <h3>Write a specific key to a file</h3>
+          <h3>Enter a specific key</h3>
           <p class="sub">Enter 64 hex characters or 32 bytes in standard base64. Generating a key keeps it out of this window.</p>
           <label class="field-label" for="key-text">Key</label>
           <input id="key-text" type="password" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" />
-          <button type="button" class="primary typed-key-button" id="save-typed">Write key to file</button>
+          <p class="sub">Use in app only keeps the key for this session and clears it when you close the app.</p>
+          <div class="row typed-key-actions">
+            <button type="button" class="primary" id="use-typed">Use in app only</button>
+            <button type="button" id="save-typed">Write key to file</button>
+          </div>
+        </div>
+      </dialog>
+      <dialog id="startup-key-dialog" class="key-dialog startup-key-dialog" aria-labelledby="startup-key-heading" aria-describedby="startup-key-description startup-key-instructions">
+        <div class="dialog-head">
+          <div>
+            <span class="step">KEY ACCESS</span>
+            <h2 id="startup-key-heading">Key file unavailable</h2>
+            <p id="startup-key-description" class="sub">Your saved key could not be found. Its drive may be disconnected, or the file may have moved.</p>
+          </div>
+          <button type="button" class="dialog-close" id="close-startup-key" aria-label="Close key warning">&times;</button>
+        </div>
+        <div class="startup-key-body">
+          <span class="field-label">Saved key file</span>
+          <p id="startup-key-path" class="startup-key-path"></p>
+          <p id="startup-key-instructions" class="sub">Reconnect your USB drive, then open Key options and click Load. If the file moved or the drive letter changed, use Browse and load.</p>
+          <p class="sub">No key is loaded. Your files are unchanged.</p>
+          <div class="row startup-key-actions">
+            <button type="button" class="primary" id="startup-key-options">Key options</button>
+            <button type="button" id="dismiss-startup-key">Dismiss</button>
+          </div>
         </div>
       </dialog>
       <footer>
