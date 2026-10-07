@@ -1329,11 +1329,57 @@ fn commit_partial(partial: &Path, output: &Path, overwrite: bool) -> Result<(), 
     if overwrite {
         fs::rename(partial, output)?;
     } else {
-        // Creating the hard link fails if another process created the output after preflight.
-        fs::hard_link(partial, output)?;
-        fs::remove_file(partial)?;
+        publish_no_replace(partial, output).map_err(|err| {
+            if err.kind() == io::ErrorKind::AlreadyExists {
+                CryptoError::OutputExists(output.display().to_string())
+            } else {
+                err.into()
+            }
+        })?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn publish_no_replace(partial: &Path, output: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    // Canonical paths retain Windows' extended-length prefix, including for UNC paths.
+    // The destination does not exist yet, so canonicalize its parent instead.
+    let source = fs::canonicalize(partial)?;
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = output
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output needs a file name"))?;
+    let destination = fs::canonicalize(parent)?.join(name);
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut destination: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    if destination.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "output contains a null byte",
+        ));
+    }
+    destination.push(0);
+
+    // SAFETY: Both paths are null-terminated UTF-16 buffers valid for the duration of the call.
+    // Without MOVEFILE_REPLACE_EXISTING, a racing destination is preserved. A rename also
+    // works on FAT32/exFAT, where the hard-link publication used on Unix is unsupported.
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn publish_no_replace(partial: &Path, output: &Path) -> io::Result<()> {
+    // Creating the hard link fails if another process created the output after preflight.
+    fs::hard_link(partial, output)?;
+    fs::remove_file(partial)
 }
 
 fn create_private_file(path: &Path) -> io::Result<File> {
@@ -1520,6 +1566,50 @@ mod tests {
             key_file: None,
             output_dir: None,
         }
+    }
+
+    #[test]
+    fn save_publishes_complete_bytes_and_cleans_up_temporary_file() {
+        let dir = TempDir::new();
+        let output = dir.path().join("backup-\u{00e9}-\u{937}.key");
+        write_transformed(&output, false, |writer| {
+            writer.write_all(b"test key backup bytes")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"test key backup bytes");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn publication_preserves_a_destination_created_after_preflight() {
+        let dir = TempDir::new();
+        let partial = dir.path().join("backup.partial");
+        let output = dir.path().join("backup.key");
+        fs::write(&partial, b"new bytes").unwrap();
+        assert!(!output.exists());
+        fs::write(&output, b"keep existing bytes").unwrap();
+
+        // Call the publication primitive directly to exercise its OS-level protection.
+        let err = publish_no_replace(&partial, &output).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&output).unwrap(), b"keep existing bytes");
+        assert_eq!(fs::read(&partial).unwrap(), b"new bytes");
+    }
+
+    #[test]
+    fn save_preserves_existing_output_and_cleans_up_temporary_file() {
+        let dir = TempDir::new();
+        let output = dir.path().join("backup.key");
+        let err = write_transformed(&output, false, |writer| {
+            writer.write_all(b"new bytes")?;
+            fs::write(&output, b"keep existing bytes")?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(err, CryptoError::OutputExists(_)));
+        assert_eq!(fs::read(&output).unwrap(), b"keep existing bytes");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     fn roundtrip(data: &[u8]) {
