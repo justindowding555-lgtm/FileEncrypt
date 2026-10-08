@@ -90,6 +90,8 @@ impl Source {
                     )
                 }));
         }
+        file_guard::ensure_no_named_streams(&self.file)?;
+        self.check()?;
         file_guard::request_delete(&self.file, &self.path)?;
         let path = self.path.clone();
         drop(self);

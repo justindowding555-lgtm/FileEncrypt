@@ -170,6 +170,7 @@ pub fn remove(
     {
         let capture = (|| -> io::Result<_> {
             source.check()?;
+            file_guard::ensure_no_named_streams(&source.file)?;
             if outputs.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -229,7 +230,7 @@ pub fn remove(
                     &path,
                     DeletionState::Pending,
                     Some(
-                        "Deletion accepted; removal has not yet been confirmed. Close open readers and check again."
+                        "Deletion accepted; removal has not yet been confirmed. Close open readers to allow Windows to finish."
                             .into(),
                     ),
                     Some(ticket),
@@ -239,10 +240,56 @@ pub fn remove(
                 &path,
                 DeletionState::Retained,
                 Some(deletion_reason(&error)),
-                Some(ticket),
+                (!matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidData | io::ErrorKind::Unsupported
+                ))
+                .then_some(ticket),
             ),
         }
     }
+}
+
+/// Check only an already accepted deletion. This never requests removal or
+/// hashes saved outputs, and cannot turn a retained receipt into a new deletion.
+pub fn check_pending(ticket: &RetryTicket) -> Option<DeletionInfo> {
+    #[cfg(windows)]
+    {
+        ticket.pending.then(|| pending_status(ticket, None))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = ticket;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn pending_status(ticket: &RetryTicket, callback: Option<&ProgressCallback<'_>>) -> DeletionInfo {
+    let path = &ticket.source.path;
+    let info = |state, reason| Removal::new(path, state, reason, None).info;
+    match file_guard::namespace_present(path) {
+        Ok(false) => return info(DeletionState::Removed, None),
+        Err(error) => return info(DeletionState::Pending, Some(error.to_string())),
+        Ok(true) => (),
+    }
+    // Output changes or cancellation cannot undo Windows' accepted deletion.
+    if check(callback).is_err() {
+        return info(
+            DeletionState::Pending,
+            Some("Deletion was already accepted; the status check was cancelled.".into()),
+        );
+    }
+    if let Ok(source) = Source::open(path, false) {
+        if file_guard::identity(&source.file).is_ok_and(|id| id != ticket.source.identity) {
+            return info(
+                DeletionState::Removed,
+                Some("Original removed; a different file now occupies its former path.".into()),
+            );
+        }
+    }
+    info(DeletionState::Pending, Some(
+        "Deletion was already accepted; removal has not yet been confirmed. Close open readers to allow Windows to finish.".into()))
 }
 
 pub fn retry(ticket: RetryTicket, callback: Option<&ProgressCallback<'_>>) -> Removal {
@@ -257,17 +304,18 @@ pub fn retry(ticket: RetryTicket, callback: Option<&ProgressCallback<'_>>) -> Re
     }
     #[cfg(windows)]
     {
+        if ticket.pending {
+            let info = pending_status(&ticket, callback);
+            let retry = (info.state == DeletionState::Pending).then_some(ticket);
+            return Removal { info, retry };
+        }
         {
             match file_guard::namespace_present(&path) {
                 Ok(false) => return Removal::new(&path, DeletionState::Removed, None, None),
                 Err(error) => {
                     return Removal::new(
                         &path,
-                        if ticket.pending {
-                            DeletionState::Pending
-                        } else {
-                            DeletionState::Retained
-                        },
+                        DeletionState::Retained,
                         Some(error.to_string()),
                         Some(ticket),
                     )
@@ -301,21 +349,68 @@ pub fn retry(ticket: RetryTicket, callback: Option<&ProgressCallback<'_>>) -> Re
                 )
             }
             Err(error) => {
-                let state = if ticket.pending && matches!(error.raw_os_error(), Some(5 | 32 | 33)) {
-                    DeletionState::Pending
-                } else {
-                    DeletionState::Retained
-                };
-                let reason = if state == DeletionState::Pending {
-                    "Deletion accepted; Windows is waiting for open file handles to close.".into()
-                } else {
-                    deletion_reason(&error)
-                };
-                let retry = (error.kind() != io::ErrorKind::InvalidData).then_some(ticket);
-                Removal::new(&path, state, Some(reason), retry)
+                let retry = (!matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidData | io::ErrorKind::Unsupported
+                ))
+                .then_some(ticket);
+                Removal::new(
+                    &path,
+                    DeletionState::Retained,
+                    Some(deletion_reason(&error)),
+                    retry,
+                )
             }
         }
     }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn pending_fixture(root: &Path) -> (PathBuf, PathBuf, File, RetryTicket) {
+    use crate::publication;
+    use std::{
+        fs,
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+    let original = root.join("pending.txt");
+    let saved = root.join("saved");
+    fs::write(&original, b"bytes").unwrap();
+    let source = Source::open(&original, true).unwrap();
+    let reader = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(7)
+        .open(&original)
+        .unwrap();
+    let output = publication::write(&saved, false, None, |w| {
+        w.write_all(b"bytes")?;
+        Ok(())
+    })
+    .unwrap();
+    let ticket = RetryTicket {
+        source: Arc::new(Receipt::capture(&source.file, &original, None).unwrap()),
+        outputs: vec![output.receipt(None).unwrap()],
+        pending: true,
+    };
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: explicitly exercise the legacy fallback on modern Windows.
+    assert_ne!(
+        unsafe {
+            SetFileInformationByHandle(
+                source.file.as_raw_handle(),
+                FileDispositionInfo,
+                (&info as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of_val(&info) as u32,
+            )
+        },
+        0
+    );
+    drop(source);
+    drop(output);
+    assert!(file_guard::namespace_present(&original).unwrap());
+    (original, saved, reader, ticket)
 }
 
 #[cfg(all(test, windows))]
@@ -506,53 +601,135 @@ mod tests {
 
     #[test]
     fn pending_deletion_is_reported_until_the_last_reader_closes() {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
-        };
-        let dir = TestDir::new();
-        let original = dir.0.join("pending.txt");
-        fs::write(&original, b"bytes").unwrap();
-        let source = Source::open(&original, true).unwrap();
-        let reader = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(7)
-            .open(&original)
-            .unwrap();
-        let output = publication::write(&dir.0.join("saved"), false, None, |w| {
-            w.write_all(b"bytes")?;
-            Ok(())
-        })
-        .unwrap();
-        let ticket = RetryTicket {
-            source: Arc::new(Receipt::capture(&source.file, &original, None).unwrap()),
-            outputs: vec![output.receipt(None).unwrap()],
-            pending: true,
-        };
-        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
-        // SAFETY: use the legacy API explicitly to exercise deferred removal on modern Windows.
-        assert_ne!(
-            unsafe {
-                SetFileInformationByHandle(
-                    source.file.as_raw_handle(),
-                    FileDispositionInfo,
-                    (&info as *const FILE_DISPOSITION_INFO).cast(),
-                    std::mem::size_of_val(&info) as u32,
-                )
-            },
-            0
-        );
-        drop(source);
-        drop(output);
-        assert!(file_guard::namespace_present(&original).unwrap());
-        let pending = retry(ticket, None);
-        assert_eq!(pending.info.state, DeletionState::Pending);
-        drop(reader);
-        assert_eq!(
-            retry(pending.retry.unwrap(), None).info.state,
-            DeletionState::Removed
-        );
+        for scenario in ["unchanged", "changed", "missing", "cancelled"] {
+            let dir = TestDir::new();
+            let (_, saved, reader, ticket) = pending_fixture(&dir.0);
+            match scenario {
+                "changed" => fs::write(&saved, b"other").unwrap(),
+                "missing" => fs::remove_file(saved).unwrap(),
+                _ => (),
+            }
+            let callback = |_| {
+                if scenario == "cancelled" {
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+                } else {
+                    Ok(())
+                }
+            };
+            let pending = retry(ticket, Some(&callback));
+            assert_eq!(pending.info.state, DeletionState::Pending, "{scenario}");
+            assert!(pending.retry.is_some(), "{scenario}");
+            drop(reader);
+            assert_eq!(
+                retry(pending.retry.unwrap(), None).info.state,
+                DeletionState::Removed
+            );
+        }
     }
+
+    #[test]
+    fn pending_status_poll_never_deletes_a_new_file_at_the_same_path() {
+        let dir = TestDir::new();
+        let (original, _, reader, ticket) = pending_fixture(&dir.0);
+        let replacement = dir.0.join("replacement.txt");
+        fs::write(&replacement, b"keep new file").unwrap();
+        drop(reader);
+        fs::rename(replacement, &original).unwrap();
+        let result = retry(ticket, None);
+        assert_eq!(result.info.state, DeletionState::Removed);
+        assert!(result.retry.is_none());
+        assert_eq!(fs::read(original).unwrap(), b"keep new file");
+    }
+
+    #[test]
+    fn extra_windows_streams_retain_both_empty_and_nonempty_originals() {
+        for bytes in [&b""[..], &b"main contents"[..]] {
+            let dir = TestDir::new();
+            let original = dir.0.join("original.txt");
+            fs::write(&original, bytes).unwrap();
+            let extra = crate::test_support::add_stream(&original, "extra", b"extra data");
+            let result =
+                crypto::encrypt_file_with_progress(&[8; 32], &original, &options(), &|_| Ok(()))
+                    .unwrap();
+            assert_eq!(result.removal.info.state, DeletionState::Retained);
+            assert!(result
+                .removal
+                .info
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("additional Windows data streams"));
+            assert!(result.removal.retry.is_none());
+            assert_eq!(fs::read(&original).unwrap(), bytes);
+            assert_eq!(fs::read(extra).unwrap(), b"extra data");
+            crypto::verify_file(&[8; 32], &result.path, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_empty_file_without_extra_streams_is_deleted_normally() {
+        let dir = TestDir::new();
+        let original = dir.0.join("empty.txt");
+        fs::write(&original, b"").unwrap();
+        let result =
+            crypto::encrypt_file_with_progress(&[8; 32], &original, &options(), &|_| Ok(()))
+                .unwrap();
+        assert_eq!(result.removal.info.state, DeletionState::Removed);
+        assert!(!original.exists());
+        crypto::verify_file(&[8; 32], &result.path, None).unwrap();
+    }
+
+    #[test]
+    fn retry_rejects_extra_streams_added_after_the_copy_was_saved() {
+        let dir = TestDir::new();
+        let (original, _, ticket) = locked_copy(&dir);
+        let extra = crate::test_support::add_stream(&original, "extra", b"new stream");
+        let result = retry(ticket, None);
+        assert_eq!(result.info.state, DeletionState::Retained);
+        assert!(result.retry.is_none());
+        assert_eq!(fs::read(original).unwrap(), b"source bytes");
+        assert_eq!(fs::read(extra).unwrap(), b"new stream");
+    }
+
+    #[test]
+    fn decryption_and_rotation_retain_encrypted_inputs_with_extra_streams() {
+        for rotate in [false, true] {
+            let dir = TestDir::new();
+            let plain = dir.0.join("plain.txt");
+            fs::write(&plain, b"secret").unwrap();
+            let encryption = JobOptions {
+                remove_original: false,
+                output_dir: Some(dir.0.join("encrypted")),
+                ..options()
+            };
+            let input =
+                crypto::encrypt_file_with_progress(&[1; 32], &plain, &encryption, &|_| Ok(()))
+                    .unwrap()
+                    .path;
+            let bytes = fs::read(&input).unwrap();
+            let extra = crate::test_support::add_stream(&input, "extra", b"keep this too");
+            let output_options = JobOptions {
+                output_dir: Some(dir.0.join("output")),
+                ..options()
+            };
+            let result = if rotate {
+                crypto::rotate_file_with_deletion(&[1; 32], &[2; 32], &input, &output_options, None)
+            } else {
+                crypto::decrypt_file_with_progress(&[1; 32], &input, &output_options, &|_| Ok(()))
+            }
+            .unwrap();
+            assert_eq!(result.removal.info.state, DeletionState::Retained);
+            assert!(result.removal.retry.is_none());
+            assert_eq!(fs::read(&input).unwrap(), bytes);
+            assert_eq!(fs::read(extra).unwrap(), b"keep this too");
+            if rotate {
+                crypto::verify_file(&[2; 32], &result.path, None).unwrap();
+            } else {
+                assert_eq!(fs::read(result.path).unwrap(), b"secret");
+            }
+        }
+    }
+
     #[test]
     fn rotation_checks_cancellation_after_publication_for_files_and_zips() {
         for zip in [false, true] {

@@ -79,6 +79,99 @@ pub fn open_read(path: &Path, delete: bool) -> io::Result<File> {
     Ok(file)
 }
 
+/// The encrypted format stores the unnamed data stream only. Check the pinned
+/// source handle rather than following a potentially changed pathname.
+#[cfg(windows)]
+pub fn ensure_no_named_streams(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{SetLastError, ERROR_HANDLE_EOF};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileStreamInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+        FILE_STREAM_INFO,
+    };
+    const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
+    let unknown = |error: io::Error| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("Windows data streams could not be checked; original retained: {error}"),
+        )
+    };
+    // FILE_STREAM_INFO requires eight-byte alignment. Bound allocation even for
+    // a provider returning unusually large stream lists.
+    let mut buffer = vec![0u64; 512];
+    loop {
+        // SAFETY: the live handle and aligned, initialized output allocation are valid.
+        let success = unsafe {
+            // FileStreamInfo documents ERROR_HANDLE_EOF for an empty stream list,
+            // including a successful call. Clear stale errors before querying.
+            SetLastError(0);
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileStreamInfo,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * 8) as u32,
+            )
+        };
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+            return Ok(());
+        }
+        if success != 0 {
+            break;
+        }
+        if matches!(error.raw_os_error(), Some(122 | 234)) && buffer.len() * 8 < 1024 * 1024 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if matches!(error.raw_os_error(), Some(1 | 50 | 87)) {
+            // FAT/exFAT do not have named streams. Only bypass the unsupported
+            // query when the same handle's volume explicitly confirms that.
+            let mut flags = 0;
+            // SAFETY: optional buffers are null and flags is a valid DWORD output.
+            let known = unsafe {
+                GetVolumeInformationByHandleW(
+                    file.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut flags,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            } != 0;
+            if known && flags & FILE_NAMED_STREAMS == 0 {
+                return Ok(());
+            }
+        }
+        return Err(unknown(error));
+    }
+    // The only permitted list is one entry named ::$DATA. Any second entry
+    // or different name represents data this format does not preserve.
+    let offset = std::mem::offset_of!(FILE_STREAM_INFO, StreamName);
+    // SAFETY: the allocation is aligned and larger than FILE_STREAM_INFO.
+    let info = unsafe { &*buffer.as_ptr().cast::<FILE_STREAM_INFO>() };
+    let length = info.StreamNameLength as usize;
+    if !length.is_multiple_of(2) || length > buffer.len() * 8 - offset {
+        return Err(unknown(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid stream information",
+        )));
+    }
+    // SAFETY: the UTF-16 slice is aligned and bounds-checked above.
+    let name = unsafe {
+        std::slice::from_raw_parts(
+            buffer.as_ptr().cast::<u8>().add(offset).cast::<u16>(),
+            length / 2,
+        )
+    };
+    if info.NextEntryOffset != 0 || name != [58, 58, 36, 68, 65, 84, 65] {
+        return Err(io::Error::new(io::ErrorKind::Unsupported,
+            "Original retained because it contains additional Windows data streams that are not included in the saved copy."));
+    }
+    Ok(())
+}
+
 pub fn create(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);

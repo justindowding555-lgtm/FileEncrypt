@@ -57,6 +57,7 @@ pub fn run() {
             commands::run_job,
             commands::cancel_job,
             commands::retry_deletion,
+            commands::check_pending_deletions,
             commands::rotate_key,
             commands::check_for_updates,
             commands::install_update,

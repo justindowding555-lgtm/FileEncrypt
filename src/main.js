@@ -123,6 +123,11 @@ function applyStatus(status, updatePath) {
 
 let fileRemoveButtons = [];
 let deletionButtons = [];
+let pendingDeletionTimer = null;
+let pendingDeletionCheckRunning = false;
+let pendingDeletionCursor = 0;
+let pendingDeletionDelay = 1000;
+const PENDING_DELETION_BATCH_SIZE = 100;
 const pagedLists = new Map();
 const PAGE_SIZE = 100;
 function renderPaged(listId, pagerId, items, renderRow) {
@@ -278,6 +283,12 @@ function renderFiles() {
 }
 
 function renderResults(results) {
+  if (state.results !== results) {
+    pendingDeletionCursor = 0;
+    pendingDeletionDelay = 1000;
+    if (pendingDeletionTimer !== null) clearTimeout(pendingDeletionTimer);
+    pendingDeletionTimer = null;
+  }
   state.results = results;
   $("results-panel").hidden = results.length === 0;
   const succeeded = results.filter((result) => result.ok).length;
@@ -309,14 +320,17 @@ function renderResults(results) {
       status.className = "deletion-status";
       const label = { removed: "Original removed", pending: "Deletion pending", retained: "Original retained" }[deletion.state];
       status.textContent = `${label}: ${deletion.source}` + (deletion.reason ? ` | ${deletion.reason}` : "");
+      if (deletion.state === "pending" && deletion.retryId) {
+        status.textContent += " Checking automatically.";
+      }
       text.append(status);
-      if (deletion.retryId) {
+      if (deletion.retryId && deletion.state === "retained") {
         const retry = document.createElement("button");
         retry.type = "button";
         retry.className = "text-button deletion-retry";
-        retry.textContent = deletion.state === "pending" ? "Check deletion" : "Retry deletion";
+        retry.textContent = "Retry deletion";
         retry.disabled = state.busy;
-        retry.title = "Check the original and saved copies before removing the original.";
+        retry.title = "The app verifies the original and saved copies, then retries deletion.";
         retry.addEventListener("click", () => retryOriginalDeletion(deletion.retryId));
         deletionButtons.push(retry);
         text.append(retry);
@@ -325,6 +339,67 @@ function renderResults(results) {
     item.append(text);
     return item;
   });
+  schedulePendingDeletionCheck();
+}
+
+function schedulePendingDeletionCheck() {
+  const pending = state.results.some((result) => result.deletion?.state === "pending" && result.deletion.retryId);
+  if (!pending) {
+    if (pendingDeletionTimer !== null) clearTimeout(pendingDeletionTimer);
+    pendingDeletionTimer = null;
+    pendingDeletionDelay = 1000;
+    return;
+  }
+  if (pendingDeletionTimer !== null || pendingDeletionCheckRunning) return;
+  pendingDeletionTimer = setTimeout(() => {
+    pendingDeletionTimer = null;
+    return checkPendingDeletions();
+  }, pendingDeletionDelay);
+}
+
+async function checkPendingDeletions() {
+  if (pendingDeletionCheckRunning) return;
+  if (state.busy) {
+    schedulePendingDeletionCheck();
+    return;
+  }
+  const results = state.results;
+  const pending = results.filter((result) => result.deletion?.state === "pending" && result.deletion.retryId);
+  if (!pending.length) return;
+  // Rotate through the whole report, including rows outside the current page.
+  const start = pendingDeletionCursor % pending.length;
+  const retryIds = Array.from({ length: Math.min(pending.length, PENDING_DELETION_BATCH_SIZE) },
+    (_, index) => pending[(start + index) % pending.length].deletion.retryId);
+  pendingDeletionCursor = (start + retryIds.length) % pending.length;
+  pendingDeletionCheckRunning = true;
+  try {
+    const updates = await invoke("check_pending_deletions", { retryIds });
+    pendingDeletionDelay = 1000;
+    if (state.results !== results) return;
+    const byId = new Map(updates.map((update) => [update.retryId, update.deletion]));
+    let changed = false;
+    for (const result of results) {
+      const previous = result.deletion;
+      if (previous?.state !== "pending" || !byId.has(previous.retryId)) continue;
+      const deletion = byId.get(previous.retryId) || {
+        ...previous, retryId: null,
+        reason: "Deletion was accepted, but its automatic status receipt is no longer available.",
+      };
+      if (previous.state !== deletion.state || previous.source !== deletion.source
+        || previous.reason !== deletion.reason || previous.retryId !== deletion.retryId) {
+        result.deletion = deletion;
+        changed = true;
+      }
+    }
+    if (changed) renderResults(results);
+  } catch {
+    // Transient IPC failures should not interrupt a successful file job or
+    // create an alert every second. Keep the honest pending status and retry.
+    pendingDeletionDelay = Math.min(pendingDeletionDelay * 2, 10000);
+  } finally {
+    pendingDeletionCheckRunning = false;
+    schedulePendingDeletionCheck();
+  }
 }
 
 async function retryOriginalDeletion(retryId) {

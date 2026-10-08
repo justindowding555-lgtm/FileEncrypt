@@ -3,7 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ pub struct AppState {
     startup_key_unavailable: AtomicBool,
     running: AtomicBool,
     cancelled: AtomicBool,
-    deletions: Mutex<HashMap<String, RetryTicket>>,
+    deletions: Mutex<DeletionRegistry>,
 }
 
 impl Default for AppState {
@@ -43,7 +43,7 @@ impl Default for AppState {
             startup_key_unavailable: AtomicBool::new(false),
             running: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
-            deletions: Mutex::new(HashMap::new()),
+            deletions: Mutex::new(DeletionRegistry::default()),
         }
     }
 }
@@ -211,13 +211,75 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
+const MAX_DELETION_RECEIPTS: usize = 10_000;
+const PENDING_DELETION_BATCH_SIZE: usize = 100;
+
+#[derive(Default)]
+struct DeletionRegistry {
+    current: HashMap<String, Arc<RetryTicket>>,
+    confirmed: HashMap<String, DeletionInfo>,
+    staged: Option<HashMap<String, Arc<RetryTicket>>>,
+}
+
+impl DeletionRegistry {
+    fn clear(&mut self) {
+        self.current.clear();
+        self.confirmed.clear();
+        self.staged = None;
+    }
+}
+
+/// Keep the displayed results usable if a new job fails. Only replace their
+/// receipts when a completed report is ready to replace those results in the UI.
+struct DeletionBatch<'a> {
+    state: &'a AppState,
+    committed: bool,
+}
+impl<'a> DeletionBatch<'a> {
+    fn new(state: &'a AppState) -> Self {
+        let mut registry = lock(&state.deletions);
+        debug_assert!(registry.staged.is_none());
+        registry.staged = Some(HashMap::new());
+        Self {
+            state,
+            committed: false,
+        }
+    }
+    fn commit(mut self) {
+        let mut registry = lock(&self.state.deletions);
+        registry.current = registry.staged.take().unwrap_or_default();
+        registry.confirmed.clear();
+        self.committed = true;
+    }
+}
+impl Drop for DeletionBatch<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            lock(&self.state.deletions).staged = None;
+        }
+    }
+}
+
 fn register_removal(state: &AppState, mut removal: Removal) -> DeletionInfo {
     if let Some(ticket) = removal.retry {
-        let mut tickets = lock(&state.deletions);
-        if tickets.len() < 10_000 {
+        let mut registry = lock(&state.deletions);
+        let tickets = match &mut *registry {
+            DeletionRegistry {
+                staged: Some(tickets),
+                ..
+            } => tickets,
+            DeletionRegistry { current, .. } => current,
+        };
+        if tickets.len() < MAX_DELETION_RECEIPTS {
             let token = crypto::opaque_file_name().to_string_lossy().into_owned();
-            tickets.insert(token.clone(), ticket);
+            tickets.insert(token.clone(), Arc::new(ticket));
             removal.info.retry_id = Some(token);
+        } else {
+            let reason = removal.info.reason.get_or_insert_with(String::new);
+            if !reason.is_empty() {
+                reason.push(' ');
+            }
+            reason.push_str("Deletion retry is unavailable because this report reached the 10,000-receipt limit.");
         }
     }
     removal.info
@@ -269,15 +331,97 @@ pub async fn retry_deletion(
         }
         let _running = Running(&state);
         state.cancelled.store(false, Ordering::Release);
-        let ticket = lock(&state.deletions).remove(&retry_id)
-            .ok_or("This deletion receipt is no longer available. Retry receipts last for this app session.")?;
+        let ticket = {
+            let mut registry = lock(&state.deletions);
+            if let Some(info) = registry.confirmed.get(&retry_id).cloned() {
+                return Ok(info);
+            }
+            registry.current.remove(&retry_id)
+        }
+            .ok_or("This deletion receipt is no longer available. Receipts last until new results replace them or the app closes.")?;
         let callback = |_| -> io::Result<()> {
             if state.cancelled.load(Ordering::Acquire) {
                 Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"))
             } else { Ok(()) }
         };
-        Ok(register_removal(&state, deletion::retry(ticket, Some(&callback))))
+        Ok(register_removal(&state, deletion::retry(Arc::unwrap_or_clone(ticket), Some(&callback))))
     }).await.map_err(|error| error.to_string())?
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingDeletionUpdate {
+    retry_id: String,
+    deletion: Option<DeletionInfo>,
+}
+
+fn pending_deletion_updates(state: &AppState, retry_ids: &[String]) -> Vec<PendingDeletionUpdate> {
+    // Snapshot shared receipts so filesystem queries never hold the registry
+    // mutex or occupy the file-job slot. IDs stay stable across status polls.
+    let tickets = {
+        let registry = lock(&state.deletions);
+        let mut seen = HashSet::new();
+        retry_ids
+            .iter()
+            .filter(|id| seen.insert(*id))
+            .map(|id| {
+                (
+                    id.clone(),
+                    registry.current.get(id).cloned(),
+                    registry.confirmed.get(id).cloned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut updates = Vec::with_capacity(tickets.len());
+    for (retry_id, ticket, confirmed) in tickets {
+        let deletion = confirmed.or_else(|| ticket.as_deref().and_then(deletion::check_pending));
+        let mut registry = lock(&state.deletions);
+        // A new report or an explicit retry may have retired this receipt while
+        // the query was in flight. Never resurrect it in the current registry.
+        let current = ticket.as_ref().is_some_and(|ticket| {
+            registry
+                .current
+                .get(&retry_id)
+                .is_some_and(|entry| Arc::ptr_eq(entry, ticket))
+        });
+        let deletion = if current {
+            // Cache confirmation until the next report. If an IPC response is
+            // lost, the next check must still be able to recover this outcome.
+            registry
+                .confirmed
+                .get(&retry_id)
+                .cloned()
+                .or(deletion)
+                .map(|mut info| {
+                    if info.state == DeletionState::Removed {
+                        registry.confirmed.insert(retry_id.clone(), info.clone());
+                    } else {
+                        info.retry_id = Some(retry_id.clone());
+                    }
+                    info
+                })
+        } else {
+            None
+        };
+        updates.push(PendingDeletionUpdate { retry_id, deletion });
+    }
+    updates
+}
+
+#[tauri::command]
+pub async fn check_pending_deletions(
+    app: tauri::AppHandle,
+    retry_ids: Vec<String>,
+) -> Result<Vec<PendingDeletionUpdate>, String> {
+    if retry_ids.len() > PENDING_DELETION_BATCH_SIZE {
+        return Err("Check at most 100 pending deletions at a time.".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        pending_deletion_updates(app.state::<AppState>().inner(), &retry_ids)
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 pub fn restore_saved_key(app: &tauri::AppHandle, state: &AppState) {
@@ -752,7 +896,10 @@ pub async fn run_job(
         if !preview.can_run {
             return Err("Resolve the issues shown in the preview before starting.".into());
         }
-        execute_job(&app, &state, request, preview)
+        let batch = DeletionBatch::new(&state);
+        let results = execute_job(&app, &state, request, preview)?;
+        batch.commit();
+        Ok(results)
     })
     .await
     .map_err(|err| err.to_string())?
@@ -834,6 +981,7 @@ pub async fn rotate_key(
         let processed = AtomicU64::new(0);
         let last_emit=Mutex::new(Instant::now()-Duration::from_secs(1));
         let mut results = Vec::with_capacity(paths.len());
+        let batch = DeletionBatch::new(&state);
         for (index, path) in paths.into_iter().enumerate() {
             if state.cancelled.load(Ordering::Acquire) { break; }
             let input = PathBuf::from(&path);
@@ -871,6 +1019,7 @@ pub async fn rotate_key(
         } else {
             set_message(&state, format!("Rotation was incomplete. The old key remains loaded. The new key file is at {} for any successful outputs.", new_path.display()));
         }
+        batch.commit();
         Ok(Some(RotationReport { results, status: status(&state) }))
     }).await.map_err(|err| err.to_string())?
 }
@@ -2035,5 +2184,205 @@ mod tests {
             fs::read(dir.0.join("restored/second.txt")).unwrap(),
             b"second"
         );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn extra_streams_are_preserved_during_bundle_creation_restoration_and_rotation() {
+        use crate::deletion::DeletionState;
+        let dir = crate::test_support::TestDir::new();
+        let first = dir.0.join("first.txt");
+        let second = dir.0.join("second.txt");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let extra = crate::test_support::add_stream(&second, "extra", b"keep source stream");
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: true,
+            key_file: None,
+            output_dir: Some(dir.0.join("encrypted")),
+        };
+        let key = [4; 32];
+        let bundle =
+            archive::encrypt_to_zip(&key, &[first.clone(), second.clone()], &options).unwrap();
+        assert_eq!(bundle.removals[0].info.state, DeletionState::Removed);
+        assert_eq!(bundle.removals[1].info.state, DeletionState::Retained);
+        assert!(bundle.removals[1].retry.is_none());
+        assert!(!first.exists());
+        assert_eq!(fs::read(second).unwrap(), b"second");
+        assert_eq!(fs::read(extra).unwrap(), b"keep source stream");
+
+        let zip_bytes = fs::read(&bundle.path).unwrap();
+        let zip_extra = crate::test_support::add_stream(&bundle.path, "extra", b"keep ZIP stream");
+        let rotation = JobOptions {
+            output_dir: Some(dir.0.join("rotated")),
+            ..options.clone()
+        };
+        let rotated =
+            archive::rotate_zip_with_deletion(&key, &[5; 32], &bundle.path, &rotation, None)
+                .unwrap();
+        assert_eq!(rotated.removal.info.state, DeletionState::Retained);
+        assert!(rotated.removal.retry.is_none());
+        let entries = archive_read::entries(&rotated.path).unwrap();
+        assert_eq!(
+            archive_read::inspect_names(&rotated.path, &[5; 32], &entries).unwrap(),
+            ["first.txt", "second.txt"]
+        );
+
+        let restore = JobOptions {
+            output_dir: Some(dir.0.join("restored")),
+            ..options
+        };
+        let results = zip_outcomes(
+            &key,
+            &bundle.path,
+            &restore,
+            false,
+            &|_| Ok(()),
+            &|_, _| {},
+            &AppState::default(),
+        );
+        assert!(results.iter().all(|result| result.ok));
+        let deletion = results[0].deletion.as_ref().unwrap();
+        assert_eq!(deletion.state, DeletionState::Retained);
+        assert!(deletion.retry_id.is_none());
+        assert_eq!(fs::read(&bundle.path).unwrap(), zip_bytes);
+        assert_eq!(fs::read(zip_extra).unwrap(), b"keep ZIP stream");
+        assert_eq!(
+            fs::read(dir.0.join("restored/first.txt")).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            fs::read(dir.0.join("restored/second.txt")).unwrap(),
+            b"second"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_reports_have_retry_capacity_even_when_the_previous_report_is_full() {
+        let dir = crate::test_support::TestDir::new();
+        let fixture = crate::test_support::retained_removal(&dir);
+        let make_removal = || Removal {
+            info: fixture.info.clone(),
+            retry: fixture.retry.clone(),
+        };
+        let state = AppState::default();
+        let old_batch = DeletionBatch::new(&state);
+        for _ in 0..MAX_DELETION_RECEIPTS {
+            assert!(register_removal(&state, make_removal()).retry_id.is_some());
+        }
+        let overflow = register_removal(&state, make_removal());
+        assert!(overflow.retry_id.is_none());
+        assert!(overflow.reason.unwrap().contains("10,000-receipt limit"));
+        old_batch.commit();
+        assert_eq!(lock(&state.deletions).current.len(), MAX_DELETION_RECEIPTS);
+        let new_batch = DeletionBatch::new(&state);
+        let latest = register_removal(&state, make_removal()).retry_id.unwrap();
+        assert_eq!(lock(&state.deletions).current.len(), MAX_DELETION_RECEIPTS);
+        new_batch.commit();
+        assert_eq!(lock(&state.deletions).current.len(), 1);
+        assert!(lock(&state.deletions).current.contains_key(&latest));
+        // A subsequent report without retryable originals retires the previous receipt.
+        DeletionBatch::new(&state).commit();
+        assert!(lock(&state.deletions).current.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_report_preserves_retries_for_the_still_displayed_results() {
+        let dir = crate::test_support::TestDir::new();
+        let fixture = crate::test_support::retained_removal(&dir);
+        let make_removal = || Removal {
+            info: fixture.info.clone(),
+            retry: fixture.retry.clone(),
+        };
+        let state = AppState::default();
+        let original = register_removal(&state, make_removal()).retry_id.unwrap();
+        {
+            let _failed_batch = DeletionBatch::new(&state);
+            assert!(register_removal(&state, make_removal()).retry_id.is_some());
+        }
+        let registry = lock(&state.deletions);
+        assert_eq!(registry.current.len(), 1);
+        assert!(registry.current.contains_key(&original));
+        assert!(registry.staged.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn automatic_checks_confirm_deletion_without_revalidating_outputs_or_blocking_jobs() {
+        let dir = crate::test_support::TestDir::new();
+        let (original, saved, reader, ticket) = deletion::pending_fixture(&dir.0);
+        let state = AppState::default();
+        let info = register_removal(
+            &state,
+            Removal {
+                info: DeletionInfo {
+                    state: DeletionState::Pending,
+                    source: original.display().to_string(),
+                    reason: None,
+                    retry_id: None,
+                },
+                retry: Some(ticket),
+            },
+        );
+        let id = info.retry_id.unwrap();
+        state.running.store(true, Ordering::Release);
+        state.cancelled.store(true, Ordering::Release);
+        fs::remove_file(saved).unwrap();
+        let pending = pending_deletion_updates(&state, &[id.clone(), id.clone()]);
+        assert_eq!(pending.len(), 1);
+        let info = pending[0].deletion.as_ref().unwrap();
+        assert_eq!(info.state, DeletionState::Pending);
+        assert_eq!(info.retry_id.as_ref(), Some(&id));
+        assert!(state.running.load(Ordering::Acquire));
+        assert!(state.cancelled.load(Ordering::Acquire));
+        assert_eq!(lock(&state.deletions).current.len(), 1);
+
+        drop(reader);
+        let removed = pending_deletion_updates(&state, std::slice::from_ref(&id));
+        let info = removed[0].deletion.as_ref().unwrap();
+        assert_eq!(info.state, DeletionState::Removed);
+        assert!(info.retry_id.is_none());
+        assert!(!original.exists());
+        assert_eq!(lock(&state.deletions).confirmed.len(), 1);
+        // A lost response can be recovered without querying a replacement or
+        // turning a confirmed deletion back into pending.
+        fs::write(&original, b"replacement").unwrap();
+        {
+            let _failed_report = DeletionBatch::new(&state);
+        }
+        let repeated = pending_deletion_updates(&state, std::slice::from_ref(&id));
+        assert_eq!(
+            repeated[0].deletion.as_ref().unwrap().state,
+            DeletionState::Removed
+        );
+        assert_eq!(fs::read(original).unwrap(), b"replacement");
+        DeletionBatch::new(&state).commit();
+        assert!(lock(&state.deletions).current.is_empty());
+        assert!(lock(&state.deletions).confirmed.is_empty());
+        assert!(pending_deletion_updates(&state, &[id])[0]
+            .deletion
+            .is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn automatic_status_checks_never_retry_retained_files_or_resurrect_expired_receipts() {
+        let dir = crate::test_support::TestDir::new();
+        let state = AppState::default();
+        let info = register_removal(&state, crate::test_support::retained_removal(&dir));
+        let id = info.retry_id.unwrap();
+        let updates = pending_deletion_updates(&state, std::slice::from_ref(&id));
+        assert!(updates[0].deletion.is_none());
+        assert_eq!(fs::read(&info.source).unwrap(), b"bytes");
+        assert!(lock(&state.deletions).current.contains_key(&id));
+
+        DeletionBatch::new(&state).commit();
+        assert!(pending_deletion_updates(&state, &[id])[0]
+            .deletion
+            .is_none());
+        assert!(lock(&state.deletions).current.is_empty());
+        assert_eq!(fs::read(info.source).unwrap(), b"bytes");
     }
 }

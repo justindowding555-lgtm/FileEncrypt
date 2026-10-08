@@ -5,6 +5,8 @@ import vm from "node:vm";
 
 function fixture(invoke) {
   let created = 0;
+  let nextTimer = 0;
+  const timers = new Map();
   const refs = new Map();
   function element(fragment = false) {
     return { fragment, children: [], handlers: new Map(), value: "", checked: false,
@@ -18,9 +20,18 @@ function fixture(invoke) {
     getElementById(id) { if (!refs.has(id)) refs.set(id, element()); return refs.get(id); },
     createElement() { created++; return element(); }, createDocumentFragment() { return element(true); },
   };
-  const context = vm.createContext({ document, window: { __TAURI__: { core: { invoke } } } });
+  const context = vm.createContext({ document, window: { __TAURI__: { core: { invoke } } },
+    setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+  });
   vm.runInContext(fs.readFileSync(new URL("../src/main.js", import.meta.url), "utf8"), context);
-  return { context, refs, count: () => created, evaluate: (code) => vm.runInContext(code, context) };
+  return { context, refs, timers, count: () => created, evaluate: (code) => vm.runInContext(code, context),
+    fireTimer() {
+      const [id, timer] = timers.entries().next().value;
+      timers.delete(id);
+      return timer.callback();
+    },
+  };
 }
 
 test("large selections stay paged and unrelated actions do not recreate rows", async () => {
@@ -76,23 +87,117 @@ test("deletion retry updates the original status without repeating the successfu
   assert.equal(ui.refs.get("progress-panel").hidden, true);
 });
 
-test("pending deletion checks are serialized and can be cancelled", async () => {
+test("pending deletions update automatically without blocking controls or requiring a button", async () => {
   let finish;
-  let calls = 0;
-  const ui = fixture(() => { calls++; return new Promise((resolve) => { finish = resolve; }); });
-  ui.evaluate('renderResults([{input:"bundle.zip",ok:true,message:"Decrypted",deletion:{state:"pending",source:"bundle.zip",retryId:"receipt"}}])');
-  const before = ui.count();
-  const button = ui.refs.get("results").children[0].children[0].children[3];
-  assert.equal(button.textContent, "Check deletion");
-  const running = button.handlers.get("click")();
-  assert.equal(button.disabled, true);
-  assert.equal(ui.refs.get("cancel-job").disabled, false);
-  assert.equal(ui.count(), before);
-  await button.handlers.get("click")();
-  assert.equal(calls, 1);
-  finish({ state: "pending", source: "bundle.zip", retryId: "next", reason: "Waiting for open readers" });
-  await running;
-  assert.equal(ui.evaluate("state.results[0].deletion.retryId"), "next");
+  const calls = [];
+  const ui = fixture((command, args) => {
+    calls.push({ command, args });
+    return new Promise((resolve) => { finish = resolve; });
+  });
+  ui.evaluate('renderResults([{input:"bundle.zip",ok:true,message:"Decrypted",deletion:{state:"pending",source:"bundle.zip",retryId:"receipt"}}]); renderControls()');
+  const text = ui.refs.get("results").children[0].children[0];
+  assert.equal(text.children.length, 3);
+  assert.match(text.children[2].textContent, /Checking automatically/);
+  assert.equal(ui.timers.size, 1);
+  const running = ui.fireTimer();
+  assert.equal(calls[0].command, "check_pending_deletions");
+  assert.equal(JSON.stringify(calls[0].args.retryIds), '["receipt"]');
+  assert.equal(ui.evaluate("state.busy"), false);
+  assert.equal(ui.evaluate("state.jobRunning"), false);
+  assert.equal(ui.refs.get("add-files").disabled, false);
   assert.equal(ui.refs.get("cancel-job").disabled, true);
-  assert.equal(ui.refs.get("results").children[0].children[0].children[3].disabled, false);
+  await ui.evaluate("checkPendingDeletions()");
+  assert.equal(calls.length, 1);
+  finish([{ retryId: "receipt", deletion: { state: "removed", source: "bundle.zip", retryId: null, reason: null } }]);
+  await running;
+  assert.equal(ui.evaluate("state.results[0].deletion.state"), "removed");
+  assert.equal(ui.refs.get("result-summary").textContent, "1 succeeded, 0 failed");
+  assert.equal(ui.timers.size, 0);
+});
+
+test("automatic checks pause during jobs and do not redraw unchanged pending rows", async () => {
+  let calls = 0;
+  const ui = fixture(async () => {
+    calls++;
+    return [{ retryId: "receipt", deletion: { state: "pending", source: "bundle.zip", retryId: "receipt", reason: "Waiting" } }];
+  });
+  ui.evaluate('renderResults([{input:"bundle.zip",ok:true,message:"Decrypted",deletion:{state:"pending",source:"bundle.zip",retryId:"receipt",reason:"Waiting"}}]); state.busy=true');
+  await ui.fireTimer();
+  assert.equal(calls, 0);
+  assert.equal(ui.timers.size, 1);
+  ui.evaluate("state.busy=false");
+  const before = ui.count();
+  await ui.fireTimer();
+  assert.equal(calls, 1);
+  assert.equal(ui.count(), before);
+  assert.equal(ui.timers.size, 1);
+});
+
+test("an in-flight automatic check cannot overwrite a newer report", async () => {
+  let finish;
+  const ui = fixture(() => new Promise((resolve) => { finish = resolve; }));
+  ui.evaluate('renderResults([{input:"old.zip",ok:true,message:"Decrypted",deletion:{state:"pending",source:"old.zip",retryId:"old"}}])');
+  const running = ui.fireTimer();
+  ui.evaluate('renderResults([{input:"new.fenc",ok:true,message:"Verified"}])');
+  finish([{ retryId: "old", deletion: { state: "removed", source: "old.zip", retryId: null } }]);
+  await running;
+  assert.equal(ui.evaluate("state.results[0].input"), "new.fenc");
+  assert.equal(ui.evaluate("state.results[0].deletion"), undefined);
+  assert.equal(ui.timers.size, 0);
+});
+
+test("a check finishing during another job still records the confirmed deletion", async () => {
+  let finish;
+  const ui = fixture(() => new Promise((resolve) => { finish = resolve; }));
+  ui.evaluate('renderResults([{input:"bundle.zip",ok:true,message:"Decrypted",deletion:{state:"pending",source:"bundle.zip",retryId:"receipt"}}])');
+  const running = ui.fireTimer();
+  ui.evaluate("state.busy=true; state.jobRunning=true");
+  finish([{ retryId: "receipt", deletion: { state: "removed", source: "bundle.zip", retryId: null } }]);
+  await running;
+  assert.equal(ui.evaluate("state.results[0].deletion.state"), "removed");
+  assert.equal(ui.evaluate("state.busy"), true);
+  assert.equal(ui.evaluate("state.jobRunning"), true);
+  assert.equal(ui.timers.size, 0);
+});
+
+test("automatic checks cover pending rows across pages in bounded batches and leave retained files alone", async () => {
+  const checked = new Set();
+  const sizes = [];
+  const ui = fixture(async (command, { retryIds }) => {
+    assert.equal(command, "check_pending_deletions");
+    sizes.push(retryIds.length);
+    return retryIds.map((retryId) => {
+      checked.add(retryId);
+      return { retryId, deletion: { state: "pending", source: `${retryId}.zip`, retryId, reason: "Waiting" } };
+    });
+  });
+  ui.evaluate('renderResults([...Array.from({length:250},(_,i)=>({input:`${i}.zip`,ok:true,message:"Decrypted",deletion:{state:"pending",source:`${i}.zip`,retryId:String(i),reason:"Waiting"}})), {input:"retained.txt",ok:true,deletion:{state:"retained",source:"retained.txt",retryId:"retained"}}, {input:"expired.zip",ok:true,deletion:{state:"pending",source:"expired.zip",retryId:null}}])');
+  for (let i = 0; i < 3; i++) await ui.fireTimer();
+  assert.equal(checked.size, 250);
+  assert.equal(checked.has("retained"), false);
+  assert.ok(sizes.every((size) => size <= 100));
+  assert.equal(ui.evaluate("state.results[250].deletion.retryId"), "retained");
+  assert.equal(ui.refs.get("results").children.length, 100);
+  assert.equal(ui.timers.size, 1);
+  ui.evaluate("renderResults([])");
+  assert.equal(ui.timers.size, 0);
+});
+
+test("automatic checks back off after errors and stop on an expired receipt without claiming retention", async () => {
+  let calls = 0;
+  const ui = fixture(async () => {
+    if (++calls <= 4) throw new Error("IPC unavailable");
+    return [{ retryId: "receipt", deletion: null }];
+  });
+  ui.evaluate('renderResults([{input:"bundle.zip",ok:true,message:"Decrypted",deletion:{state:"pending",source:"bundle.zip",retryId:"receipt"}}])');
+  for (const expectedDelay of [2000, 4000, 8000, 10000]) {
+    await ui.fireTimer();
+    assert.equal(ui.timers.values().next().value.delay, expectedDelay);
+    assert.equal(ui.evaluate("state.results[0].deletion.state"), "pending");
+  }
+  await ui.fireTimer();
+  assert.equal(ui.evaluate("state.results[0].deletion.state"), "pending");
+  assert.equal(ui.evaluate("state.results[0].deletion.retryId"), null);
+  assert.match(ui.evaluate("state.results[0].deletion.reason"), /no longer available/);
+  assert.equal(ui.timers.size, 0);
 });
