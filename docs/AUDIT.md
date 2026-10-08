@@ -133,3 +133,6 @@ All five bug fixes and all six performance improvements are implemented:
 Compatibility: existing standalone files and older bundles remain readable. New bundle formats require this updated reader. Removing originals from a legacy ZIP is deliberately disabled because its complete membership cannot be authenticated. Unix metadata checks detect changes but cannot provide Windows-style mandatory sharing restrictions against a concurrent external writer.
 
 Validation: all 49 Rust unit tests and all 3 frontend unit tests pass. They cover the regressions, legacy compatibility, authenticated manifest tampering and stripping, long names, source edits during reads/publication, backup snapshot changes, partial result preservation, streaming CRC/authentication failures, compressed restoration and rotation, cancellation cleanup, and bounded frontend rendering. Development checking and strict library Clippy checks pass. No application smoke test, fuzz run, production build, installer, release package, or dev server was run. Throughput has not been benchmarked; performance claims describe the eliminated work and backend selection.
+
+
+The subsequent deletion audit and its implementation are recorded in [DELETION_AUDIT.md](DELETION_AUDIT.md). It supersedes the source-deletion and overwrite-backup details above.

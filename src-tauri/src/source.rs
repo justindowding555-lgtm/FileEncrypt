@@ -1,71 +1,68 @@
-//! Keep the source stable through publication and delete the file we actually opened.
-use std::fs::{self, File, Metadata, OpenOptions};
+//! Pin source identity and reject source links at the opened-handle boundary.
+use crate::file_guard::{self, Identity};
+use std::fs::{File, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
 
 pub struct Source {
     pub file: File,
-    path: PathBuf,
+    pub path: PathBuf,
     initial: Metadata,
+    identity: Identity,
+    #[cfg(windows)]
+    delete_error: Option<i32>,
+    #[cfg(windows)]
     deletable: bool,
 }
 
 impl Source {
     pub fn open(path: &Path, deletable: bool) -> io::Result<Self> {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            // Exclude writers and renames for the lifetime of this handle. DELETE access
-            // lets removal target this handle, without reopening a potentially replaced path.
-            options
-                .share_mode(1)
-                .access_mode(0x8000_0000 | if deletable { 0x0001_0000 } else { 0 });
-        }
-        let (file, can_delete) = match options.open(path) {
-            Ok(file) => (file, deletable),
-            #[cfg(windows)]
-            Err(err) if deletable && matches!(err.raw_os_error(), Some(5 | 32)) => {
-                use std::os::windows::fs::OpenOptionsExt;
-                // A reader may deny DELETE access while still allowing a stable copy.
-                // Keep that source and report OriginalRemains after publishing the copy.
-                (options.access_mode(0x8000_0000).open(path)?, false)
-            }
-            Err(err) => return Err(err),
-        };
+        let (file, can_delete, delete_error): (File, bool, Option<i32>) =
+            match file_guard::open_read(path, deletable) {
+                Ok(file) => (file, deletable, None),
+                #[cfg(windows)]
+                Err(error) if deletable && matches!(error.raw_os_error(), Some(5 | 32)) => (
+                    file_guard::open_read(path, false)?,
+                    false,
+                    error.raw_os_error(),
+                ),
+                Err(error) => return Err(error),
+            };
+        #[cfg(not(windows))]
+        let _ = (can_delete, delete_error);
         let initial = file.metadata()?;
-        if !initial.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "source is not a regular file",
-            ));
-        }
-        Ok(Self {
+        file_guard::regular(&initial)?;
+        let identity = file_guard::identity(&file)?;
+        let source = Self {
             file,
             path: path.to_path_buf(),
             initial,
+            identity,
+            #[cfg(windows)]
             deletable: can_delete,
-        })
+            #[cfg(windows)]
+            delete_error,
+        };
+        source.check()?;
+        Ok(source)
     }
 
     pub fn len(&self) -> u64 {
         self.initial.len()
     }
+    #[cfg(windows)]
+    pub fn can_delete(&self) -> bool {
+        self.deletable
+    }
 
     pub fn check(&self) -> io::Result<()> {
+        file_guard::check_path(&self.file, &self.path, self.identity, self.initial.len())?;
         let current = self.file.metadata()?;
-        let at_path = fs::metadata(&self.path)?;
-        let unchanged = current.len() == self.initial.len()
-            && current.modified()? == self.initial.modified()?
-            && at_path.len() == self.initial.len()
-            && at_path.modified()? == self.initial.modified()?;
+        let unchanged = current.modified()? == self.initial.modified()?;
         #[cfg(unix)]
         let unchanged = {
             use std::os::unix::fs::MetadataExt;
             unchanged
-                && at_path.dev() == self.initial.dev()
-                && at_path.ino() == self.initial.ino()
                 && current.ctime() == self.initial.ctime()
                 && current.ctime_nsec() == self.initial.ctime_nsec()
         };
@@ -79,39 +76,28 @@ impl Source {
         }
     }
 
-    pub fn remove(&self) -> io::Result<()> {
+    #[cfg(windows)]
+    pub fn remove(self) -> io::Result<crate::deletion::DeletionState> {
         self.check()?;
         if !self.deletable {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "source could not be opened for deletion; original was preserved",
-            ));
+            return Err(self
+                .delete_error
+                .map(io::Error::from_raw_os_error)
+                .unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "source was not opened for deletion",
+                    )
+                }));
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Storage::FileSystem::{
-                FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
-            };
-            let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-            // SAFETY: the live file handle was opened with DELETE access; the buffer
-            // has the exact layout and length required by FileDispositionInfo.
-            if unsafe {
-                SetFileInformationByHandle(
-                    self.file.as_raw_handle(),
-                    FileDispositionInfo,
-                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
-                    std::mem::size_of_val(&disposition) as u32,
-                )
-            } == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        }
-        #[cfg(not(windows))]
-        {
-            fs::remove_file(&self.path)
+        file_guard::request_delete(&self.file, &self.path)?;
+        let path = self.path.clone();
+        drop(self);
+        match file_guard::namespace_present(&path) {
+            Ok(false) => Ok(crate::deletion::DeletionState::Removed),
+            // Once deletion is accepted, a failed namespace query must not turn it
+            // back into an unaccepted deletion. A later check can confirm removal.
+            Ok(true) | Err(_) => Ok(crate::deletion::DeletionState::Pending),
         }
     }
 }

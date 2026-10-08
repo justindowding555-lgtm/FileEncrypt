@@ -23,11 +23,15 @@
 
 use std::cell::Cell;
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
 use crate::source::Source;
+use crate::{
+    deletion::{self, Removal},
+    publication::{self, PublishedFile},
+};
 use aegis::aegis256::Aegis256;
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::stream::DecryptorBE32;
@@ -96,8 +100,14 @@ pub enum CryptoError {
     InvalidKeyMaterial,
     #[error("the stored file name is not a single file name")]
     BadEncryptedName,
-    #[error("wrote {output}, but could not delete the original file: {source}")]
-    OriginalRemains { output: String, source: io::Error },
+    #[error("output published at {output}, but durability could not be confirmed; original retained: {source}")]
+    PublicationUncertain { output: String, source: io::Error },
+    #[error("{cause}; temporary cleanup failed at {path}: {source}")]
+    CleanupFailed {
+        cause: Box<CryptoError>,
+        path: String,
+        source: io::Error,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -115,16 +125,6 @@ struct SecretBytes(Vec<u8>);
 impl Drop for SecretBytes {
     fn drop(&mut self) {
         self.0.zeroize();
-    }
-}
-
-struct DeleteOnDrop<'a> {
-    path: &'a Path,
-}
-
-impl Drop for DeleteOnDrop<'_> {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(self.path);
     }
 }
 
@@ -146,7 +146,7 @@ pub fn encrypt_file(
     input: &Path,
     options: &JobOptions,
 ) -> Result<PathBuf, CryptoError> {
-    transform(Direction::Encrypt, key, input, options, None)
+    transform(Direction::Encrypt, key, input, options, None).map(|result| result.path)
 }
 
 #[cfg(test)]
@@ -155,7 +155,13 @@ pub fn decrypt_file(
     input: &Path,
     options: &JobOptions,
 ) -> Result<PathBuf, CryptoError> {
-    transform(Direction::Decrypt, key, input, options, None)
+    transform(Direction::Decrypt, key, input, options, None).map(|result| result.path)
+}
+
+#[derive(Debug)]
+pub struct TransformOutcome {
+    pub path: PathBuf,
+    pub removal: Removal,
 }
 
 pub type ProgressCallback<'a> = dyn Fn(u64) -> io::Result<()> + Sync + 'a;
@@ -195,7 +201,7 @@ pub fn encrypt_file_with_progress(
     input: &Path,
     options: &JobOptions,
     callback: &ProgressCallback<'_>,
-) -> Result<PathBuf, CryptoError> {
+) -> Result<TransformOutcome, CryptoError> {
     transform(Direction::Encrypt, key, input, options, Some(callback))
 }
 
@@ -275,7 +281,7 @@ pub(crate) fn decrypt_named_reader(
     reader: &mut dyn Read,
     options: &JobOptions,
     callback: Option<&ProgressCallback<'_>>,
-) -> Result<PathBuf, CryptoError> {
+) -> Result<PublishedFile, CryptoError> {
     let opened = open_named(reader, key)?;
     let output = place(
         input,
@@ -289,11 +295,10 @@ pub(crate) fn decrypt_named_reader(
         .ok_or(CryptoError::BadEncryptedName)?;
     ensure_no_linked_parent(root, &output)?;
     ensure_distinct(input, &output, options.key_file.as_deref())?;
-    write_transformed(&output, options.overwrite, |writer| {
+    publication::write(&output, options.overwrite, callback, |writer| {
         decrypt_named_body(reader, writer, &opened)?;
         check_progress(callback)
-    })?;
-    Ok(output)
+    })
 }
 
 enum PipeMessage {
@@ -376,6 +381,7 @@ impl Drop for PipeReader {
     }
 }
 
+#[cfg(test)]
 pub fn rotate_file_with_progress(
     old_key: &[u8; 32],
     new_key: &[u8; 32],
@@ -383,9 +389,19 @@ pub fn rotate_file_with_progress(
     options: &JobOptions,
     callback: Option<&ProgressCallback<'_>>,
 ) -> Result<PathBuf, CryptoError> {
+    rotate_file_with_deletion(old_key, new_key, input, options, callback).map(|result| result.path)
+}
+
+pub fn rotate_file_with_deletion(
+    old_key: &[u8; 32],
+    new_key: &[u8; 32],
+    input: &Path,
+    options: &JobOptions,
+    callback: Option<&ProgressCallback<'_>>,
+) -> Result<TransformOutcome, CryptoError> {
     let version = legacy_version(input)?.ok_or(CryptoError::NotEncrypted)?;
     let output = opaque_output_path(input, options.output_dir.as_deref(), false)?;
-    finish_job(input, output, options, |destination, source| {
+    finish_job(input, output, options, callback, |destination, source| {
         let reader = BufReader::new(source.file.try_clone()?);
         let mut source: Box<dyn Read + Send + '_> = if let Some(callback) = callback {
             Box::new(ProgressReader {
@@ -422,7 +438,7 @@ pub fn rotate_file_with_progress(
         } else {
             return Err(CryptoError::UnsupportedVersion(version));
         };
-        let result = write_transformed(destination, false, |writer| {
+        let result = publication::write(destination, false, callback, |writer| {
             std::thread::scope(|scope| {
                 let (sender, receiver) = sync_channel(2);
                 let (recycled, pool) = sync_channel(4);
@@ -551,7 +567,7 @@ pub fn decrypt_file_with_progress(
     input: &Path,
     options: &JobOptions,
     callback: &ProgressCallback<'_>,
-) -> Result<PathBuf, CryptoError> {
+) -> Result<TransformOutcome, CryptoError> {
     transform(Direction::Decrypt, key, input, options, Some(callback))
 }
 
@@ -620,20 +636,10 @@ fn verify_reader(
 }
 
 pub(crate) fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<(), CryptoError> {
-    if let Some(parent) = destination.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    let partial = temporary_sibling(destination, "partial");
-    let _guard = DeleteOnDrop { path: &partial };
-    {
-        let mut file = create_private_file(&partial)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    commit_partial(&partial, destination, true)?;
-    Ok(())
+    write_transformed(destination, true, |writer| {
+        writer.write_all(bytes)?;
+        Ok(())
+    })
 }
 
 fn transform(
@@ -642,7 +648,7 @@ fn transform(
     input: &Path,
     options: &JobOptions,
     callback: Option<&ProgressCallback<'_>>,
-) -> Result<PathBuf, CryptoError> {
+) -> Result<TransformOutcome, CryptoError> {
     if !input.exists() {
         return Err(CryptoError::NotAFile(format!(
             "file not found: {}",
@@ -661,10 +667,10 @@ fn transform(
             let output =
                 opaque_output_path(input, options.output_dir.as_deref(), options.overwrite)?;
             let original_name = file_name_utf8(input)?;
-            finish_job(input, output, options, |destination, source| {
+            finish_job(input, output, options, callback, |destination, source| {
                 let input_file = source.file.try_clone()?;
                 let mut reader = BufReader::new(input_file);
-                write_transformed(destination, options.overwrite, |writer| {
+                publication::write(destination, options.overwrite, callback, |writer| {
                     let result = if let Some(callback) = callback {
                         let mut reader = ProgressReader {
                             inner: reader,
@@ -696,10 +702,10 @@ fn transform(
         Direction::Decrypt => match legacy_version(input)? {
             Some(LEGACY_VERSION) => {
                 let output = output_path(input, options.output_dir.as_deref(), Direction::Decrypt)?;
-                finish_job(input, output, options, |destination, source| {
+                finish_job(input, output, options, callback, |destination, source| {
                     let input_file = source.file.try_clone()?;
                     let mut reader = BufReader::new(input_file);
-                    write_transformed(destination, options.overwrite, |writer| {
+                    publication::write(destination, options.overwrite, callback, |writer| {
                         let result = if let Some(callback) = callback {
                             let mut reader = ProgressReader {
                                 inner: reader,
@@ -716,10 +722,10 @@ fn transform(
             }
             Some(AEGIS_VERSION) => {
                 let output = output_path(input, options.output_dir.as_deref(), Direction::Decrypt)?;
-                finish_job(input, output, options, |destination, source| {
+                finish_job(input, output, options, callback, |destination, source| {
                     let input_file = source.file.try_clone()?;
                     let mut reader = BufReader::new(input_file);
-                    write_transformed(destination, options.overwrite, |writer| {
+                    publication::write(destination, options.overwrite, callback, |writer| {
                         let result = if let Some(callback) = callback {
                             let mut reader = ProgressReader {
                                 inner: reader,
@@ -758,19 +764,21 @@ fn finish_job(
     input: &Path,
     output: PathBuf,
     options: &JobOptions,
-    write: impl FnOnce(&Path, &Source) -> Result<(), CryptoError>,
-) -> Result<PathBuf, CryptoError> {
+    callback: Option<&ProgressCallback<'_>>,
+    write: impl FnOnce(&Path, &Source) -> Result<PublishedFile, CryptoError>,
+) -> Result<TransformOutcome, CryptoError> {
     let source = Source::open(input, options.remove_original)?;
-    finish_opened_job(input, output, options, &source, write)
+    finish_opened_job(input, output, options, source, callback, write)
 }
 
 fn finish_opened_job(
     input: &Path,
     output: PathBuf,
     options: &JobOptions,
-    source: &Source,
-    write: impl FnOnce(&Path, &Source) -> Result<(), CryptoError>,
-) -> Result<PathBuf, CryptoError> {
+    source: Source,
+    callback: Option<&ProgressCallback<'_>>,
+    write: impl FnOnce(&Path, &Source) -> Result<PublishedFile, CryptoError>,
+) -> Result<TransformOutcome, CryptoError> {
     ensure_distinct(input, &output, options.key_file.as_deref())?;
     match fs::symlink_metadata(&output) {
         Ok(_) if !options.overwrite => {
@@ -786,16 +794,16 @@ fn finish_opened_job(
         _ => {}
     }
     source.check()?;
-    write(&output, source)?;
-    if options.remove_original {
-        if let Err(source) = source.remove() {
-            return Err(CryptoError::OriginalRemains {
-                output: output.display().to_string(),
-                source,
-            });
-        }
-    }
-    Ok(output)
+    let published = write(&output, &source)?;
+    let removal = if options.remove_original {
+        deletion::remove(source, std::slice::from_ref(&published), callback)
+    } else {
+        Removal::not_requested(input)
+    };
+    Ok(TransformOutcome {
+        path: output,
+        removal,
+    })
 }
 
 fn decrypt_named(
@@ -803,7 +811,7 @@ fn decrypt_named(
     input: &Path,
     options: &JobOptions,
     callback: Option<&ProgressCallback<'_>>,
-) -> Result<PathBuf, CryptoError> {
+) -> Result<TransformOutcome, CryptoError> {
     let source = Source::open(input, options.remove_original)?;
     let reader = BufReader::new(source.file.try_clone()?);
     let mut reader: Box<dyn Read + '_> = if let Some(callback) = callback {
@@ -828,12 +836,19 @@ fn decrypt_named(
             .ok_or(CryptoError::BadEncryptedName)?;
         ensure_no_linked_parent(root, &output)?;
     }
-    finish_opened_job(input, output, options, &source, |destination, _| {
-        write_transformed(destination, options.overwrite, |writer| {
-            decrypt_named_body(&mut reader, writer, &opened)?;
-            check_progress(callback)
-        })
-    })
+    finish_opened_job(
+        input,
+        output,
+        options,
+        source,
+        callback,
+        move |destination, _| {
+            publication::write(destination, options.overwrite, callback, |writer| {
+                decrypt_named_body(&mut reader, writer, &opened)?;
+                check_progress(callback)
+            })
+        },
+    )
 }
 
 fn random_key() -> Zeroizing<[u8; 32]> {
@@ -1532,115 +1547,7 @@ pub(crate) fn write_transformed(
     overwrite: bool,
     produce: impl FnOnce(&mut dyn Write) -> Result<(), CryptoError>,
 ) -> Result<(), CryptoError> {
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    let partial = temporary_sibling(output, "partial");
-    let _guard = DeleteOnDrop { path: &partial };
-    {
-        let file = create_private_file(&partial)?;
-        let mut writer = BufWriter::new(file);
-        produce(&mut writer)?;
-        writer.flush()?;
-        let file = writer.into_inner().map_err(|err| err.into_error())?;
-        file.sync_all()?;
-    }
-    commit_partial(&partial, output, overwrite)?;
-    Ok(())
-}
-
-fn commit_partial(partial: &Path, output: &Path, overwrite: bool) -> Result<(), CryptoError> {
-    let existing = match fs::symlink_metadata(output) {
-        Ok(metadata) => Some(metadata),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-        Err(err) => return Err(err.into()),
-    };
-    if let Some(metadata) = existing {
-        if !overwrite {
-            return Err(CryptoError::OutputExists(output.display().to_string()));
-        }
-        if !metadata.is_file() {
-            return Err(CryptoError::NotAFile(format!(
-                "existing output is not a regular file: {}",
-                output.display()
-            )));
-        }
-        let backup = temporary_sibling(output, "backup");
-        fs::rename(output, &backup)?;
-        if let Err(err) = fs::rename(partial, output) {
-            let _ = fs::rename(&backup, output);
-            return Err(err.into());
-        }
-        let _ = fs::remove_file(&backup);
-        return Ok(());
-    }
-    if overwrite {
-        fs::rename(partial, output)?;
-    } else {
-        publish_no_replace(partial, output).map_err(|err| {
-            if err.kind() == io::ErrorKind::AlreadyExists {
-                CryptoError::OutputExists(output.display().to_string())
-            } else {
-                err.into()
-            }
-        })?;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn publish_no_replace(partial: &Path, output: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
-
-    // Canonical paths retain Windows' extended-length prefix, including for UNC paths.
-    // The destination does not exist yet, so canonicalize its parent instead.
-    let source = fs::canonicalize(partial)?;
-    let parent = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let name = output
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output needs a file name"))?;
-    let destination = fs::canonicalize(parent)?.join(name);
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut destination: Vec<u16> = destination.as_os_str().encode_wide().collect();
-    if destination.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "output contains a null byte",
-        ));
-    }
-    destination.push(0);
-
-    // SAFETY: Both paths are null-terminated UTF-16 buffers valid for the duration of the call.
-    // Without MOVEFILE_REPLACE_EXISTING, a racing destination is preserved. A rename also
-    // works on FAT32/exFAT, where the hard-link publication used on Unix is unsupported.
-    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn publish_no_replace(partial: &Path, output: &Path) -> io::Result<()> {
-    // Creating the hard link fails if another process created the output after preflight.
-    fs::hard_link(partial, output)?;
-    fs::remove_file(partial)
-}
-
-fn create_private_file(path: &Path) -> io::Result<File> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
+    publication::write(output, overwrite, None, produce).map(|_| ())
 }
 
 fn output_path(
@@ -1758,13 +1665,6 @@ fn normalize(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn temporary_sibling(path: &Path, kind: &str) -> PathBuf {
-    path.with_file_name(format!(
-        ".fe-{kind}-{}",
-        opaque_file_name().to_string_lossy()
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1842,7 +1742,8 @@ mod tests {
         fs::write(&output, b"keep existing bytes").unwrap();
 
         // Call the publication primitive directly to exercise its OS-level protection.
-        let err = publish_no_replace(&partial, &output).unwrap_err();
+        let handle = crate::file_guard::open_read(&partial, true).unwrap();
+        let err = crate::file_guard::rename(&handle, &partial, &output, false).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&output).unwrap(), b"keep existing bytes");
         assert_eq!(fs::read(&partial).unwrap(), b"new bytes");
@@ -2082,7 +1983,9 @@ mod tests {
         fs::write(&input, data).unwrap();
         let key = test_key(6);
         let encrypted = encrypt_file(&key, &input, &options(false, true)).unwrap();
-        assert!(!input.exists());
+        assert_eq!(input.exists(), !cfg!(windows));
+        #[cfg(not(windows))]
+        fs::remove_file(&input).unwrap();
         assert!(is_opaque_name(&encrypted));
 
         let renamed = dir.path().join("blob.bin");
@@ -2129,15 +2032,16 @@ mod tests {
             .share_mode(0x0000_0001)
             .open(&input)
             .unwrap();
-        let err = encrypt_file(&test_key(5), &input, &options(false, true)).unwrap_err();
-        match err {
-            CryptoError::OriginalRemains { output, .. } => {
-                assert!(Path::new(&output).is_file());
-                assert!(output.ends_with(".fenc"));
-                assert!(!output.to_lowercase().contains("locked"));
-            }
-            other => panic!("unexpected {other:?}"),
-        }
+        let result =
+            encrypt_file_with_progress(&test_key(5), &input, &options(false, true), &|_| Ok(()))
+                .unwrap();
+        assert_eq!(
+            result.removal.info.state,
+            crate::deletion::DeletionState::Retained
+        );
+        assert!(result.removal.retry.is_some());
+        assert!(result.path.is_file());
+        assert!(is_opaque_name(&result.path));
         assert_eq!(fs::read(&input).unwrap(), b"data");
     }
 
@@ -2243,7 +2147,7 @@ mod tests {
             assert_eq!(fs::read(&encrypted).unwrap(), replacement_bytes);
         } else {
             assert!(result.is_ok());
-            assert!(!encrypted.exists());
+            assert_eq!(encrypted.exists(), !cfg!(windows));
             assert_eq!(fs::read(&input).unwrap(), b"original data");
         }
     }

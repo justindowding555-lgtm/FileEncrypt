@@ -455,3 +455,6 @@ footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: s
 .list-pages span { color: var(--muted); font-size: 0.78rem; }
 .list-pages button { min-height: 30px; padding: 5px 9px; font-size: 0.78rem; }
 .list-pages[hidden] { display: none; }
+
+.deletion-status { margin-top: 5px; color: var(--muted); font-size: 0.8rem; overflow-wrap: anywhere; }
+.deletion-retry { margin-top: 5px; font-size: 0.8rem; }

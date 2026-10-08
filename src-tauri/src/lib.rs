@@ -2,8 +2,13 @@ mod archive;
 mod archive_read;
 mod commands;
 mod crypto;
+mod deletion;
+mod file_guard;
 mod key_file;
+mod publication;
 mod source;
+#[cfg(test)]
+mod test_support;
 
 /// Parse an in-memory archive with the same checks used for files selected in the app.
 /// This entry point also lets the fuzz target exercise the parser without disk I/O.
@@ -51,6 +56,7 @@ pub fn run() {
             commands::preview_job,
             commands::run_job,
             commands::cancel_job,
+            commands::retry_deletion,
             commands::rotate_key,
             commands::check_for_updates,
             commands::install_update,

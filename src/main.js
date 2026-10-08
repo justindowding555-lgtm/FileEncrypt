@@ -1,5 +1,6 @@
 const state = {
   files: [],
+  results: [],
   fileSet: new Set(),
   folderRoots: new Map(),
   busy: false,
@@ -121,6 +122,7 @@ function applyStatus(status, updatePath) {
 }
 
 let fileRemoveButtons = [];
+let deletionButtons = [];
 const pagedLists = new Map();
 const PAGE_SIZE = 100;
 function renderPaged(listId, pagerId, items, renderRow) {
@@ -138,6 +140,7 @@ function renderPaged(listId, pagerId, items, renderRow) {
       view.page = Math.max(0, Math.min(view.page, count - 1));
       const start = view.page * PAGE_SIZE;
       if (listId === "file-list") fileRemoveButtons = [];
+      if (listId === "results") deletionButtons = [];
       const fragment = document.createDocumentFragment();
       for (let index = start; index < Math.min(start + PAGE_SIZE, view.items.length); index++) {
         fragment.append(view.renderRow(view.items[index], index));
@@ -159,7 +162,7 @@ function renderPaged(listId, pagerId, items, renderRow) {
 }
 
 function renderControls() {
-  for (const button of fileRemoveButtons) button.disabled = state.busy;
+  for (const button of [...fileRemoveButtons, ...deletionButtons]) button.disabled = state.busy;
   const noFiles = state.files.length === 0;
   const blocked = state.busy || !state.keyLoaded || noFiles;
   $("generate").classList.toggle("primary", !state.keyLoaded);
@@ -275,9 +278,14 @@ function renderFiles() {
 }
 
 function renderResults(results) {
+  state.results = results;
   $("results-panel").hidden = results.length === 0;
   const succeeded = results.filter((result) => result.ok).length;
-  $("result-summary").textContent = `${succeeded} succeeded, ${results.length - succeeded} failed`;
+  const retained = results.filter((result) => result.deletion?.state === "retained").length;
+  const pending = results.filter((result) => result.deletion?.state === "pending").length;
+  $("result-summary").textContent = `${succeeded} succeeded, ${results.length - succeeded} failed`
+    + (retained ? ` | ${retained} originals retained` : "")
+    + (pending ? ` | ${pending} deletions pending` : "");
   renderPaged("results", "result-pages", results, (result) => {
     const item = document.createElement("li");
     item.className = result.ok ? "result ok" : "result fail";
@@ -295,9 +303,49 @@ function renderResults(results) {
       ? `${result.message} · ${result.output}`
       : result.message;
     text.append(title, message);
+    const deletion = result.deletion;
+    if (deletion && deletion.state !== "notRequested") {
+      const status = document.createElement("div");
+      status.className = "deletion-status";
+      const label = { removed: "Original removed", pending: "Deletion pending", retained: "Original retained" }[deletion.state];
+      status.textContent = `${label}: ${deletion.source}` + (deletion.reason ? ` | ${deletion.reason}` : "");
+      text.append(status);
+      if (deletion.retryId) {
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.className = "text-button deletion-retry";
+        retry.textContent = deletion.state === "pending" ? "Check deletion" : "Retry deletion";
+        retry.disabled = state.busy;
+        retry.title = "Check the original and saved copies before removing the original.";
+        retry.addEventListener("click", () => retryOriginalDeletion(deletion.retryId));
+        deletionButtons.push(retry);
+        text.append(retry);
+      }
+    }
     item.append(text);
     return item;
   });
+}
+
+async function retryOriginalDeletion(retryId) {
+  if (state.busy) return;
+  state.jobRunning = true;
+  $("progress-panel").hidden = false;
+  $("job-progress").removeAttribute("value");
+  $("progress-label").textContent = "Checking files before deleting the original...";
+  try {
+    await run(async () => {
+      const deletion = await invoke("retry_deletion", { retryId });
+      for (const result of state.results) {
+        if (result.deletion?.retryId === retryId) result.deletion = deletion;
+      }
+      renderResults(state.results);
+    }, false);
+  } finally {
+    state.jobRunning = false;
+    $("progress-panel").hidden = true;
+    renderControls();
+  }
 }
 
 async function run(work, updatePathOnSuccess) {

@@ -2,6 +2,8 @@
 use crate::{
     archive_read,
     crypto::{self, BundleBinding, CryptoError, JobOptions},
+    deletion::{self, Removal},
+    publication,
     source::Source,
 };
 use hkdf::Hkdf;
@@ -15,7 +17,7 @@ use zeroize::Zeroizing;
 
 pub struct ArchiveOutcome {
     pub path: PathBuf,
-    pub delete_errors: Vec<Option<String>>,
+    pub removals: Vec<Removal>,
 }
 type EntryCallback<'a> = dyn Fn(usize, &Path) + 'a;
 #[cfg(test)]
@@ -152,7 +154,7 @@ pub fn encrypt_to_zip_with_progress(
     // modified or replaced in the interval between encrypting it and removing it.
     let mut held = Vec::new();
     let bundle = binding(inputs.len());
-    crypto::write_transformed(&archive, false, |writer| {
+    let published = publication::write(&archive, false, progress, |writer| {
         let mut zip = ZipWriter::new(writer);
         for (index, input) in inputs.iter().enumerate() {
             check(progress)?;
@@ -186,20 +188,23 @@ pub fn encrypt_to_zip_with_progress(
         zip.finish(key, bundle)?;
         check(progress)
     })?;
-    let delete_errors = if options.remove_original {
-        held.iter()
-            .map(|source| source.remove().err().map(|err| err.to_string()))
+    let removals = if options.remove_original {
+        held.into_iter()
+            .map(|source| deletion::remove(source, std::slice::from_ref(&published), progress))
             .collect()
     } else {
-        vec![None; inputs.len()]
+        inputs
+            .iter()
+            .map(|path| Removal::not_requested(path))
+            .collect()
     };
-    drop(held);
     Ok(ArchiveOutcome {
         path: archive,
-        delete_errors,
+        removals,
     })
 }
 
+#[cfg(test)]
 pub fn rotate_zip_with_progress(
     old_key: &[u8; 32],
     new_key: &[u8; 32],
@@ -207,6 +212,16 @@ pub fn rotate_zip_with_progress(
     options: &JobOptions,
     progress: Option<&crypto::ProgressCallback<'_>>,
 ) -> Result<PathBuf, CryptoError> {
+    rotate_zip_with_deletion(old_key, new_key, input, options, progress).map(|result| result.path)
+}
+
+pub fn rotate_zip_with_deletion(
+    old_key: &[u8; 32],
+    new_key: &[u8; 32],
+    input: &Path,
+    options: &JobOptions,
+    progress: Option<&crypto::ProgressCallback<'_>>,
+) -> Result<crypto::TransformOutcome, CryptoError> {
     let source = Source::open(input, options.remove_original)?;
     let mut file = source.file.try_clone()?;
     let entries = archive_read::entries_from_reader(&mut file)?;
@@ -214,7 +229,7 @@ pub fn rotate_zip_with_progress(
     let output = destination(input, options)?;
     crypto::ensure_distinct(input, &output, options.key_file.as_deref())?;
     let bundle = binding(entries.len());
-    crypto::write_transformed(&output, false, |writer| {
+    let published = publication::write(&output, false, progress, |writer| {
         let mut zip = ZipWriter::new(writer);
         for entry in &entries {
             check(progress)?;
@@ -235,16 +250,21 @@ pub fn rotate_zip_with_progress(
         zip.finish(new_key, bundle)?;
         check(progress)
     })?;
-    // Legacy bundles authenticate only individual entries, so their source is retained.
-    if options.remove_original && authenticated {
-        source
-            .remove()
-            .map_err(|source| CryptoError::OriginalRemains {
-                output: output.display().to_string(),
-                source,
-            })?;
-    }
-    Ok(output)
+    drop(file);
+    let removal = if options.remove_original && authenticated {
+        deletion::remove(source, std::slice::from_ref(&published), progress)
+    } else if options.remove_original {
+        Removal::retained(
+            input,
+            "Older ZIP retained because its complete file list is unauthenticated.",
+        )
+    } else {
+        Removal::not_requested(input)
+    };
+    Ok(crypto::TransformOutcome {
+        path: output,
+        removal,
+    })
 }
 
 pub(crate) const MANIFEST_MAGIC: &[u8; 4] = b"FEB1";
@@ -491,9 +511,14 @@ mod tests {
         );
 
         let result = encrypt_to_zip(&key, &[first.clone(), second.clone()], &options).unwrap();
-        assert_eq!(result.delete_errors, vec![None, None]);
-        assert!(!first.exists());
-        assert!(!second.exists());
+        let expected = if cfg!(windows) {
+            crate::deletion::DeletionState::Removed
+        } else {
+            crate::deletion::DeletionState::Retained
+        };
+        assert!(result.removals.iter().all(|r| r.info.state == expected));
+        assert_eq!(first.exists(), !cfg!(windows));
+        assert_eq!(second.exists(), !cfg!(windows));
         assert_eq!(result.path.extension().unwrap(), "zip");
         assert!(fs::read(&result.path).unwrap().starts_with(b"PK\x03\x04"));
 
@@ -830,7 +855,7 @@ mod tests {
             assert_eq!(fs::read(input).unwrap(), b"changed after encryption");
         } else {
             assert!(result.is_ok());
-            assert!(!input.exists());
+            assert_eq!(input.exists(), !cfg!(windows));
         }
     }
     #[test]
@@ -894,5 +919,57 @@ mod tests {
             assert_eq!(restored, name);
             assert_eq!(opened, Some(bound));
         }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_during_original_cleanup_stops_the_remaining_deletions() {
+        let dir = TestDir::new();
+        let first = dir.0.join("first.txt");
+        let second = dir.0.join("second.txt");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: true,
+            key_file: None,
+            output_dir: Some(dir.0.join("out")),
+        };
+        let cancel_after_first = |_| {
+            if !first.exists() {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "cancelled during cleanup",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        let result = encrypt_to_zip_with_progress(
+            &[1; 32],
+            &[first.clone(), second.clone()],
+            &options,
+            None,
+            false,
+            Some(&cancel_after_first),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            result.removals[0].info.state,
+            crate::deletion::DeletionState::Removed
+        );
+        assert_eq!(
+            result.removals[1].info.state,
+            crate::deletion::DeletionState::Retained
+        );
+        assert!(!first.exists());
+        assert!(second.exists());
+        let entries = archive_read::entries(&result.path).unwrap();
+        assert_eq!(
+            archive_read::inspect_names(&result.path, &[1; 32], &entries)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }

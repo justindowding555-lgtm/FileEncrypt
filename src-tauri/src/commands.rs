@@ -17,6 +17,10 @@ use crate::archive_read;
 use crate::crypto::{self, CryptoError, JobOptions};
 use crate::key_file;
 use crate::source::Source;
+use crate::{
+    deletion::{self, DeletionInfo, DeletionState, Removal, RetryTicket},
+    file_guard,
+};
 
 pub struct AppState {
     key: Mutex<Option<Zeroizing<[u8; 32]>>>,
@@ -26,6 +30,7 @@ pub struct AppState {
     startup_key_unavailable: AtomicBool,
     running: AtomicBool,
     cancelled: AtomicBool,
+    deletions: Mutex<HashMap<String, RetryTicket>>,
 }
 
 impl Default for AppState {
@@ -38,6 +43,7 @@ impl Default for AppState {
             startup_key_unavailable: AtomicBool::new(false),
             running: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            deletions: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -56,6 +62,8 @@ pub struct AppStatus {
 
 #[derive(Serialize)]
 pub struct FileOutcome {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deletion: Option<DeletionInfo>,
     input: String,
     output: Option<String>,
     ok: bool,
@@ -203,6 +211,75 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
+fn register_removal(state: &AppState, mut removal: Removal) -> DeletionInfo {
+    if let Some(ticket) = removal.retry {
+        let mut tickets = lock(&state.deletions);
+        if tickets.len() < 10_000 {
+            let token = crypto::opaque_file_name().to_string_lossy().into_owned();
+            tickets.insert(token.clone(), ticket);
+            removal.info.retry_id = Some(token);
+        }
+    }
+    removal.info
+}
+
+fn transformed_outcome(
+    state: &AppState,
+    input: String,
+    result: crypto::TransformOutcome,
+    message: &str,
+) -> FileOutcome {
+    let info = register_removal(state, result.removal);
+    FileOutcome {
+        input,
+        output: Some(result.path.display().to_string()),
+        ok: true,
+        message: message.into(),
+        deletion: (info.state != DeletionState::NotRequested).then_some(info),
+    }
+}
+
+fn failed_outcome(input: String, error: CryptoError) -> FileOutcome {
+    let output = match &error {
+        CryptoError::PublicationUncertain { output, .. } => Some(output.clone()),
+        _ => None,
+    };
+    FileOutcome {
+        input,
+        output,
+        ok: false,
+        message: error.to_string(),
+        deletion: None,
+    }
+}
+
+#[tauri::command]
+pub async fn retry_deletion(
+    app: tauri::AppHandle,
+    retry_id: String,
+) -> Result<DeletionInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        if state.running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return Err("Finish the current job before retrying deletion.".into());
+        }
+        struct Running<'a>(&'a AppState);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) { self.0.running.store(false, Ordering::Release); }
+        }
+        let _running = Running(&state);
+        state.cancelled.store(false, Ordering::Release);
+        let ticket = lock(&state.deletions).remove(&retry_id)
+            .ok_or("This deletion receipt is no longer available. Retry receipts last for this app session.")?;
+        let callback = |_| -> io::Result<()> {
+            if state.cancelled.load(Ordering::Acquire) {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"))
+            } else { Ok(()) }
+        };
+        Ok(register_removal(&state, deletion::retry(ticket, Some(&callback))))
+    }).await.map_err(|error| error.to_string())?
+}
+
 pub fn restore_saved_key(app: &tauri::AppHandle, state: &AppState) {
     let Some(settings) = read_settings(app) else {
         return;
@@ -267,6 +344,10 @@ pub async fn pick_input_files(app: tauri::AppHandle) -> Result<Vec<String>, Stri
                 .display()
                 .to_string(),
         );
+    }
+    for path in &paths {
+        file_guard::regular(&fs::symlink_metadata(path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("{path}: {error}"))?;
     }
     Ok(paths)
 }
@@ -630,6 +711,7 @@ pub fn unload_key(state: tauri::State<'_, AppState>) -> AppStatus {
 
 pub fn clear_key_on_close(state: &AppState) {
     state.cancelled.store(true, Ordering::Release);
+    lock(&state.deletions).clear();
     // Dropping Zeroizing overwrites the stored key bytes before releasing them.
     *lock(&state.key) = None;
 }
@@ -728,6 +810,8 @@ pub async fn rotate_key(
             if !seen.insert(comparison_path(input)) {
                 return Err("The same input was selected more than once.".into());
             }
+            file_guard::regular(&fs::symlink_metadata(input).map_err(|error| error.to_string())?)
+                .map_err(|error| format!("{}: {error}", input.display()))?;
             let meta = fs::metadata(input).map_err(|err| err.to_string())?;
             if !meta.is_file() { return Err(format!("Not a file: {}", input.display())); }
             if input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
@@ -770,20 +854,14 @@ pub async fn rotate_key(
                 Ok(())
             };
             let rotated = if input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
-                archive::rotate_zip_with_progress(&old_key, &new_key, &input, &options, Some(&progress))
+                archive::rotate_zip_with_deletion(&old_key, &new_key, &input, &options, Some(&progress))
             } else {
-                crypto::rotate_file_with_progress(&old_key, &new_key, &input, &options, Some(&progress))
+                crypto::rotate_file_with_deletion(&old_key, &new_key, &input, &options, Some(&progress))
             };
             let _=app.emit("job-progress",JobProgress{processed_bytes:processed.load(Ordering::Relaxed),total_bytes:total,current_file:path.clone(),file_index:index+1,file_count:seen.len(),stage:"Rotating key".into()});
             results.push(match rotated {
-                Ok(output) => FileOutcome { input: path, output: Some(output.display().to_string()),
-                    ok: true, message: if remove_original && input.exists() {
-                        "Rotated to new key; older ZIP retained because its complete file list is unauthenticated".into()
-                    } else { "Rotated to new key".into() } },
-                Err(CryptoError::OriginalRemains { output, source }) => FileOutcome {
-                    input: path, output: Some(output), ok: false,
-                    message: format!("Rotated, but old encrypted file remains: {source}") },
-                Err(err) => FileOutcome { input: path, output: None, ok: false, message: err.to_string() },
+                Ok(result) => transformed_outcome(&state, path, result, "Rotated to new key"),
+                Err(error) => failed_outcome(path, error),
             });
         }
         let success = results.len() == seen.len() && results.iter().all(|item| item.ok);
@@ -868,17 +946,20 @@ fn plan_job(state: &AppState, request: &JobRequest) -> Result<JobPreview, String
     let mut total_bytes = 0u64;
     let mut warnings = Vec::new();
     if request.remove_original && request.operation != "verify" {
-        warnings.push("Originals will be removed after each successful output. This is ordinary deletion, not secure erasure.".into());
+        warnings.push(if cfg!(windows) {
+            "Originals are removed after saved outputs are flushed and protected. Locked originals may be retained or pending; check the results. This is ordinary deletion, not secure erasure."
+        } else {
+            "Originals will be retained on this platform because mandatory file protection is unavailable."
+        }.into());
     }
     if request.remove_original && request.operation == "verify" {
         warnings.push("Verify does not delete originals.".into());
     }
     for path in &request.paths {
         let input = PathBuf::from(path);
-        let meta = fs::metadata(&input).map_err(|err| format!("{}: {err}", input.display()))?;
-        if !meta.is_file() {
-            return Err(format!("{} is not a file.", input.display()));
-        }
+        let meta =
+            fs::symlink_metadata(&input).map_err(|err| format!("{}: {err}", input.display()))?;
+        file_guard::regular(&meta).map_err(|err| format!("{}: {err}", input.display()))?;
         let duplicate = !seen_inputs.insert(comparison_path(&input));
         let is_zip = input
             .extension()
@@ -1022,9 +1103,9 @@ fn zip_outcomes(
     input: &Path,
     options: &JobOptions,
     verify: bool,
-    cancelled: &AtomicBool,
     progress: &crypto::ProgressCallback<'_>,
     on_entry: &dyn Fn(usize, &archive_read::Entry),
+    state: &AppState,
 ) -> Vec<FileOutcome> {
     let setup = (|| -> Result<_, CryptoError> {
         let source = Source::open(input, options.remove_original && !verify)?;
@@ -1037,6 +1118,7 @@ fn zip_outcomes(
         Ok(value) => value,
         Err(err) => {
             return vec![FileOutcome {
+                deletion: None,
                 input: input.display().to_string(),
                 output: None,
                 ok: false,
@@ -1046,8 +1128,9 @@ fn zip_outcomes(
     };
     let mut outcomes = Vec::with_capacity(entries.len());
     let mut all_ok = true;
+    let mut protected = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
-        let result = if cancelled.load(Ordering::Acquire) {
+        let result = if state.cancelled.load(Ordering::Acquire) {
             Err(CryptoError::Io(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "Not processed: job cancelled",
@@ -1076,11 +1159,12 @@ fn zip_outcomes(
         };
         let ok = result.is_ok();
         all_ok &= ok;
-        let output = result
-            .as_ref()
-            .ok()
-            .and_then(|value| value.as_ref().map(|p| p.display().to_string()));
-        let message = match result {
+        let output = match &result {
+            Ok(Some(published)) => Some(published.path.display().to_string()),
+            Err(CryptoError::PublicationUncertain { output, .. }) => Some(output.clone()),
+            _ => None,
+        };
+        let message = match &result {
             Ok(_) if !authenticated => format!(
                 "{}; older ZIP retained because its complete file list is unauthenticated",
                 if verify {
@@ -1098,26 +1182,34 @@ fn zip_outcomes(
             }
             Err(err) => err.to_string(),
         };
+        if let Ok(Some(published)) = result {
+            protected.push(published);
+        }
         outcomes.push(FileOutcome {
+            deletion: None,
             input: format!("{} / {}", input.display(), entry.name),
             output,
             ok,
             message,
         });
     }
-    if all_ok
-        && !cancelled.load(Ordering::Acquire)
-        && !verify
-        && options.remove_original
-        && authenticated
-    {
-        if let Err(err) = source.remove() {
-            outcomes.push(FileOutcome {
-                input: input.display().to_string(),
-                output: None,
-                ok: false,
-                message: format!("Decrypted entries, but ZIP remains: {err}"),
-            });
+    drop(file);
+    if !verify && options.remove_original {
+        let removal = if !all_ok {
+            Removal::retained(
+                input,
+                "ZIP retained because not every entry was restored successfully.",
+            )
+        } else if !authenticated {
+            Removal::retained(
+                input,
+                "Older ZIP retained because its complete file list is unauthenticated.",
+            )
+        } else {
+            deletion::remove(source, &protected, Some(progress))
+        };
+        if let Some(first) = outcomes.first_mut() {
+            first.deletion = Some(register_removal(state, removal));
         }
     }
     outcomes
@@ -1195,16 +1287,16 @@ fn execute_job(
             Some(&on_entry),
         );
         let result = result.map_err(|err| err.to_string())?;
-        for (input, error) in request.paths.into_iter().zip(result.delete_errors) {
-            outcomes.push(FileOutcome {
+        for (input, removal) in request.paths.into_iter().zip(result.removals) {
+            outcomes.push(transformed_outcome(
+                state,
                 input,
-                output: Some(result.path.display().to_string()),
-                ok: error.is_none(),
-                message: error.map_or_else(
-                    || "Encrypted into ZIP".into(),
-                    |err| format!("ZIP written, but original remains: {err}"),
-                ),
-            });
+                crypto::TransformOutcome {
+                    path: result.path.clone(),
+                    removal,
+                },
+                "Encrypted into ZIP",
+            ));
         }
         report(true);
         return Ok(outcomes);
@@ -1242,9 +1334,9 @@ fn execute_job(
                 &input,
                 &options,
                 request.operation == "verify",
-                &state.cancelled,
                 &progress,
                 &on_entry,
+                state,
             ));
             preview_index += expected;
         } else {
@@ -1269,29 +1361,24 @@ fn execute_job(
                 _ => crypto::verify_file(&key, &input, Some(&progress)).map(|()| None),
             };
             outcomes.push(match result {
-                Ok(output) => FileOutcome {
-                    input: path,
-                    output: output.map(|value| value.display().to_string()),
-                    ok: true,
-                    message: match request.operation.as_str() {
-                        "encrypt" => "Encrypted",
-                        "decrypt" => "Decrypted",
-                        _ => "Verified",
-                    }
-                    .into(),
-                },
-                Err(CryptoError::OriginalRemains { output, source }) => FileOutcome {
-                    input: path,
-                    output: Some(output),
-                    ok: false,
-                    message: format!("The output was written, but the original remains: {source}"),
-                },
-                Err(err) => FileOutcome {
+                Ok(Some(result)) => transformed_outcome(
+                    state,
+                    path,
+                    result,
+                    if request.operation == "encrypt" {
+                        "Encrypted"
+                    } else {
+                        "Decrypted"
+                    },
+                ),
+                Ok(None) => FileOutcome {
                     input: path,
                     output: None,
-                    ok: false,
-                    message: err.to_string(),
+                    ok: true,
+                    message: "Verified".into(),
+                    deletion: None,
                 },
+                Err(error) => failed_outcome(path, error),
             });
             preview_index += 1;
         }
@@ -1299,6 +1386,7 @@ fn execute_job(
     if state.cancelled.load(Ordering::Acquire) {
         for item in preview.items.iter().skip(preview_index) {
             outcomes.push(FileOutcome {
+                deletion: None,
                 input: item.input.clone(),
                 output: None,
                 ok: false,
@@ -1773,8 +1861,8 @@ mod tests {
     #[test]
     fn a_late_zip_setup_error_is_an_outcome_and_preserves_completed_results() {
         let key = [1; 32];
-        let cancelled = AtomicBool::new(false);
         let mut results = vec![FileOutcome {
+            deletion: None,
             input: "first.fenc".into(),
             output: Some("first.txt".into()),
             ok: true,
@@ -1792,9 +1880,9 @@ mod tests {
             &missing,
             &options,
             false,
-            &cancelled,
             &|_| Ok(()),
             &|_, _| {},
+            &AppState::default(),
         ));
         assert_eq!(results.len(), 2);
         assert!(results[0].ok);
@@ -1810,7 +1898,6 @@ mod tests {
         fs::write(&a, b"first file").unwrap();
         fs::write(&b, vec![7; 150_000]).unwrap();
         let key = [4; 32];
-        let cancelled = AtomicBool::new(false);
         let encryption = JobOptions {
             overwrite: false,
             remove_original: false,
@@ -1839,9 +1926,9 @@ mod tests {
                 &archive,
                 &restore,
                 true,
-                &cancelled,
                 &|_| Ok(()),
                 &|_, _| {},
+                &AppState::default(),
             );
             assert_eq!(verified.len(), 2);
             assert!(verified.iter().all(|r| r.ok));
@@ -1857,9 +1944,9 @@ mod tests {
                 &damaged,
                 &restore,
                 false,
-                &cancelled,
                 &|_| Ok(()),
                 &|_, _| {},
+                &AppState::default(),
             );
             assert!(!failed[0].ok);
             assert!(failed[1].ok);
@@ -1871,12 +1958,12 @@ mod tests {
                 &archive,
                 &restore,
                 false,
-                &cancelled,
                 &|_| Ok(()),
                 &|_, _| {},
+                &AppState::default(),
             );
             assert!(restored.iter().all(|r| r.ok));
-            assert!(!archive.exists());
+            assert_eq!(archive.exists(), !cfg!(windows));
             assert_eq!(
                 fs::read(root.join("restored/a.txt")).unwrap(),
                 b"first file"
@@ -1893,5 +1980,60 @@ mod tests {
             fs::remove_dir_all(root.join("restored")).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn all_restored_zip_outputs_stay_protected_until_source_deletion() {
+        let dir = crate::test_support::TestDir::new();
+        let first = dir.0.join("first.txt");
+        let second = dir.0.join("second.txt");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: false,
+            key_file: None,
+            output_dir: Some(dir.0.join("encrypted")),
+        };
+        let key = [4; 32];
+        let archive = archive::encrypt_to_zip(&key, &[first, second], &options)
+            .unwrap()
+            .path;
+        let restore = JobOptions {
+            remove_original: true,
+            output_dir: Some(dir.0.join("restored")),
+            ..options
+        };
+        let first_output = dir.0.join("restored/first.txt");
+        let attacked = AtomicBool::new(false);
+        let on_entry = |index, _: &archive_read::Entry| {
+            if index == 1 {
+                assert!(first_output.exists());
+                assert!(fs::write(&first_output, b"changed").is_err());
+                assert!(fs::remove_file(&first_output).is_err());
+                attacked.store(true, Ordering::Relaxed);
+            }
+        };
+        let results = zip_outcomes(
+            &key,
+            &archive,
+            &restore,
+            false,
+            &|_| Ok(()),
+            &on_entry,
+            &AppState::default(),
+        );
+        assert!(attacked.load(Ordering::Relaxed));
+        assert!(results.iter().all(|r| r.ok));
+        assert_eq!(
+            results[0].deletion.as_ref().unwrap().state,
+            DeletionState::Removed
+        );
+        assert!(!archive.exists());
+        assert_eq!(fs::read(first_output).unwrap(), b"first");
+        assert_eq!(
+            fs::read(dir.0.join("restored/second.txt")).unwrap(),
+            b"second"
+        );
     }
 }
