@@ -1,8 +1,14 @@
 //! Reads the stored, randomly named entries produced by this application's ZIP writer.
 //! Refuses compressed entries and paths; no archive-controlled path is ever extracted.
 
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use crate::archive;
+use std::collections::HashSet;
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
+#[cfg(test)]
+use std::io::Write;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::crypto::{self, CryptoError, ProgressCallback};
@@ -12,7 +18,7 @@ pub struct Entry {
     pub name: String,
     pub size: u64,
     pub data_offset: u64,
-    crc: u32,
+    pub(crate) crc: u32,
 }
 
 fn invalid(message: &str) -> CryptoError {
@@ -58,6 +64,10 @@ pub fn entries_from_reader<R: Read + Seek>(mut file: &mut R) -> Result<Vec<Entry
     if u16le(&tail, eocd + 4) != 0 || u16le(&tail, eocd + 6) != 0 {
         return Err(invalid("multi-disk archives are unsupported"));
     }
+    if u16le(&tail, eocd + 8) != u16le(&tail, eocd + 10) {
+        return Err(invalid("entry counts disagree"));
+    }
+    let mut directory_end = eocd_offset;
     let mut count = u16le(&tail, eocd + 10) as u64;
     let mut central_size = u32le(&tail, eocd + 12) as u64;
     let mut central_offset = u32le(&tail, eocd + 16) as u64;
@@ -74,9 +84,21 @@ pub fn entries_from_reader<R: Read + Seek>(mut file: &mut R) -> Result<Vec<Entry
             return Err(invalid("missing ZIP64 locator"));
         }
         let zip64_offset = u64le(&locator, 8);
+        if u32le(&locator, 4) != 0
+            || u32le(&locator, 16) != 1
+            || zip64_offset.checked_add(56) != Some(eocd_offset - 20)
+        {
+            return Err(invalid("invalid ZIP64 layout"));
+        }
+        directory_end = zip64_offset;
         let mut record = [0; 56];
         read_at(&mut file, zip64_offset, &mut record)?;
-        if u32le(&record, 0) != 0x0606_4b50 {
+        if u32le(&record, 0) != 0x0606_4b50
+            || u64le(&record, 4) != 44
+            || u32le(&record, 16) != 0
+            || u32le(&record, 20) != 0
+            || u64le(&record, 24) != u64le(&record, 32)
+        {
             return Err(invalid("bad ZIP64 directory"));
         }
         count = u64le(&record, 32);
@@ -89,10 +111,12 @@ pub fn entries_from_reader<R: Read + Seek>(mut file: &mut R) -> Result<Vec<Entry
     let central_end = central_offset
         .checked_add(central_size)
         .ok_or_else(|| invalid("directory overflow"))?;
-    if central_end > file_len {
+    if central_end != directory_end {
         return Err(invalid("directory exceeds archive"));
     }
     let mut cursor = central_offset;
+    let mut data_cursor = 0u64;
+    let mut seen_names = HashSet::new();
     let mut result = Vec::with_capacity(count as usize);
     for _ in 0..count {
         if cursor.checked_add(46).is_none_or(|end| end > central_end) {
@@ -124,6 +148,9 @@ pub fn entries_from_reader<R: Read + Seek>(mut file: &mut R) -> Result<Vec<Entry
             .map_err(|_| invalid("entry name is not text"))?;
         if !name.ends_with(".fenc") || !name[..32].bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(invalid("entry is not a FileEncrypt file"));
+        }
+        if !seen_names.insert(name.to_lowercase()) {
+            return Err(invalid("duplicate entry"));
         }
         let mut size = u32le(&header, 24) as u64;
         let compressed = u32le(&header, 20) as u64;
@@ -176,9 +203,12 @@ pub fn entries_from_reader<R: Read + Seek>(mut file: &mut R) -> Result<Vec<Entry
         } else if compressed != size {
             return Err(invalid("compressed entry"));
         }
+        if local_offset != data_cursor {
+            return Err(invalid("unlisted or overlapping entry data"));
+        }
         let mut local = [0; 30];
         read_at(&mut file, local_offset, &mut local)?;
-        if u32le(&local, 0) != 0x0403_4b50 || u16le(&local, 8) != 0 {
+        if u32le(&local, 0) != 0x0403_4b50 || u16le(&local, 8) != 0 || u16le(&local, 6) != flags {
             return Err(invalid("bad local entry"));
         }
         let local_name_len = u16le(&local, 26) as usize;
@@ -200,6 +230,38 @@ pub fn entries_from_reader<R: Read + Seek>(mut file: &mut R) -> Result<Vec<Entry
         if local_name != variable[..name_len] {
             return Err(invalid("entry names disagree"));
         }
+        data_cursor = data_offset
+            .checked_add(size)
+            .ok_or_else(|| invalid("entry overflow"))?;
+        if flags & 8 != 0 {
+            let large = u32le(&local, 18) == u32::MAX || u32le(&local, 22) == u32::MAX;
+            let descriptor_len = if large { 24 } else { 16 };
+            if data_cursor
+                .checked_add(descriptor_len as u64)
+                .is_none_or(|end| end > central_offset)
+            {
+                return Err(invalid("missing data descriptor"));
+            }
+            let mut descriptor = vec![0; descriptor_len];
+            read_at(&mut file, data_cursor, &mut descriptor)?;
+            if u32le(&descriptor, 0) != 0x0807_4b50 || u32le(&descriptor, 4) != u32le(&header, 16) {
+                return Err(invalid("bad data descriptor"));
+            }
+            let (a, b) = if large {
+                (u64le(&descriptor, 8), u64le(&descriptor, 16))
+            } else {
+                (u32le(&descriptor, 8) as u64, u32le(&descriptor, 12) as u64)
+            };
+            if a != size || b != size {
+                return Err(invalid("descriptor sizes disagree"));
+            }
+            data_cursor += descriptor_len as u64;
+        } else if u32le(&local, 14) != u32le(&header, 16)
+            || u32le(&local, 18) as u64 != size
+            || u32le(&local, 22) as u64 != size
+        {
+            return Err(invalid("local sizes or checksum disagree"));
+        }
         result.push(Entry {
             name: name.to_owned(),
             size,
@@ -208,7 +270,7 @@ pub fn entries_from_reader<R: Read + Seek>(mut file: &mut R) -> Result<Vec<Entry
         });
         cursor = next;
     }
-    if cursor != central_end {
+    if cursor != central_end || data_cursor != central_offset {
         return Err(invalid("unexpected directory data"));
     }
     Ok(result)
@@ -220,16 +282,98 @@ pub fn inspect_names(
     entries: &[Entry],
 ) -> Result<Vec<String>, CryptoError> {
     let mut file = File::open(path)?;
-    entries
-        .iter()
-        .map(|entry| {
-            file.seek(SeekFrom::Start(entry.data_offset))?;
-            let mut limited = (&mut file).take(entry.size);
-            crypto::named_file_name_from_reader(key, &mut limited)
+    Ok(inspect_names_from_reader(&mut file, key, entries)?.0)
+}
+pub(crate) fn inspect_names_from_reader<R: Read + Seek>(
+    file: &mut R,
+    key: &[u8; 32],
+    entries: &[Entry],
+) -> Result<(Vec<String>, bool), CryptoError> {
+    let length = file.seek(SeekFrom::End(0))?;
+    let mut tail = vec![0; length.min(65_557) as usize];
+    read_at(file, length - tail.len() as u64, &mut tail)?;
+    let at = (0..=tail.len().saturating_sub(22))
+        .rev()
+        .find(|&i| {
+            i + 22 <= tail.len()
+                && u32le(&tail, i) == 0x0605_4b50
+                && i + 22 + u16le(&tail, i + 20) as usize == tail.len()
         })
-        .collect()
+        .ok_or_else(|| invalid("missing directory"))?;
+    let manifest = archive::verify_manifest(key, &tail[at + 22..], entries)?;
+    let mut names = Vec::with_capacity(entries.len());
+    for entry in entries {
+        file.seek(SeekFrom::Start(entry.data_offset))?;
+        let (name, binding) =
+            crypto::inspect_named_reader(key, &mut (&mut *file).take(entry.size))?;
+        if binding != manifest {
+            return Err(invalid(
+                "bundle membership is missing or does not match this entry",
+            ));
+        }
+        names.push(name);
+    }
+    Ok((names, manifest.is_some()))
 }
 
+pub(crate) struct EntryReader<'a, R> {
+    source: &'a mut R,
+    remaining: u64,
+    expected_crc: u32,
+    hash: crc32fast::Hasher,
+    callback: Option<&'a ProgressCallback<'a>>,
+}
+impl<R: Read> Read for EntryReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if let Some(callback) = self.callback {
+            callback(0)?;
+        }
+        if self.remaining == 0 {
+            if self.hash.clone().finalize() != self.expected_crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ZIP entry checksum changed",
+                ));
+            }
+            return Ok(0);
+        }
+        let max = buffer
+            .len()
+            .min(self.remaining.min(usize::MAX as u64) as usize);
+        let n = self.source.read(&mut buffer[..max])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "ZIP entry truncated",
+            ));
+        }
+        self.remaining -= n as u64;
+        self.hash.update(&buffer[..n]);
+        if let Some(callback) = self.callback {
+            callback(n as u64)?;
+        }
+        Ok(n)
+    }
+}
+pub(crate) fn entry_reader<'a, R: Read + Seek>(
+    source: &'a mut R,
+    entry: &Entry,
+    callback: Option<&'a ProgressCallback<'a>>,
+) -> Result<EntryReader<'a, R>, CryptoError> {
+    source.seek(SeekFrom::Start(entry.data_offset))?;
+    Ok(EntryReader {
+        source,
+        remaining: entry.size,
+        expected_crc: entry.crc,
+        hash: crc32fast::Hasher::new(),
+        callback,
+    })
+}
+
+#[cfg(test)]
 pub fn extract_entry(
     archive: &Path,
     entry: &Entry,

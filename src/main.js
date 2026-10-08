@@ -1,5 +1,6 @@
 const state = {
   files: [],
+  fileSet: new Set(),
   folderRoots: new Map(),
   busy: false,
   keyLoaded: false,
@@ -82,7 +83,8 @@ function addSelectedFiles(selected) {
       state.folderRoots.set(path, roots[path]);
       changed = true;
     }
-    if (!state.files.includes(path)) {
+    if (!state.fileSet.has(path)) {
+      state.fileSet.add(path);
       state.files.push(path);
       changed = true;
     }
@@ -118,7 +120,46 @@ function applyStatus(status, updatePath) {
   renderControls();
 }
 
+let fileRemoveButtons = [];
+const pagedLists = new Map();
+const PAGE_SIZE = 100;
+function renderPaged(listId, pagerId, items, renderRow) {
+  let view = pagedLists.get(listId);
+  if (!view) {
+    const previous = document.createElement("button");
+    const next = document.createElement("button");
+    const label = document.createElement("span");
+    previous.type = next.type = "button";
+    previous.textContent = "Previous";
+    next.textContent = "Next";
+    view = { page: 0, previous, next, label, items: [], renderRow: null };
+    view.draw = () => {
+      const count = Math.max(1, Math.ceil(view.items.length / PAGE_SIZE));
+      view.page = Math.max(0, Math.min(view.page, count - 1));
+      const start = view.page * PAGE_SIZE;
+      if (listId === "file-list") fileRemoveButtons = [];
+      const fragment = document.createDocumentFragment();
+      for (let index = start; index < Math.min(start + PAGE_SIZE, view.items.length); index++) {
+        fragment.append(view.renderRow(view.items[index], index));
+      }
+      $(listId).replaceChildren(fragment);
+      $(pagerId).hidden = count <= 1;
+      previous.disabled = view.page === 0;
+      next.disabled = view.page >= count - 1;
+      label.textContent = `Page ${view.page + 1} of ${count} | ${view.items.length} items`;
+    };
+    previous.addEventListener("click", () => { view.page--; view.draw(); });
+    next.addEventListener("click", () => { view.page++; view.draw(); });
+    $(pagerId).append(previous, label, next);
+    pagedLists.set(listId, view);
+  }
+  view.items = items;
+  view.renderRow = renderRow;
+  view.draw();
+}
+
 function renderControls() {
+  for (const button of fileRemoveButtons) button.disabled = state.busy;
   const noFiles = state.files.length === 0;
   const blocked = state.busy || !state.keyLoaded || noFiles;
   $("generate").classList.toggle("primary", !state.keyLoaded);
@@ -190,12 +231,10 @@ function renderOutputHint() {
 }
 
 function renderFiles() {
-  const list = $("file-list");
   const empty = $("file-empty");
-  list.replaceChildren();
   empty.hidden = state.files.length > 0;
   $("selection-area").classList.toggle("has-files", state.files.length > 0);
-  for (const [index, path] of state.files.entries()) {
+  renderPaged("file-list", "file-pages", state.files, (path) => {
     const item = document.createElement("li");
     item.className = "file-row";
 
@@ -216,8 +255,13 @@ function renderFiles() {
     remove.textContent = "Remove";
     remove.disabled = state.busy;
     remove.setAttribute("aria-label", `Remove ${baseName(path)}`);
+    fileRemoveButtons.push(remove);
     remove.addEventListener("click", () => {
+      if (state.busy) return;
+      const index = state.files.indexOf(path);
+      if (index < 0) return;
       state.files.splice(index, 1);
+      state.fileSet.delete(path);
       state.folderRoots.delete(path);
       invalidatePreview();
       renderFiles();
@@ -225,18 +269,16 @@ function renderFiles() {
     });
 
     item.append(text, remove);
-    list.append(item);
-  }
+    return item;
+  });
   renderControls();
 }
 
 function renderResults(results) {
-  const list = $("results");
-  list.replaceChildren();
   $("results-panel").hidden = results.length === 0;
   const succeeded = results.filter((result) => result.ok).length;
   $("result-summary").textContent = `${succeeded} succeeded, ${results.length - succeeded} failed`;
-  for (const result of results) {
+  renderPaged("results", "result-pages", results, (result) => {
     const item = document.createElement("li");
     item.className = result.ok ? "result ok" : "result fail";
     const text = document.createElement("div");
@@ -254,15 +296,14 @@ function renderResults(results) {
       : result.message;
     text.append(title, message);
     item.append(text);
-    list.append(item);
-  }
+    return item;
+  });
 }
 
 async function run(work, updatePathOnSuccess) {
   if (state.busy) return;
   state.busy = true;
   renderControls();
-  renderFiles();
   clearAlert();
   try {
     const value = await work();
@@ -280,7 +321,7 @@ async function run(work, updatePathOnSuccess) {
     return null;
   } finally {
     state.busy = false;
-    renderFiles();
+    renderControls();
   }
 }
 
@@ -476,6 +517,7 @@ async function init() {
 
   $("clear-files").addEventListener("click", () => {
     state.files = [];
+    state.fileSet.clear();
     state.folderRoots.clear();
     invalidatePreview();
     renderFiles();
@@ -540,15 +582,13 @@ async function prepareJob(operation) {
     await startJob();
     return;
   }
-  const list = $("preview-list");
-  list.replaceChildren();
-  for (const item of preview.items) {
+  renderPaged("preview-list", "preview-pages", preview.items, (item) => {
     const row = document.createElement("li");
     row.className = item.issue ? "preview-issue" : "";
     row.textContent = `${baseName(item.input)} → ${item.output}${item.issue ? ` · ${item.issue}` : ""}`;
     row.title = item.input;
-    list.append(row);
-  }
+    return row;
+  });
   const warnings = $("preview-warnings");
   warnings.replaceChildren();
   for (const warning of preview.warnings) {

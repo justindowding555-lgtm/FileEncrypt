@@ -16,6 +16,7 @@ use crate::archive;
 use crate::archive_read;
 use crate::crypto::{self, CryptoError, JobOptions};
 use crate::key_file;
+use crate::source::Source;
 
 pub struct AppState {
     key: Mutex<Option<Zeroizing<[u8; 32]>>>,
@@ -218,7 +219,9 @@ fn restore_saved_settings(state: &AppState, settings: Settings) {
 }
 
 fn restore_saved_key_from_path(state: &AppState, path: &Path) {
-    state.startup_key_unavailable.store(false, Ordering::Release);
+    state
+        .startup_key_unavailable
+        .store(false, Ordering::Release);
     *lock(&state.key_path) = Some(path.to_path_buf());
     *lock(&state.key) = None;
     match key_file::read_key_file(path) {
@@ -470,7 +473,9 @@ fn activate_session_key(
     write_settings_file(settings_path, &settings)?;
     *lock(&state.key) = Some(key);
     *lock(&state.key_path) = None;
-    state.startup_key_unavailable.store(false, Ordering::Release);
+    state
+        .startup_key_unavailable
+        .store(false, Ordering::Release);
     set_message(
         state,
         "Key loaded for this session only. It will be cleared when you close the app.",
@@ -528,8 +533,9 @@ pub async fn backup_key(
         .clone()
         .ok_or("Load a saved key first.")?;
     let current = lock(&state.key).clone().ok_or("Load a key first.")?;
+    let bytes = key_file::read_key_snapshot(&source).map_err(|err| err.to_string())?;
     let source_key =
-        key_file::read_key_file_with_passphrase(&source, passphrase.as_deref().map(String::as_str))
+        key_file::parse_key_snapshot(&source, &bytes, passphrase.as_deref().map(String::as_str))
             .map_err(|err| err.to_string());
     if source_key?.as_slice() != current.as_slice() {
         return Err(
@@ -545,30 +551,47 @@ pub async fn backup_key(
     if destination.exists() {
         return Err("Choose a new path for the backup so an existing key is not replaced.".into());
     }
-    if fs::metadata(&source).map_err(|err| err.to_string())?.len() > 4096 {
-        return Err("The selected key file is too large.".into());
-    }
-    let bytes = Zeroizing::new(fs::read(&source).map_err(|err| err.to_string())?);
-    crypto::write_transformed(&destination, false, |writer| {
-        writer
-            .write_all(bytes.as_slice())
-            .map_err(CryptoError::from)
-    })
-    .map_err(|err| err.to_string())?;
-    let copied = Zeroizing::new(fs::read(&destination).map_err(|err| err.to_string())?);
-    if copied != bytes {
-        return Err("Backup verification failed.".into());
-    }
-    // The copy is byte-for-byte identical. A separate restore check tests its passphrase.
+    write_checked_backup(
+        &destination,
+        &bytes,
+        &current,
+        passphrase.as_deref().map(String::as_str),
+    )?;
+    // The published copy has been reopened, parsed, and checked against the loaded key.
     set_message(
         &state,
         format!(
-            "Key backup written and checked at {}. Use Check backup to test opening it.",
+            "Key backup written, reopened, and checked at {}.",
             destination.display()
         ),
     );
     drop(current);
     Ok(status(&state))
+}
+
+fn write_checked_backup(
+    destination: &Path,
+    bytes: &[u8],
+    current: &[u8; 32],
+    passphrase: Option<&str>,
+) -> Result<(), String> {
+    let snapshot_key = key_file::parse_key_snapshot(destination, bytes, passphrase)
+        .map_err(|err| err.to_string())?;
+    if snapshot_key.as_slice() != current {
+        return Err("Backup snapshot contains a different key.".into());
+    }
+    crypto::write_transformed(destination, false, |writer| {
+        writer.write_all(bytes)?;
+        Ok(())
+    })
+    .map_err(|err| err.to_string())?;
+    let copied = key_file::read_key_snapshot(destination).map_err(|err| err.to_string())?;
+    let reopened = key_file::parse_key_snapshot(destination, &copied, passphrase)
+        .map_err(|err| err.to_string())?;
+    if copied.as_slice() != bytes || reopened.as_slice() != current {
+        return Err("Backup verification failed.".into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -710,7 +733,7 @@ pub async fn rotate_key(
             if input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
                 let entries = archive_read::entries(input).map_err(|err| err.to_string())?;
                 archive_read::inspect_names(input, &old_key, &entries).map_err(|err| err.to_string())?;
-                total = total.saturating_add(meta.len().saturating_mul(2));
+                total = entries.iter().fold(total,|sum,entry|sum.saturating_add(entry.size));
             } else {
                 crypto::inspect_output_name(&old_key, input).map_err(|err| err.to_string())?;
                 total = total.saturating_add(meta.len());
@@ -725,19 +748,25 @@ pub async fn rotate_key(
             overwrite: false, remove_original, key_file: old_path, output_dir: dir,
         };
         let processed = AtomicU64::new(0);
+        let last_emit=Mutex::new(Instant::now()-Duration::from_secs(1));
         let mut results = Vec::with_capacity(paths.len());
         for (index, path) in paths.into_iter().enumerate() {
             if state.cancelled.load(Ordering::Acquire) { break; }
             let input = PathBuf::from(&path);
+            *lock(&last_emit)=Instant::now()-Duration::from_secs(1);
             let progress = |bytes: u64| -> io::Result<()> {
                 if state.cancelled.load(Ordering::Acquire) {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"));
                 }
                 let done = processed.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
-                let _ = app.emit("job-progress", JobProgress {
-                    processed_bytes: done, total_bytes: total, current_file: path.clone(),
-                    file_index: index + 1, file_count: seen.len(), stage: "Rotating key".into(),
-                });
+                let mut last=lock(&last_emit);
+                if last.elapsed()>=Duration::from_millis(80) {
+                    let _ = app.emit("job-progress", JobProgress {
+                        processed_bytes: done, total_bytes: total, current_file: path.clone(),
+                        file_index: index + 1, file_count: seen.len(), stage: "Rotating key".into(),
+                    });
+                    *last=Instant::now();
+                }
                 Ok(())
             };
             let rotated = if input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
@@ -745,9 +774,12 @@ pub async fn rotate_key(
             } else {
                 crypto::rotate_file_with_progress(&old_key, &new_key, &input, &options, Some(&progress))
             };
+            let _=app.emit("job-progress",JobProgress{processed_bytes:processed.load(Ordering::Relaxed),total_bytes:total,current_file:path.clone(),file_index:index+1,file_count:seen.len(),stage:"Rotating key".into()});
             results.push(match rotated {
                 Ok(output) => FileOutcome { input: path, output: Some(output.display().to_string()),
-                    ok: true, message: "Rotated to new key".into() },
+                    ok: true, message: if remove_original && input.exists() {
+                        "Rotated to new key; older ZIP retained because its complete file list is unauthenticated".into()
+                    } else { "Rotated to new key".into() } },
                 Err(CryptoError::OriginalRemains { output, source }) => FileOutcome {
                     input: path, output: Some(output), ok: false,
                     message: format!("Rotated, but old encrypted file remains: {source}") },
@@ -853,8 +885,13 @@ fn plan_job(state: &AppState, request: &JobRequest) -> Result<JobPreview, String
             .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
         if is_zip && request.operation != "encrypt" {
             let entries = archive_read::entries(&input).map_err(|err| err.to_string())?;
-            let names = archive_read::inspect_names(&input, &key, &entries)
-                .map_err(|err| err.to_string())?;
+            let mut source = fs::File::open(&input).map_err(|err| err.to_string())?;
+            let (names, authenticated) =
+                archive_read::inspect_names_from_reader(&mut source, &key, &entries)
+                    .map_err(|err| err.to_string())?;
+            if !authenticated {
+                warnings.push(format!("{}: older bundle; individual files authenticate, but bundle completeness cannot be checked. The source ZIP will be retained.",input.display()));
+            }
             for (entry, name) in entries.iter().zip(names) {
                 let output = if request.operation == "verify" {
                     None
@@ -874,7 +911,7 @@ fn plan_job(state: &AppState, request: &JobRequest) -> Result<JobPreview, String
                     &all_inputs,
                     &mut seen_outputs,
                 );
-                total_bytes = total_bytes.saturating_add(entry.size.saturating_mul(2));
+                total_bytes = total_bytes.saturating_add(entry.size);
                 items.push(PreviewItem {
                     input: format!("{} / {}", input.display(), entry.name),
                     output: output
@@ -980,11 +1017,110 @@ fn preview_issue(
     None
 }
 
-struct RemoveTemp(PathBuf);
-impl Drop for RemoveTemp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+fn zip_outcomes(
+    key: &[u8; 32],
+    input: &Path,
+    options: &JobOptions,
+    verify: bool,
+    cancelled: &AtomicBool,
+    progress: &crypto::ProgressCallback<'_>,
+    on_entry: &dyn Fn(usize, &archive_read::Entry),
+) -> Vec<FileOutcome> {
+    let setup = (|| -> Result<_, CryptoError> {
+        let source = Source::open(input, options.remove_original && !verify)?;
+        let mut file = source.file.try_clone()?;
+        let entries = archive_read::entries_from_reader(&mut file)?;
+        let authenticated = archive_read::inspect_names_from_reader(&mut file, key, &entries)?.1;
+        Ok((source, file, entries, authenticated))
+    })();
+    let (source, mut file, entries, authenticated) = match setup {
+        Ok(value) => value,
+        Err(err) => {
+            return vec![FileOutcome {
+                input: input.display().to_string(),
+                output: None,
+                ok: false,
+                message: err.to_string(),
+            }]
+        }
+    };
+    let mut outcomes = Vec::with_capacity(entries.len());
+    let mut all_ok = true;
+    for (index, entry) in entries.iter().enumerate() {
+        let result = if cancelled.load(Ordering::Acquire) {
+            Err(CryptoError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Not processed: job cancelled",
+            )))
+        } else {
+            on_entry(index, entry);
+            let mut entry_options = options.clone();
+            entry_options.remove_original = false;
+            if entry_options.output_dir.is_none() {
+                entry_options.output_dir = input.parent().map(Path::to_path_buf);
+            }
+            archive_read::entry_reader(&mut file, entry, Some(progress)).and_then(|mut reader| {
+                if verify {
+                    crypto::verify_named_reader(key, &mut reader).map(|()| None)
+                } else {
+                    crypto::decrypt_named_reader(
+                        key,
+                        input,
+                        &mut reader,
+                        &entry_options,
+                        Some(progress),
+                    )
+                    .map(Some)
+                }
+            })
+        };
+        let ok = result.is_ok();
+        all_ok &= ok;
+        let output = result
+            .as_ref()
+            .ok()
+            .and_then(|value| value.as_ref().map(|p| p.display().to_string()));
+        let message = match result {
+            Ok(_) if !authenticated => format!(
+                "{}; older ZIP retained because its complete file list is unauthenticated",
+                if verify {
+                    "Verified entry"
+                } else {
+                    "Decrypted entry"
+                }
+            ),
+            Ok(_) => {
+                if verify {
+                    "Verified".into()
+                } else {
+                    "Decrypted from ZIP".into()
+                }
+            }
+            Err(err) => err.to_string(),
+        };
+        outcomes.push(FileOutcome {
+            input: format!("{} / {}", input.display(), entry.name),
+            output,
+            ok,
+            message,
+        });
     }
+    if all_ok
+        && !cancelled.load(Ordering::Acquire)
+        && !verify
+        && options.remove_original
+        && authenticated
+    {
+        if let Err(err) = source.remove() {
+            outcomes.push(FileOutcome {
+                input: input.display().to_string(),
+                output: None,
+                ok: false,
+                message: format!("Decrypted entries, but ZIP remains: {err}"),
+            });
+        }
+    }
+    outcomes
 }
 
 fn execute_job(
@@ -1006,9 +1142,9 @@ fn execute_job(
     let current = Mutex::new((0usize, String::new(), String::new()));
     let last_emit = Mutex::new(Instant::now() - Duration::from_secs(1));
     let report = |force: bool| {
-        let (index, file, stage) = lock(&current).clone();
         let mut last = lock(&last_emit);
         if force || last.elapsed() >= Duration::from_millis(80) {
+            let (index, file, stage) = lock(&current).clone();
             let _ = app.emit(
                 "job-progress",
                 JobProgress {
@@ -1082,85 +1218,35 @@ fn execute_job(
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
         if is_zip && request.operation != "encrypt" {
-            let entries = archive_read::entries(&input).map_err(|err| err.to_string())?;
-            let mut all_ok = true;
-            for entry in entries {
-                if state.cancelled.load(Ordering::Acquire) {
-                    all_ok = false;
-                    break;
-                }
+            let expected = preview
+                .items
+                .iter()
+                .skip(preview_index)
+                .take_while(|item| item.input.starts_with(&format!("{} / ", input.display())))
+                .count()
+                .max(1);
+            let on_entry = |index: usize, entry: &archive_read::Entry| {
                 *lock(&current) = (
-                    preview_index,
+                    preview_index + index,
                     format!("{} / {}", path, entry.name),
-                    "Reading ZIP entry".into(),
+                    if request.operation == "verify" {
+                        "Verifying".into()
+                    } else {
+                        "Decrypting".into()
+                    },
                 );
                 report(true);
-                let temp_dir = std::env::temp_dir().join(format!(
-                    "fileencrypt-{}",
-                    crypto::opaque_file_name().to_string_lossy()
-                ));
-                fs::create_dir(&temp_dir).map_err(|err| err.to_string())?;
-                let _cleanup = RemoveTemp(temp_dir.clone());
-                let temp = temp_dir.join(&entry.name);
-                let result = archive_read::extract_entry(&input, &entry, &temp, Some(&progress))
-                    .and_then(|()| {
-                        lock(&current).2 = if request.operation == "verify" {
-                            "Verifying".into()
-                        } else {
-                            "Decrypting".into()
-                        };
-                        report(true);
-                        if request.operation == "verify" {
-                            crypto::verify_file(&key, &temp, Some(&progress))?;
-                            Ok(None)
-                        } else {
-                            let mut entry_options = options.clone();
-                            entry_options.remove_original = false;
-                            if entry_options.output_dir.is_none() {
-                                entry_options.output_dir = input.parent().map(Path::to_path_buf);
-                            }
-                            crypto::decrypt_file_with_progress(
-                                &key,
-                                &temp,
-                                &entry_options,
-                                &progress,
-                            )
-                            .map(Some)
-                        }
-                    });
-                let ok = result.is_ok();
-                if !ok {
-                    all_ok = false;
-                }
-                outcomes.push(FileOutcome {
-                    input: format!("{} / {}", path, entry.name),
-                    output: result
-                        .as_ref()
-                        .ok()
-                        .and_then(|value| value.as_ref().map(|path| path.display().to_string())),
-                    ok,
-                    message: match result {
-                        Ok(_) if request.operation == "verify" => "Verified".into(),
-                        Ok(_) => "Decrypted from ZIP".into(),
-                        Err(err) => err.to_string(),
-                    },
-                });
-                preview_index += 1;
-                if state.cancelled.load(Ordering::Acquire) {
-                    all_ok = false;
-                    break;
-                }
-            }
-            if all_ok && request.remove_original && request.operation == "decrypt" {
-                if let Err(err) = fs::remove_file(&input) {
-                    outcomes.push(FileOutcome {
-                        input: path,
-                        output: None,
-                        ok: false,
-                        message: format!("Decrypted entries, but ZIP remains: {err}"),
-                    });
-                }
-            }
+            };
+            outcomes.extend(zip_outcomes(
+                &key,
+                &input,
+                &options,
+                request.operation == "verify",
+                &state.cancelled,
+                &progress,
+                &on_entry,
+            ));
+            preview_index += expected;
         } else {
             *lock(&current) = (
                 preview_index,
@@ -1293,7 +1379,9 @@ fn remember_key(
 ) -> String {
     *lock(&state.key) = Some(key);
     *lock(&state.key_path) = Some(path.clone());
-    state.startup_key_unavailable.store(false, Ordering::Release);
+    state
+        .startup_key_unavailable
+        .store(false, Ordering::Release);
     match write_settings(app, state) {
         Ok(()) => String::new(),
         Err(err) => format!(" The path could not be remembered for next launch: {err}"),
@@ -1500,7 +1588,10 @@ mod tests {
         *lock(&state.key_path) = Some(old_path.clone());
 
         assert!(activate_session_key(&state, Zeroizing::new([7; 32]), &blocked).is_err());
-        assert_eq!(status(&state).fingerprint, Some(key_file::fingerprint(&old_key)));
+        assert_eq!(
+            status(&state).fingerprint,
+            Some(key_file::fingerprint(&old_key))
+        );
         assert_eq!(*lock(&state.key_path), Some(old_path));
         assert!(blocked.is_dir());
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
@@ -1562,7 +1653,9 @@ mod tests {
         restore_saved_key_from_path(&state, &path);
         assert!(!status(&state).startup_key_unavailable);
         assert!(!status(&state).key_loaded);
-        assert!(status(&state).message.contains("Could not load the saved key"));
+        assert!(status(&state)
+            .message
+            .contains("Could not load the saved key"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1658,6 +1751,147 @@ mod tests {
             .roots
             .values()
             .all(|path| path == &root.display().to_string()));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn backup_writes_the_validated_snapshot_even_when_the_source_changes() {
+        let root = std::env::temp_dir().join(crypto::opaque_file_name());
+        fs::create_dir(&root).unwrap();
+        let input = root.join("source.key");
+        let backup = root.join("backup.key");
+        let old = [1; 32];
+        let new = [2; 32];
+        key_file::write_key_file(&input, &old).unwrap();
+        let snapshot = key_file::read_key_snapshot(&input).unwrap();
+        key_file::write_key_file(&input, &new).unwrap();
+        write_checked_backup(&backup, &snapshot, &old, None).unwrap();
+        assert_eq!(*key_file::read_key_file(&backup).unwrap(), old);
+        assert!(write_checked_backup(&root.join("wrong.key"), &snapshot, &new, None).is_err());
+        assert!(!root.join("wrong.key").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn a_late_zip_setup_error_is_an_outcome_and_preserves_completed_results() {
+        let key = [1; 32];
+        let cancelled = AtomicBool::new(false);
+        let mut results = vec![FileOutcome {
+            input: "first.fenc".into(),
+            output: Some("first.txt".into()),
+            ok: true,
+            message: "Decrypted".into(),
+        }];
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: false,
+            key_file: None,
+            output_dir: None,
+        };
+        let missing = std::env::temp_dir().join(crypto::opaque_file_name());
+        results.extend(zip_outcomes(
+            &key,
+            &missing,
+            &options,
+            false,
+            &cancelled,
+            &|_| Ok(()),
+            &|_, _| {},
+        ));
+        assert_eq!(results.len(), 2);
+        assert!(results[0].ok);
+        assert!(!results[1].ok);
+        assert!(results[1].output.is_none());
+    }
+    #[test]
+    fn zip_jobs_stream_verify_restore_delete_and_preserve_sources_on_failure() {
+        let root = std::env::temp_dir().join(crypto::opaque_file_name());
+        fs::create_dir(&root).unwrap();
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        fs::write(&a, b"first file").unwrap();
+        fs::write(&b, vec![7; 150_000]).unwrap();
+        let key = [4; 32];
+        let cancelled = AtomicBool::new(false);
+        let encryption = JobOptions {
+            overwrite: false,
+            remove_original: false,
+            key_file: None,
+            output_dir: Some(root.join("archives")),
+        };
+        for compress in [false, true] {
+            let archive = archive::encrypt_to_zip_with_progress(
+                &key,
+                &[a.clone(), b.clone()],
+                &encryption,
+                None,
+                compress,
+                None,
+                None,
+            )
+            .unwrap()
+            .path;
+            let restore = JobOptions {
+                remove_original: true,
+                output_dir: Some(root.join("restored")),
+                ..encryption.clone()
+            };
+            let verified = zip_outcomes(
+                &key,
+                &archive,
+                &restore,
+                true,
+                &cancelled,
+                &|_| Ok(()),
+                &|_, _| {},
+            );
+            assert_eq!(verified.len(), 2);
+            assert!(verified.iter().all(|r| r.ok));
+            assert!(archive.exists());
+            assert!(!root.join("restored").exists());
+            let damaged = root.join("damaged.zip");
+            let mut bytes = fs::read(&archive).unwrap();
+            let entries = archive_read::entries(&archive).unwrap();
+            bytes[(entries[0].data_offset + entries[0].size - 1) as usize] ^= 1;
+            fs::write(&damaged, bytes).unwrap();
+            let failed = zip_outcomes(
+                &key,
+                &damaged,
+                &restore,
+                false,
+                &cancelled,
+                &|_| Ok(()),
+                &|_, _| {},
+            );
+            assert!(!failed[0].ok);
+            assert!(failed[1].ok);
+            assert!(damaged.exists());
+            assert!(!root.join("restored/a.txt").exists());
+            fs::remove_file(root.join("restored/b.txt")).unwrap();
+            let restored = zip_outcomes(
+                &key,
+                &archive,
+                &restore,
+                false,
+                &cancelled,
+                &|_| Ok(()),
+                &|_, _| {},
+            );
+            assert!(restored.iter().all(|r| r.ok));
+            assert!(!archive.exists());
+            assert_eq!(
+                fs::read(root.join("restored/a.txt")).unwrap(),
+                b"first file"
+            );
+            assert_eq!(
+                fs::read(root.join("restored/b.txt")).unwrap(),
+                vec![7; 150_000]
+            );
+            assert!(!fs::read_dir(root.join("restored")).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".fe-")));
+            fs::remove_dir_all(root.join("restored")).unwrap();
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }

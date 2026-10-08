@@ -450,3 +450,8 @@ footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: s
 @media (prefers-reduced-motion: reduce) {
   button { transition: none; }
 }
+
+.list-pages { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px; padding: 10px; }
+.list-pages span { color: var(--muted); font-size: 0.78rem; }
+.list-pages button { min-height: 30px; padding: 5px 9px; font-size: 0.78rem; }
+.list-pages[hidden] { display: none; }

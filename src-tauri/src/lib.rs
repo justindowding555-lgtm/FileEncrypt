@@ -3,6 +3,7 @@ mod archive_read;
 mod commands;
 mod crypto;
 mod key_file;
+mod source;
 
 /// Parse an in-memory archive with the same checks used for files selected in the app.
 /// This entry point also lets the fuzz target exercise the parser without disk I/O.

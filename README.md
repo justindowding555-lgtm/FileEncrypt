@@ -11,7 +11,7 @@ npm install
 npm run tauri dev
 ```
 
-Windows needs the WebView2 runtime, which is already present on Windows 11.
+Windows needs the WebView2 runtime, which is already present on Windows 11, and the Visual Studio C++ build tools. The Tauri command initializes the installed MSVC compiler when clang-cl is unavailable. This setup is local to the command process.
 
 The app icon is drawn in `src/icon.svg` and used in the window header. Desktop PNG, ICO, and ICNS sizes in `src-tauri/icons/` are generated from that source with `npm run tauri -- icon src/icon.svg -o src-tauri/icons`.
 
@@ -19,19 +19,19 @@ The app icon is drawn in `src/icon.svg` and used in the window header. Desktop P
 
 - **Add files…** selects several files. **Add folder** includes files in its subfolders. You can also drop files or folders onto the window. Symbolic links are skipped when expanding folders.
 - **Encrypt** writes a random `.fenc` name. The original file name is encrypted inside the file, so it is not visible on disk. **Decrypt** restores that name.
-- **Bundle encrypted files into one ZIP** puts selected files into a randomly named `.zip`. Each entry is an encrypted `.fenc` file. New bundles restore the selected files' relative folder paths. **Compress files before encryption** reduces the size of compressible data inside the bundle. Add one of these ZIPs to decrypt or verify it directly. Older FileEncrypt ZIPs remain readable. Other ZIP layouts are not supported. With **Save to** empty, the ZIP is placed beside the first selected file.
+- **Bundle encrypted files into one ZIP** puts selected files into a randomly named `.zip`. Each entry is an encrypted `.fenc` file. New bundles restore the selected files' relative folder paths. **Compress files before encryption** reduces the size of compressible data inside the bundle. Add one of these ZIPs to decrypt or verify it directly. New ZIPs authenticate the complete file list as well as each encrypted entry. Older FileEncrypt ZIPs remain readable, but their completeness cannot be authenticated and their sources are retained after restoration or rotation. Other ZIP layouts are not supported. With **Save to** empty, the ZIP is placed beside the first selected file.
 - Without ZIP, leave **Save to** empty and each result stays in the same folder as its original. Choose a folder to put every result there. The choice is remembered for the next launch.
 - Older files, whose names were visible, still decrypt. A `.fenc` file from the first version restores the name with that suffix removed.
 - **Encrypt**, **Decrypt**, and **Verify** start after automatic checks for duplicates, output collisions, key-file conflicts, and existing outputs. Turn on **Review plan before starting** to see the planned output paths and start manually. If a check finds a conflict, the preview shows the problem and blocks the job. Progress shows bytes and the current file, and **Cancel job** stops at a chunk boundary. Already completed files remain.
-- **Verify** authenticates encrypted files without creating plaintext copies. For ZIPs, it checks each encrypted entry.
-- Originals stay on disk unless **Delete originals after success** is checked. Deletion happens only after the new file is written. This is ordinary filesystem deletion, **not secure erasure**. A ZIP source is removed only after all of its entries decrypt successfully.
+- **Verify** authenticates encrypted files without creating plaintext copies. For new ZIPs, it checks the authenticated file list and every encrypted entry. For older ZIPs, it checks individual entries and explains the completeness limitation.
+- Originals stay on disk unless **Delete originals after success** is checked. Deletion happens only after the new file is written. This is ordinary filesystem deletion, **not secure erasure**. A new ZIP source is removed only after its authenticated file list and every entry pass restoration. On Windows, source handles prevent edits and replacement throughout processing and publication; a source that cannot be deleted stays on disk with a reported error.
 - Decrypt uses the original filename, so turn on **Replace an existing output file** when that file is still there.
 
 ## Key file
 
 **Generate and save** creates a random key and writes it to the path in the box. If the path is empty, a save dialog asks where to put it. **Set path…** only chooses the location. **Browse and load…** opens an existing key file. **Load** reads the path you typed. To protect a newly saved key file, enter a passphrase under **Key options** first. Enter that passphrase again before opening or checking the protected key file. The passphrase field clears after use.
 
-**Back up key** writes a copy to a new location and checks it byte for byte. **Check backup** opens a chosen key file and confirms that it contains the currently loaded key. Enter the passphrase before either action if the key file is protected. Keep the backup and its passphrase in separate safe locations.
+**Back up key** captures the validated key-file bytes, writes those same bytes to a new location, then reopens the copy to check its contents and key against the loaded key. **Check backup** opens a chosen key file and confirms that it contains the currently loaded key. Enter the passphrase before either action if the key file is protected. Keep the backup and its passphrase in separate safe locations.
 
 **Rotate selected encrypted files to a new key** asks for a new, unused key-file path, writes a fresh master key there, and re-encrypts the selected `.fenc` files or FileEncrypt ZIPs. Plaintext is streamed in memory during rotation. The old encrypted inputs and old key file remain unless **Delete originals after success** is checked. If any file fails, the old key remains loaded; successful new outputs need the new key file named in the status message. Keep the old key for encrypted files you did not select. The passphrase field, if filled, protects the *new* key file.
 
@@ -56,9 +56,13 @@ Under **Key options → Use a specific key**, **Use in app only** loads a manual
 
 ## Tests
 
+Run frontend unit tests with `npm test`. Run Rust unit tests on Windows with the compiler environment helper:
+
+```powershell
+.\scripts\with-msvc.ps1 cargo test --manifest-path src-tauri/Cargo.toml --lib --locked
 ```
-cargo test --manifest-path src-tauri/Cargo.toml
-```
+
+On other platforms, use `cargo test --manifest-path src-tauri/Cargo.toml --lib --locked` with the platform's C compiler and Tauri prerequisites installed. Development checking uses `cargo check` or `cargo clippy` through the same Windows helper. The helper respects an explicitly configured `CC`.
 
 The ZIP directory parser also has a `cargo-fuzz` target under `fuzz/` and a short Linux CI fuzz run. The seed corpus is generated by `python fuzz/generate_corpus.py`. See [the recovery smoke test](docs/RECOVERY_SMOKE_TEST.md) before a release.
 
@@ -84,6 +88,6 @@ The generated public key is recorded in `src-tauri/tauri.release.conf.json`. If 
 
 ## File format
 
-New files use AEGIS-256 with a 256-bit authentication tag. That is the authenticated cipher recommended for machines with AES hardware: a 256-bit key, a 256-bit nonce, and a key-committing tag. The saved key is a master key. HKDF-SHA256 derives a wrap key from it, and that wrap key seals a fresh file key. The file body is split into 64 KiB chunks. The last chunk is marked final, so a truncated or edited file fails decryption instead of returning partial plaintext. Bundle entries use format v4 for relative paths or v5 for relative paths with zlib compression before encryption. The path and the original size of compressed entries are authenticated metadata.
+New files use AEGIS-256 with a 256-bit authentication tag. That is the authenticated cipher recommended for machines with AES hardware: a 256-bit key, a 256-bit nonce, and a key-committing tag. The saved key is a master key. HKDF-SHA256 derives a wrap key from it, and that wrap key seals a fresh file key. The file body is split into 64 KiB chunks. The last chunk is marked final, so a truncated or edited file fails decryption instead of returning partial plaintext. New bundle entries use format v6 for relative paths or v7 for relative paths with zlib compression before encryption. The encrypted metadata contains the path, bundle identity, expected entry count, and the original size of compressed entries. An HMAC-SHA256 manifest in the ZIP comment authenticates the bundle identity, entry count, and a SHA256 digest of the ordered ciphertext entry names, sizes, and CRCs. Removing the manifest or moving entries into a different bundle fails verification. Older v4/v5 bundles remain readable with per-entry authentication.
 
-This build uses the pure Rust AEGIS implementation, so it does not need a C compiler. Files created by the first version of this app used AES-256-GCM and still decrypt with the same key. New files hide their names, but approximate sizes remain visible. Legacy files may expose their names.
+This build uses the native AEGIS backend, which selects AES hardware at runtime and has a software fallback. It requires a C compiler when building the app. Cipher compatibility is unchanged for existing files. ZIP creation, verification, restoration, and rotation stream entries directly, without staging ciphertext copies. Lists show 100 rows per page so large selections, previews, and result sets keep bounded DOM work. Files created by the first version of this app used AES-256-GCM and still decrypt with the same key. New files hide their names, but approximate sizes remain visible. Legacy files may expose their names.

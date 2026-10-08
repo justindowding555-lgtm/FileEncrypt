@@ -1,30 +1,23 @@
-//! A ZIP container for already encrypted files. Stored entries avoid trying to
-//! compress ciphertext and keep each `.fenc` file independently decryptable.
-
-use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Write};
+//! Streaming ZIP bundles with authenticated membership.
+use crate::{
+    archive_read,
+    crypto::{self, BundleBinding, CryptoError, JobOptions},
+    source::Source,
+};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-
-use crate::archive_read;
-use crate::crypto::{self, CryptoError, JobOptions};
-
-struct RemoveDir(PathBuf);
-
-impl Drop for RemoveDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+use zeroize::Zeroizing;
 
 pub struct ArchiveOutcome {
     pub path: PathBuf,
     pub delete_errors: Vec<Option<String>>,
 }
-
 type EntryCallback<'a> = dyn Fn(usize, &Path) + 'a;
-
-/// Encrypt every input before publishing the ZIP. Originals are removed only
-/// after the finished archive has been committed to its destination.
 #[cfg(test)]
 pub fn encrypt_to_zip(
     key: &[u8; 32],
@@ -33,7 +26,6 @@ pub fn encrypt_to_zip(
 ) -> Result<ArchiveOutcome, CryptoError> {
     encrypt_to_zip_with_progress(key, inputs, options, None, false, None, None)
 }
-
 pub fn relative_names(
     inputs: &[PathBuf],
     root_hint: Option<&Path>,
@@ -82,6 +74,42 @@ pub fn relative_names(
         .collect()
 }
 
+fn destination(input: &Path, options: &JobOptions) -> Result<PathBuf, CryptoError> {
+    let dir = options.output_dir.clone().unwrap_or_else(|| {
+        input
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    });
+    fs::create_dir_all(&dir)?;
+    for _ in 0..8 {
+        let mut name = PathBuf::from(crypto::opaque_file_name());
+        name.set_extension("zip");
+        let path = dir.join(name);
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(CryptoError::EncryptFailed)
+}
+fn binding(count: usize) -> BundleBinding {
+    let text = crypto::opaque_file_name();
+    let text = text.to_string_lossy();
+    let mut id = [0; 16];
+    for (i, byte) in id.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap();
+    }
+    BundleBinding {
+        id,
+        count: count as u32,
+    }
+}
+fn check(callback: Option<&crypto::ProgressCallback<'_>>) -> Result<(), CryptoError> {
+    if let Some(callback) = callback {
+        callback(0)?;
+    }
+    Ok(())
+}
 pub fn encrypt_to_zip_with_progress(
     key: &[u8; 32],
     inputs: &[PathBuf],
@@ -94,95 +122,82 @@ pub fn encrypt_to_zip_with_progress(
     let first = inputs
         .first()
         .ok_or_else(|| CryptoError::NotAFile("add at least one file".into()))?;
-    let destination = match &options.output_dir {
-        Some(dir) => dir.clone(),
-        None => first
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
-    };
-    if destination.exists() && !destination.is_dir() {
-        return Err(CryptoError::NotAFile(format!(
-            "output folder is not a folder: {}",
-            destination.display()
-        )));
+    if inputs.len() > 10_000 {
+        return Err(CryptoError::NotAFile("select at most 10,000 files".into()));
     }
-    fs::create_dir_all(&destination)?;
-
-    let archive = (0..8)
-        .map(|_| {
-            let mut name = PathBuf::from(crypto::opaque_file_name());
-            name.set_extension("zip");
-            destination.join(name)
-        })
-        .find(|path| !path.exists())
-        .ok_or(CryptoError::EncryptFailed)?;
-
-    for (index, input) in inputs.iter().enumerate() {
+    let archive = destination(first, options)?;
+    let mut seen = HashSet::with_capacity(inputs.len());
+    for input in inputs {
+        check(progress)?;
         crypto::ensure_distinct(input, &archive, options.key_file.as_deref())?;
-        if inputs[..index].iter().any(|other| same_file(other, input)) {
-            return Err(CryptoError::NotAFile(format!(
-                "file selected more than once: {}",
-                input.display()
-            )));
+        let canonical = fs::canonicalize(input)?;
+        let canonical = if cfg!(windows) {
+            PathBuf::from(canonical.to_string_lossy().to_lowercase())
+        } else {
+            canonical
+        };
+        if !seen.insert(canonical) {
+            return Err(CryptoError::NotAFile("file selected more than once".into()));
         }
     }
-
-    let work_dir = archive.with_extension("zip.work");
-    fs::create_dir(&work_dir)?;
-    let _cleanup = RemoveDir(work_dir.clone());
-    let staging = JobOptions {
-        overwrite: false,
-        remove_original: false,
-        key_file: options.key_file.clone(),
-        output_dir: Some(work_dir),
-    };
-    let relative_names = relative_names(inputs, root_hint)?;
-    let encrypted: Vec<PathBuf> = inputs
+    let names = relative_names(inputs, root_hint)?;
+    let mut seen_names = HashSet::new();
+    if names
         .iter()
-        .enumerate()
-        .map(|(index, input)| {
+        .any(|name| !seen_names.insert(name.to_lowercase()))
+    {
+        return Err(CryptoError::BadEncryptedName);
+    }
+    // Keep deletion handles open through publication; on Windows no source can be
+    // modified or replaced in the interval between encrypting it and removing it.
+    let mut held = Vec::new();
+    let bundle = binding(inputs.len());
+    crypto::write_transformed(&archive, false, |writer| {
+        let mut zip = ZipWriter::new(writer);
+        for (index, input) in inputs.iter().enumerate() {
+            check(progress)?;
             if let Some(on_entry) = on_entry {
                 on_entry(index, input);
             }
-            crypto::encrypt_bundle_entry_with_progress(
-                key,
-                input,
-                &relative_names[index],
-                compress,
-                &staging,
-                progress,
-            )
-        })
-        .collect::<Result<_, _>>()?;
-    if let Some(on_entry) = on_entry {
-        on_entry(inputs.len(), &archive);
-    }
-    crypto::write_transformed(&archive, false, |writer| {
-        write_zip(writer, &encrypted, progress).map_err(Into::into)
-    })?;
-
-    let delete_errors = inputs
-        .iter()
-        .map(|input| {
+            let source = Source::open(input, options.remove_original)?;
+            let name = crypto::opaque_file_name().to_string_lossy().into_owned();
+            zip.entry(&name, |sink| {
+                crypto::encrypt_bundle_reader(
+                    key,
+                    &source,
+                    &names[index],
+                    compress,
+                    bundle,
+                    sink,
+                    progress,
+                )
+            })?;
             if options.remove_original {
-                fs::remove_file(input).err().map(|err| err.to_string())
-            } else {
-                None
+                held.push(source);
             }
-        })
-        .collect();
+        }
+        if let Some(on_entry) = on_entry {
+            on_entry(inputs.len(), &archive);
+        }
+        check(progress)?;
+        for source in &held {
+            source.check()?;
+        }
+        zip.finish(key, bundle)?;
+        check(progress)
+    })?;
+    let delete_errors = if options.remove_original {
+        held.iter()
+            .map(|source| source.remove().err().map(|err| err.to_string()))
+            .collect()
+    } else {
+        vec![None; inputs.len()]
+    };
+    drop(held);
     Ok(ArchiveOutcome {
         path: archive,
         delete_errors,
     })
-}
-
-fn same_file(left: &Path, right: &Path) -> bool {
-    match (fs::canonicalize(left), fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
-    }
 }
 
 pub fn rotate_zip_with_progress(
@@ -192,243 +207,237 @@ pub fn rotate_zip_with_progress(
     options: &JobOptions,
     progress: Option<&crypto::ProgressCallback<'_>>,
 ) -> Result<PathBuf, CryptoError> {
-    let entries = archive_read::entries(input)?;
-    let destination = options.output_dir.clone().unwrap_or_else(|| {
-        input
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()
-    });
-    fs::create_dir_all(&destination)?;
-    let archive = (0..8)
-        .map(|_| {
-            let mut name = PathBuf::from(crypto::opaque_file_name());
-            name.set_extension("zip");
-            destination.join(name)
-        })
-        .find(|path| !path.exists())
-        .ok_or(CryptoError::EncryptFailed)?;
-    crypto::ensure_distinct(input, &archive, options.key_file.as_deref())?;
-    let work_dir = archive.with_extension("zip.work");
-    fs::create_dir(&work_dir)?;
-    let _cleanup = RemoveDir(work_dir.clone());
-    let new_dir = work_dir.join("new");
-    fs::create_dir(&new_dir)?;
-    let staging = JobOptions {
-        overwrite: false,
-        remove_original: false,
-        key_file: options.key_file.clone(),
-        output_dir: Some(new_dir),
-    };
-    let mut rotated = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let old_file = work_dir.join(&entry.name);
-        archive_read::extract_entry(input, &entry, &old_file, progress)?;
-        rotated.push(crypto::rotate_file_with_progress(
-            old_key, new_key, &old_file, &staging, progress,
-        )?);
-    }
-    crypto::write_transformed(&archive, false, |writer| {
-        write_zip(writer, &rotated, progress).map_err(Into::into)
+    let source = Source::open(input, options.remove_original)?;
+    let mut file = source.file.try_clone()?;
+    let entries = archive_read::entries_from_reader(&mut file)?;
+    let authenticated = archive_read::inspect_names_from_reader(&mut file, old_key, &entries)?.1;
+    let output = destination(input, options)?;
+    crypto::ensure_distinct(input, &output, options.key_file.as_deref())?;
+    let bundle = binding(entries.len());
+    crypto::write_transformed(&output, false, |writer| {
+        let mut zip = ZipWriter::new(writer);
+        for entry in &entries {
+            check(progress)?;
+            let mut reader = archive_read::entry_reader(&mut file, entry, progress)?;
+            let name = crypto::opaque_file_name().to_string_lossy().into_owned();
+            zip.entry(&name, |sink| {
+                crypto::rotate_named_reader(
+                    old_key,
+                    new_key,
+                    &mut reader,
+                    sink,
+                    Some(bundle),
+                    progress,
+                )
+            })?;
+        }
+        source.check()?;
+        zip.finish(new_key, bundle)?;
+        check(progress)
     })?;
-    if options.remove_original {
-        fs::remove_file(input).map_err(|source| CryptoError::OriginalRemains {
-            output: archive.display().to_string(),
-            source,
-        })?;
+    // Legacy bundles authenticate only individual entries, so their source is retained.
+    if options.remove_original && authenticated {
+        source
+            .remove()
+            .map_err(|source| CryptoError::OriginalRemains {
+                output: output.display().to_string(),
+                source,
+            })?;
     }
-    Ok(archive)
+    Ok(output)
 }
 
+pub(crate) const MANIFEST_MAGIC: &[u8; 4] = b"FEB1";
+fn manifest_key(key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let mut derived = Zeroizing::new([0; 32]);
+    Hkdf::<Sha256>::new(Some(b"FileEncrypt-Bundle-v1"), key)
+        .expand(b"membership", derived.as_mut())
+        .unwrap();
+    derived
+}
+pub(crate) fn membership(entries: impl Iterator<Item = (String, u64, u32)>) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    for (name, size, crc) in entries {
+        hash.update((name.len() as u32).to_be_bytes());
+        hash.update(name.as_bytes());
+        hash.update(size.to_be_bytes());
+        hash.update(crc.to_be_bytes());
+    }
+    hash.finalize().into()
+}
+pub(crate) fn verify_manifest(
+    key: &[u8; 32],
+    comment: &[u8],
+    entries: &[archive_read::Entry],
+) -> Result<Option<BundleBinding>, CryptoError> {
+    if comment.is_empty() {
+        return Ok(None);
+    }
+    if comment.len() != 88 || &comment[..4] != MANIFEST_MAGIC {
+        return Err(CryptoError::AuthenticationFailed);
+    }
+    let derived = manifest_key(key);
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(derived.as_slice()).unwrap();
+    mac.update(&comment[..56]);
+    mac.verify_slice(&comment[56..])
+        .map_err(|_| CryptoError::AuthenticationFailed)?;
+    let bundle = BundleBinding {
+        id: comment[4..20].try_into().unwrap(),
+        count: u32::from_be_bytes(comment[20..24].try_into().unwrap()),
+    };
+    if bundle.count as usize != entries.len()
+        || comment[24..56] != membership(entries.iter().map(|e| (e.name.clone(), e.size, e.crc)))
+    {
+        return Err(CryptoError::AuthenticationFailed);
+    }
+    Ok(Some(bundle))
+}
 struct Entry {
-    name: Vec<u8>,
+    name: String,
     size: u64,
     crc: u32,
     offset: u64,
 }
-
 struct CountingWriter<'a> {
     inner: &'a mut dyn Write,
     position: u64,
 }
-
 impl Write for CountingWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(bytes)?;
-        self.position += written as u64;
-        Ok(written)
+        let n = self.inner.write(bytes)?;
+        self.position += n as u64;
+        Ok(n)
     }
-
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }
 }
-
-fn write_zip(
-    writer: &mut dyn Write,
-    paths: &[PathBuf],
-    progress: Option<&crypto::ProgressCallback<'_>>,
-) -> io::Result<()> {
-    let mut writer = CountingWriter {
-        inner: writer,
-        position: 0,
-    };
-    let mut entries = Vec::with_capacity(paths.len());
-    for path in paths {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid ZIP entry name"))?
-            .as_bytes()
-            .to_vec();
-        if name.len() > u16::MAX as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ZIP entry name is too long",
-            ));
+struct EntryWriter<'a, 'b> {
+    inner: &'a mut CountingWriter<'b>,
+    hash: crc32fast::Hasher,
+    size: u64,
+}
+impl Write for EntryWriter<'_, '_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(bytes)?;
+        self.hash.update(&bytes[..n]);
+        self.size += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+struct ZipWriter<'a> {
+    writer: CountingWriter<'a>,
+    entries: Vec<Entry>,
+}
+impl<'a> ZipWriter<'a> {
+    fn new(inner: &'a mut dyn Write) -> Self {
+        Self {
+            writer: CountingWriter { inner, position: 0 },
+            entries: Vec::new(),
         }
-        let file = File::open(path)?;
-        let size = file.metadata()?.len();
-        let large = size >= u32::MAX as u64;
-        let offset = writer.position;
-        let version: u16 = if large { 45 } else { 20 };
-        let extra_len: u16 = if large { 20 } else { 0 };
-
-        writer.write_all(&0x0403_4b50u32.to_le_bytes())?;
-        writer.write_all(&version.to_le_bytes())?;
-        writer.write_all(&8u16.to_le_bytes())?; // data descriptor follows the entry
-        writer.write_all(&0u16.to_le_bytes())?; // stored; ciphertext is incompressible
-        writer.write_all(&[0; 4])?; // DOS time and date
-        writer.write_all(&0u32.to_le_bytes())?; // CRC is written in the descriptor
-        for _ in 0..2 {
-            writer.write_all(&(if large { u32::MAX } else { 0 }).to_le_bytes())?;
-        }
-        writer.write_all(&(name.len() as u16).to_le_bytes())?;
-        writer.write_all(&extra_len.to_le_bytes())?;
-        writer.write_all(&name)?;
-        if large {
-            writer.write_all(&1u16.to_le_bytes())?; // ZIP64 extended information
-            writer.write_all(&16u16.to_le_bytes())?;
-            writer.write_all(&size.to_le_bytes())?;
-            writer.write_all(&size.to_le_bytes())?;
-        }
-
-        let mut reader = BufReader::new(file);
-        let mut hasher = crc32fast::Hasher::new();
-        let mut copied = 0u64;
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            if let Some(progress) = progress {
-                progress(0)?;
-            }
-            let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            writer.write_all(&buffer[..count])?;
-            hasher.update(&buffer[..count]);
-            copied += count as u64;
-        }
-        if copied != size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "encrypted file changed while archiving",
-            ));
-        }
-        let crc = hasher.finalize();
-        writer.write_all(&0x0807_4b50u32.to_le_bytes())?;
-        writer.write_all(&crc.to_le_bytes())?;
-        if large {
-            writer.write_all(&size.to_le_bytes())?;
-            writer.write_all(&size.to_le_bytes())?;
-        } else {
-            writer.write_all(&(size as u32).to_le_bytes())?;
-            writer.write_all(&(size as u32).to_le_bytes())?;
-        }
-        entries.push(Entry {
-            name,
+    }
+    fn entry(
+        &mut self,
+        name: &str,
+        produce: impl FnOnce(&mut dyn Write) -> Result<(), CryptoError>,
+    ) -> Result<(), CryptoError> {
+        let offset = self.writer.position;
+        let w = &mut self.writer;
+        w.write_all(&0x0403_4b50u32.to_le_bytes())?;
+        w.write_all(&45u16.to_le_bytes())?;
+        w.write_all(&8u16.to_le_bytes())?;
+        w.write_all(&[0; 10])?;
+        w.write_all(&u32::MAX.to_le_bytes())?;
+        w.write_all(&u32::MAX.to_le_bytes())?;
+        w.write_all(&(name.len() as u16).to_le_bytes())?;
+        w.write_all(&20u16.to_le_bytes())?;
+        w.write_all(name.as_bytes())?;
+        w.write_all(&1u16.to_le_bytes())?;
+        w.write_all(&16u16.to_le_bytes())?;
+        w.write_all(&[0; 16])?;
+        let mut sink = EntryWriter {
+            inner: w,
+            hash: crc32fast::Hasher::new(),
+            size: 0,
+        };
+        produce(&mut sink)?;
+        let size = sink.size;
+        let crc = sink.hash.finalize();
+        let w = &mut self.writer;
+        w.write_all(&0x0807_4b50u32.to_le_bytes())?;
+        w.write_all(&crc.to_le_bytes())?;
+        w.write_all(&size.to_le_bytes())?;
+        w.write_all(&size.to_le_bytes())?;
+        self.entries.push(Entry {
+            name: name.into(),
             size,
             crc,
             offset,
         });
+        Ok(())
     }
-
-    let central_offset = writer.position;
-    let mut zip64 = false;
-    for entry in &entries {
-        let large = entry.size >= u32::MAX as u64;
-        let far = entry.offset >= u32::MAX as u64;
-        zip64 |= large || far;
-        let version: u16 = if large || far { 45 } else { 20 };
-        let extra_len: u16 = if large || far {
-            4 + (if large { 16 } else { 0 }) + (if far { 8 } else { 0 })
-        } else {
-            0
-        };
-        writer.write_all(&0x0201_4b50u32.to_le_bytes())?;
-        writer.write_all(&version.to_le_bytes())?; // version made by
-        writer.write_all(&version.to_le_bytes())?; // version needed
-        writer.write_all(&8u16.to_le_bytes())?;
-        writer.write_all(&0u16.to_le_bytes())?;
-        writer.write_all(&[0; 4])?;
-        writer.write_all(&entry.crc.to_le_bytes())?;
-        for _ in 0..2 {
-            writer.write_all(&(if large { u32::MAX } else { entry.size as u32 }).to_le_bytes())?;
+    fn finish(&mut self, key: &[u8; 32], bundle: BundleBinding) -> Result<(), CryptoError> {
+        let central_offset = self.writer.position;
+        let w = &mut self.writer;
+        for e in &self.entries {
+            w.write_all(&0x0201_4b50u32.to_le_bytes())?;
+            w.write_all(&45u16.to_le_bytes())?;
+            w.write_all(&45u16.to_le_bytes())?;
+            w.write_all(&8u16.to_le_bytes())?;
+            w.write_all(&[0; 6])?;
+            w.write_all(&e.crc.to_le_bytes())?;
+            w.write_all(&u32::MAX.to_le_bytes())?;
+            w.write_all(&u32::MAX.to_le_bytes())?;
+            w.write_all(&(e.name.len() as u16).to_le_bytes())?;
+            w.write_all(&28u16.to_le_bytes())?;
+            w.write_all(&[0; 10])?;
+            w.write_all(&u32::MAX.to_le_bytes())?;
+            w.write_all(e.name.as_bytes())?;
+            w.write_all(&1u16.to_le_bytes())?;
+            w.write_all(&24u16.to_le_bytes())?;
+            w.write_all(&e.size.to_le_bytes())?;
+            w.write_all(&e.size.to_le_bytes())?;
+            w.write_all(&e.offset.to_le_bytes())?;
         }
-        writer.write_all(&(entry.name.len() as u16).to_le_bytes())?;
-        writer.write_all(&extra_len.to_le_bytes())?;
-        writer.write_all(&0u16.to_le_bytes())?; // comment length
-        writer.write_all(&0u16.to_le_bytes())?; // disk number
-        writer.write_all(&0u16.to_le_bytes())?; // internal attributes
-        writer.write_all(&0u32.to_le_bytes())?; // external attributes
-        writer.write_all(&(if far { u32::MAX } else { entry.offset as u32 }).to_le_bytes())?;
-        writer.write_all(&entry.name)?;
-        if large || far {
-            writer.write_all(&1u16.to_le_bytes())?;
-            writer.write_all(&extra_len.saturating_sub(4).to_le_bytes())?;
-            if large {
-                writer.write_all(&entry.size.to_le_bytes())?;
-                writer.write_all(&entry.size.to_le_bytes())?;
-            }
-            if far {
-                writer.write_all(&entry.offset.to_le_bytes())?;
-            }
-        }
+        let central_size = w.position - central_offset;
+        let zip64_offset = w.position;
+        w.write_all(&0x0606_4b50u32.to_le_bytes())?;
+        w.write_all(&44u64.to_le_bytes())?;
+        w.write_all(&45u16.to_le_bytes())?;
+        w.write_all(&45u16.to_le_bytes())?;
+        w.write_all(&[0; 8])?;
+        w.write_all(&(self.entries.len() as u64).to_le_bytes())?;
+        w.write_all(&(self.entries.len() as u64).to_le_bytes())?;
+        w.write_all(&central_size.to_le_bytes())?;
+        w.write_all(&central_offset.to_le_bytes())?;
+        w.write_all(&0x0706_4b50u32.to_le_bytes())?;
+        w.write_all(&0u32.to_le_bytes())?;
+        w.write_all(&zip64_offset.to_le_bytes())?;
+        w.write_all(&1u32.to_le_bytes())?;
+        let mut comment = Vec::with_capacity(88);
+        comment.extend_from_slice(MANIFEST_MAGIC);
+        comment.extend_from_slice(&bundle.id);
+        comment.extend_from_slice(&bundle.count.to_be_bytes());
+        comment.extend_from_slice(&membership(
+            self.entries.iter().map(|e| (e.name.clone(), e.size, e.crc)),
+        ));
+        let derived = manifest_key(key);
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(derived.as_slice()).unwrap();
+        mac.update(&comment);
+        comment.extend_from_slice(&mac.finalize().into_bytes());
+        w.write_all(&0x0605_4b50u32.to_le_bytes())?;
+        w.write_all(&[0; 4])?;
+        w.write_all(&u16::MAX.to_le_bytes())?;
+        w.write_all(&u16::MAX.to_le_bytes())?;
+        w.write_all(&u32::MAX.to_le_bytes())?;
+        w.write_all(&u32::MAX.to_le_bytes())?;
+        w.write_all(&(comment.len() as u16).to_le_bytes())?;
+        w.write_all(&comment)?;
+        Ok(())
     }
-    let central_size = writer.position - central_offset;
-    zip64 |= entries.len() >= u16::MAX as usize
-        || central_size >= u32::MAX as u64
-        || central_offset >= u32::MAX as u64;
-    if zip64 {
-        let zip64_offset = writer.position;
-        writer.write_all(&0x0606_4b50u32.to_le_bytes())?;
-        writer.write_all(&44u64.to_le_bytes())?;
-        writer.write_all(&45u16.to_le_bytes())?;
-        writer.write_all(&45u16.to_le_bytes())?;
-        writer.write_all(&0u32.to_le_bytes())?;
-        writer.write_all(&0u32.to_le_bytes())?;
-        writer.write_all(&(entries.len() as u64).to_le_bytes())?;
-        writer.write_all(&(entries.len() as u64).to_le_bytes())?;
-        writer.write_all(&central_size.to_le_bytes())?;
-        writer.write_all(&central_offset.to_le_bytes())?;
-        writer.write_all(&0x0706_4b50u32.to_le_bytes())?;
-        writer.write_all(&0u32.to_le_bytes())?;
-        writer.write_all(&zip64_offset.to_le_bytes())?;
-        writer.write_all(&1u32.to_le_bytes())?;
-    }
-    writer.write_all(&0x0605_4b50u32.to_le_bytes())?;
-    writer.write_all(&0u16.to_le_bytes())?;
-    writer.write_all(&0u16.to_le_bytes())?;
-    for _ in 0..2 {
-        writer.write_all(&(entries.len().min(u16::MAX as usize) as u16).to_le_bytes())?;
-    }
-    writer.write_all(&(central_size.min(u32::MAX as u64) as u32).to_le_bytes())?;
-    writer.write_all(&(central_offset.min(u32::MAX as u64) as u32).to_le_bytes())?;
-    writer.write_all(&0u16.to_le_bytes())?;
-    if let Some(progress) = progress {
-        progress(0)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -679,5 +688,211 @@ mod tests {
         assert!(first.exists());
         assert!(second.exists());
         assert_eq!(fs::read_dir(&second_dir).unwrap().count(), 1);
+    }
+    fn strip_manifest(path: &Path) {
+        let mut bytes = fs::read(path).unwrap();
+        let eocd = bytes.len() - 110;
+        assert_eq!(&bytes[eocd..eocd + 4], b"PK\x05\x06");
+        bytes[eocd + 20..eocd + 22].copy_from_slice(&0u16.to_le_bytes());
+        bytes.truncate(eocd + 22);
+        fs::write(path, bytes).unwrap();
+    }
+    #[test]
+    fn new_bundles_cannot_be_downgraded_by_removing_the_manifest() {
+        let dir = TestDir::new();
+        let input = dir.0.join("secret.txt");
+        fs::write(&input, b"secret").unwrap();
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: false,
+            key_file: None,
+            output_dir: Some(dir.0.join("out")),
+        };
+        let zip = encrypt_to_zip(&[1; 32], &[input], &options).unwrap();
+        strip_manifest(&zip.path);
+        let entries = archive_read::entries(&zip.path).unwrap();
+        assert!(archive_read::inspect_names(&zip.path, &[1; 32], &entries).is_err());
+    }
+    #[test]
+    fn rebuilt_subset_with_the_original_manifest_fails_membership_verification() {
+        let dir = TestDir::new();
+        let left = dir.0.join("left.txt");
+        let right = dir.0.join("right.txt");
+        fs::write(&left, b"left").unwrap();
+        fs::write(&right, b"right").unwrap();
+        let key = [1; 32];
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: false,
+            key_file: None,
+            output_dir: Some(dir.0.join("out")),
+        };
+        let original = encrypt_to_zip(&key, &[left, right], &options).unwrap();
+        let bytes = fs::read(&original.path).unwrap();
+        let comment = &bytes[bytes.len() - 88..];
+        let entries = archive_read::entries(&original.path).unwrap();
+        let e = &entries[0];
+        let ciphertext = &bytes[e.data_offset as usize..(e.data_offset + e.size) as usize];
+        let rebuilt = dir.0.join("subset.zip");
+        crypto::write_transformed(&rebuilt, false, |w| {
+            let mut zip = ZipWriter::new(w);
+            zip.entry(&e.name, |sink| {
+                sink.write_all(ciphertext)?;
+                Ok(())
+            })?;
+            zip.finish(&key, binding(1))
+        })
+        .unwrap();
+        let mut rebuilt_bytes = fs::read(&rebuilt).unwrap();
+        let at = rebuilt_bytes.len() - 88;
+        rebuilt_bytes[at..].copy_from_slice(comment);
+        fs::write(&rebuilt, rebuilt_bytes).unwrap();
+        let subset = archive_read::entries(&rebuilt).unwrap();
+        assert_eq!(subset.len(), 1);
+        assert!(archive_read::inspect_names(&rebuilt, &key, &subset).is_err());
+    }
+    #[test]
+    fn legacy_bundles_remain_readable_and_are_retained_after_rotation() {
+        let dir = TestDir::new();
+        let input = dir.0.join("secret.txt");
+        fs::write(&input, b"legacy data").unwrap();
+        let key = [1; 32];
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: false,
+            key_file: None,
+            output_dir: Some(dir.0.join("out")),
+        };
+        let encrypted = crypto::encrypt_file(&key, &input, &options).unwrap();
+        let bytes = fs::read(&encrypted).unwrap();
+        let legacy = dir.0.join("legacy.zip");
+        crypto::write_transformed(&legacy, false, |w| {
+            let mut zip = ZipWriter::new(w);
+            zip.entry(encrypted.file_name().unwrap().to_str().unwrap(), |sink| {
+                sink.write_all(&bytes)?;
+                Ok(())
+            })?;
+            zip.finish(&key, binding(1))
+        })
+        .unwrap();
+        strip_manifest(&legacy);
+        let entries = archive_read::entries(&legacy).unwrap();
+        assert_eq!(
+            archive_read::inspect_names(&legacy, &key, &entries).unwrap(),
+            ["secret.txt"]
+        );
+        let rotated = rotate_zip_with_progress(
+            &key,
+            &[2; 32],
+            &legacy,
+            &JobOptions {
+                remove_original: true,
+                ..options
+            },
+            None,
+        )
+        .unwrap();
+        assert!(legacy.exists());
+        let entries = archive_read::entries(&rotated).unwrap();
+        assert_eq!(
+            archive_read::inspect_names(&rotated, &[2; 32], &entries).unwrap(),
+            ["secret.txt"]
+        );
+    }
+    #[test]
+    fn originals_cannot_change_between_entry_encryption_and_publication() {
+        let dir = TestDir::new();
+        let input = dir.0.join("source.txt");
+        fs::write(&input, b"original").unwrap();
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: true,
+            key_file: None,
+            output_dir: Some(dir.0.join("out")),
+        };
+        let changed = std::sync::atomic::AtomicBool::new(false);
+        let on_entry = |index: usize, _: &Path| {
+            if index == 1 && fs::write(&input, b"changed after encryption").is_ok() {
+                changed.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let result = encrypt_to_zip_with_progress(
+            &[1; 32],
+            &[input.clone()],
+            &options,
+            None,
+            false,
+            None,
+            Some(&on_entry),
+        );
+        if changed.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(result.is_err());
+            assert_eq!(fs::read(input).unwrap(), b"changed after encryption");
+        } else {
+            assert!(result.is_ok());
+            assert!(!input.exists());
+        }
+    }
+    #[test]
+    fn cancelled_streaming_bundle_keeps_originals_and_publishes_nothing() {
+        let dir = TestDir::new();
+        let input = dir.0.join("source.bin");
+        fs::write(&input, vec![9; 150_000]).unwrap();
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: true,
+            key_file: None,
+            output_dir: Some(dir.0.join("out")),
+        };
+        let progress = |bytes: u64| -> io::Result<()> {
+            if bytes > 0 {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(encrypt_to_zip_with_progress(
+            &[1; 32],
+            &[input.clone()],
+            &options,
+            None,
+            true,
+            Some(&progress),
+            None
+        )
+        .is_err());
+        assert!(input.exists());
+        assert_eq!(
+            fs::read_dir(options.output_dir.unwrap()).unwrap().count(),
+            0
+        );
+    }
+    #[test]
+    fn bound_entries_preserve_the_legacy_relative_name_capacity() {
+        let dir = TestDir::new();
+        let input = dir.0.join("source.bin");
+        fs::write(&input, b"data").unwrap();
+        let name = format!("{}/{}.txt", "a".repeat(240), "b".repeat(257));
+        assert_eq!(name.len(), 502);
+        let source = Source::open(&input, false).unwrap();
+        for compress in [false, true] {
+            use std::io::{Seek, SeekFrom};
+            source
+                .file
+                .try_clone()
+                .unwrap()
+                .seek(SeekFrom::Start(0))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let bound = binding(1);
+            crypto::encrypt_bundle_reader(
+                &[1; 32], &source, &name, compress, bound, &mut bytes, None,
+            )
+            .unwrap();
+            let (restored, opened) =
+                crypto::inspect_named_reader(&[1; 32], &mut std::io::Cursor::new(bytes)).unwrap();
+            assert_eq!(restored, name);
+            assert_eq!(opened, Some(bound));
+        }
     }
 }

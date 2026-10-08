@@ -9,6 +9,7 @@
 //! always use base64.
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use aegis::aegis256::Aegis256;
@@ -50,8 +51,8 @@ pub fn fingerprint(key: &[u8]) -> String {
 }
 
 pub fn write_key_file(path: &Path, key: &[u8; 32]) -> Result<(), CryptoError> {
-    let encoded = STANDARD.encode(key);
-    let mut body = format!("{HEADER}\n{encoded}\n");
+    let encoded = Zeroizing::new(STANDARD.encode(key));
+    let mut body = format!("{HEADER}\n{}\n", encoded.as_str());
     let result = crypto::atomic_write(path, body.as_bytes());
     body.zeroize();
     result
@@ -132,35 +133,39 @@ pub fn read_key_file_with_passphrase(
     path: &Path,
     passphrase: Option<&str>,
 ) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
-    let meta = fs::metadata(path).map_err(|err| {
+    let bytes = read_key_snapshot(path)?;
+    parse_key_snapshot(path, &bytes, passphrase)
+}
+
+pub(crate) fn read_key_snapshot(path: &Path) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    let file = fs::File::open(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             CryptoError::InvalidKeyFile(format!("key file not found: {}", path.display()))
         } else {
-            CryptoError::Io(err)
+            err.into()
         }
     })?;
-    if !meta.is_file() {
+    if !file.metadata()?.is_file() {
         return Err(CryptoError::NotAFile(format!(
             "not a file: {}",
             path.display()
         )));
     }
-    if meta.len() > MAX_KEY_FILE_BYTES {
-        return Err(CryptoError::InvalidKeyFile(format!(
-            "{} is too large to be a key file",
-            path.display()
-        )));
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(MAX_KEY_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_KEY_FILE_BYTES {
+        return Err(CryptoError::InvalidKeyFile("key file is too large".into()));
     }
-    let mut text = fs::read_to_string(path).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::InvalidData {
-            CryptoError::InvalidKeyFile(format!("{} is not valid text", path.display()))
-        } else {
-            CryptoError::Io(err)
-        }
-    })?;
-    let parsed = parse_key_file(path, &text, passphrase);
-    text.zeroize();
-    parsed
+    Ok(bytes)
+}
+pub(crate) fn parse_key_snapshot(
+    path: &Path,
+    bytes: &[u8],
+    passphrase: Option<&str>,
+) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| CryptoError::InvalidKeyFile("key file is not valid text".into()))?;
+    parse_key_file(path, text, passphrase)
 }
 
 pub fn parse_key_material(text: &str) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
@@ -332,13 +337,13 @@ mod tests {
         fs::write(&path, format!("\u{feff}FileEncrypt-Key-v1\n{hex}\n")).unwrap();
         assert_eq!(read_key_file(&path).unwrap().as_slice(), &key);
 
-        let encoded = STANDARD.encode(key);
+        let encoded = Zeroizing::new(STANDARD.encode(key));
         let unpadded = encoded.trim_end_matches('=');
         let spaced = format!("FileEncrypt-Key-v1\n\n{unpadded}\n");
         fs::write(&path, spaced).unwrap();
         assert_eq!(read_key_file(&path).unwrap().as_slice(), &key);
 
-        let parsed = parse_key_material(&format!("  {encoded}  ")).unwrap();
+        let parsed = parse_key_material(&format!("  {}  ", encoded.as_str())).unwrap();
         assert_eq!(parsed.as_slice(), &key);
     }
 
