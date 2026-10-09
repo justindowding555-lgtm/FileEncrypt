@@ -22,6 +22,7 @@
 //! ```
 
 use std::cell::Cell;
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -1650,14 +1651,12 @@ fn opaque_output_path(
 
 pub(crate) fn opaque_file_name() -> std::ffi::OsString {
     let bytes = random_key();
-    let hex: String = bytes
-        .iter()
-        .take(16)
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    let mut name = std::ffi::OsString::from(hex);
-    name.push(".fenc");
-    name
+    let mut name = String::with_capacity(37);
+    for byte in &bytes[..16] {
+        write!(&mut name, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    name.push_str(".fenc");
+    name.into()
 }
 
 fn file_name_utf8(path: &Path) -> Result<String, CryptoError> {
@@ -1740,6 +1739,7 @@ fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct TempDir {
@@ -1831,7 +1831,7 @@ mod tests {
             Ok(())
         })
         .unwrap_err();
-        assert!(matches!(err, CryptoError::OutputExists(_)));
+        assert_matches!(err, CryptoError::OutputExists(_));
         assert_eq!(fs::read(&output).unwrap(), b"keep existing bytes");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
@@ -1930,7 +1930,7 @@ mod tests {
 
         let wrong = test_key(2);
         let err = decrypt_file(&wrong, &encrypted, &options(false, false)).unwrap_err();
-        assert!(matches!(err, CryptoError::AuthenticationFailed));
+        assert_matches!(err, CryptoError::AuthenticationFailed);
         assert!(!input.exists());
         assert!(!dir.path().join("notes.txt.fenc.partial").exists());
 
@@ -2025,7 +2025,7 @@ mod tests {
         bytes[4] = 9;
         fs::write(&encrypted, &bytes).unwrap();
         let err = decrypt_file(&key, &encrypted, &options(false, false)).unwrap_err();
-        assert!(matches!(err, CryptoError::UnsupportedVersion(9)));
+        assert_matches!(err, CryptoError::UnsupportedVersion(9));
     }
 
     #[test]
@@ -2041,7 +2041,7 @@ mod tests {
         assert_eq!(fs::read(&encrypted).unwrap(), first);
 
         let err = decrypt_file(&key, &encrypted, &options(false, false)).unwrap_err();
-        assert!(matches!(err, CryptoError::OutputExists(_)));
+        assert_matches!(err, CryptoError::OutputExists(_));
         assert_eq!(fs::read(&input).unwrap(), b"pdf");
 
         let key_file = dir.path().join("vault.key");
@@ -2049,7 +2049,7 @@ mod tests {
         let mut guarded = options(false, false);
         guarded.key_file = Some(key_file.clone());
         let err = encrypt_file(&key, &key_file, &guarded).unwrap_err();
-        assert!(matches!(err, CryptoError::KeyFileConflict));
+        assert_matches!(err, CryptoError::KeyFileConflict);
         assert_eq!(fs::read(&key_file).unwrap(), b"key");
     }
 
@@ -2066,7 +2066,7 @@ mod tests {
         fs::write(&child, b"keep").unwrap();
 
         let err = decrypt_file(&key, &encrypted, &options(true, true)).unwrap_err();
-        assert!(matches!(err, CryptoError::NotAFile(_)));
+        assert_matches!(err, CryptoError::NotAFile(_));
         assert_eq!(fs::read(&child).unwrap(), b"keep");
         assert!(encrypted.exists());
     }
@@ -2098,7 +2098,7 @@ mod tests {
         assert_eq!(decrypted, out.join("notes.txt"));
         assert_eq!(fs::read(&decrypted).unwrap(), b"one");
         let err = decrypt_file(&key, &other, &job).unwrap_err();
-        assert!(matches!(err, CryptoError::OutputExists(_)));
+        assert_matches!(err, CryptoError::OutputExists(_));
         assert_eq!(fs::read(&second).unwrap(), b"two");
     }
 
@@ -2140,10 +2140,10 @@ mod tests {
         let sneaky = b"../secret.txt";
         slot[0..2].copy_from_slice(&(sneaky.len() as u16).to_be_bytes());
         slot[2..2 + sneaky.len()].copy_from_slice(sneaky);
-        assert!(matches!(
+        assert_matches!(
             unpack_name(&slot, NAMED_VERSION),
             Err(CryptoError::BadEncryptedName)
-        ));
+        );
     }
 
     #[cfg(windows)]

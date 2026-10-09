@@ -8,6 +8,7 @@
 //! The second line may also be 64 hex characters. Files this app writes
 //! always use base64.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -38,16 +39,14 @@ pub fn generate_key() -> Zeroizing<[u8; 32]> {
 
 pub fn fingerprint(key: &[u8]) -> String {
     let digest = Sha256::digest(key);
-    let hex: String = digest
-        .iter()
-        .take(8)
-        .map(|byte| format!("{byte:02X}"))
-        .collect();
-    hex.as_bytes()
-        .chunks(4)
-        .map(|chunk| std::str::from_utf8(chunk).expect("hex is utf-8"))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut fingerprint = String::with_capacity(19);
+    for (index, byte) in digest[..8].iter().enumerate() {
+        if index != 0 && index.is_multiple_of(2) {
+            fingerprint.push(' ');
+        }
+        write!(&mut fingerprint, "{byte:02X}").expect("writing to a String cannot fail");
+    }
+    fingerprint
 }
 
 pub fn write_key_file(path: &Path, key: &[u8; 32]) -> Result<(), CryptoError> {
@@ -301,6 +300,7 @@ fn decode_hex(text: &str) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct TempDir {
@@ -371,23 +371,14 @@ mod tests {
         let path = dir.path.join("bad.key");
 
         fs::write(&path, "nope\n").unwrap();
-        assert!(matches!(
-            read_key_file(&path),
-            Err(CryptoError::InvalidKeyFile(_))
-        ));
+        assert_matches!(read_key_file(&path), Err(CryptoError::InvalidKeyFile(_)));
 
         fs::write(&path, "FileEncrypt-Key-v1\nYQ==\n").unwrap();
-        assert!(matches!(
-            read_key_file(&path),
-            Err(CryptoError::InvalidKeyFile(_))
-        ));
+        assert_matches!(read_key_file(&path), Err(CryptoError::InvalidKeyFile(_)));
 
         let good = STANDARD.encode([1u8; 32]);
         fs::write(&path, format!("FileEncrypt-Key-v1\n{good}\nextra\n")).unwrap();
-        assert!(matches!(
-            read_key_file(&path),
-            Err(CryptoError::InvalidKeyFile(_))
-        ));
+        assert_matches!(read_key_file(&path), Err(CryptoError::InvalidKeyFile(_)));
 
         fs::write(&path, vec![0, 159, 146, 150]).unwrap();
         assert!(read_key_file(&path).is_err());

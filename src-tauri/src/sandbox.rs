@@ -1,6 +1,7 @@
 //! Read-only previews. Plaintext is bounded, authenticated in memory, and never
 //! passed to a filesystem writer or an external application.
 use std::collections::{HashMap, HashSet};
+use std::fmt::NumBuffer;
 use std::io::{self, BufReader, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -238,7 +239,7 @@ fn open(state: &AppState, paths: Vec<String>) -> Result<Catalog, String> {
     let file_hash =
         lock(&state.key_file_hash).ok_or("Reload the saved key file to enable sandbox viewing.")?;
     let mut session = Session {
-        id: revision.to_string(),
+        id: revision.format_into(&mut NumBuffer::new()).to_owned(),
         key,
         key_path,
         file_hash,
@@ -787,10 +788,17 @@ fn register_preview(
         );
     }
     registry.next_preview = registry.next_preview.wrapping_add(1);
-    let label = format!(
-        "sandbox-preview-{}-{}-{}",
-        session_id, item_id, registry.next_preview
-    );
+    let mut item_buffer = NumBuffer::new();
+    let mut preview_buffer = NumBuffer::new();
+    let item = item_id.format_into(&mut item_buffer);
+    let preview = registry.next_preview.format_into(&mut preview_buffer);
+    let mut label = String::with_capacity(18 + session_id.len() + item.len() + preview.len());
+    label.push_str("sandbox-preview-");
+    label.push_str(&session_id);
+    label.push('-');
+    label.push_str(item);
+    label.push('-');
+    label.push_str(preview);
     registry
         .previews
         .insert(label.clone(), PreviewTarget::new(session_id, item_id));
