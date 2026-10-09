@@ -13,6 +13,10 @@ const state = {
   emergencyDeletionPath: null,
   emergencyDeletionMessage: "",
   emergencyShortcutsNative: false,
+  accessSetupRequired: false,
+  accessSetupIsUpgrade: false,
+  accessSetupKeyPath: null,
+  accessSetupRequiresCurrentReference: false,
   keyRevision: 0,
   keyHasFile: false,
   sandboxAvailable: false,
@@ -26,10 +30,12 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+const keyProtection = { token: null, generation: 0, firstRun: false, firstRunVisible: false, operation: null };
 const savedSelection = { revision: 0, ready: false, pending: true, restoring: false };
 const fileVerification = { ready: false, generation: 0, running: false, entries: new Map(), badges: new Map() };
 const KEY_DISCONNECTED_GUIDANCE = "Reconnect your key drive to continue.";
 const KEY_READ_ERROR = "Unable to read the saved key.";
+const MAX_SELECTED_FILES = 10000;
 const ROUTINE_KEY_MESSAGES = new Set([
   "Key loaded.",
   "Key loaded from the saved location.",
@@ -131,6 +137,10 @@ function invalidatePreview() {
 function addSelectedFiles(selected, remember = true) {
   const paths = Array.isArray(selected) ? selected : selected.paths;
   const roots = Array.isArray(selected) ? {} : selected.roots;
+  const additions = new Set(paths.filter((path) => !state.fileSet.has(path)));
+  if (state.files.length + additions.size > MAX_SELECTED_FILES) {
+    throw new Error("Select at most 10,000 files in total. Remove some selected files before adding this selection.");
+  }
   let changed = false;
   for (const path of paths) {
     if (roots[path] && state.folderRoots.get(path) !== roots[path]) {
@@ -265,12 +275,18 @@ function applyStatus(status, updatePath) {
   }
   const wasDisconnected = state.keyDisconnected;
   const wasEmergencyLocked = state.emergencyLocked;
+  const wasSetupRequired = state.accessSetupRequired;
+  if (typeof status.accessSetupRequired === "boolean") state.accessSetupRequired = status.accessSetupRequired;
+  state.accessSetupIsUpgrade = Boolean(status.accessSetupIsUpgrade);
+  state.accessSetupKeyPath = status.accessSetupKeyPath || state.accessSetupKeyPath;
+  state.accessSetupRequiresCurrentReference = Boolean(status.accessSetupRequiresCurrentReference);
   state.emergencyLocked = Boolean(status.emergencyLocked);
   state.emergencyDeletionArmed = Boolean(status.emergencyDeletionArmed);
   state.emergencyDeletionPath = status.emergencyDeletionPath || null;
   state.emergencyDeletionMessage = status.emergencyDeletionMessage || "";
   state.emergencyShortcutsNative = Boolean(status.emergencyShortcutsNative);
   if (keyRevisionChanged || (state.keyFingerprint !== null && state.keyFingerprint !== status.fingerprint)) {
+    resetKeyProtection();
     invalidatePreview();
     resetFileVerification();
   }
@@ -289,7 +305,7 @@ function applyStatus(status, updatePath) {
   if (state.emergencyLocked) {
     cancelSandboxRecovery();
     $("key-text").value = "";
-    $("key-passphrase").value = "";
+    if (!wasEmergencyLocked || keyRevisionChanged) $("key-passphrase").value = "";
     if (!wasEmergencyLocked && $("key-dialog").open) $("key-dialog").close();
   }
   if (sandbox.recovery) {
@@ -344,12 +360,18 @@ function applyStatus(status, updatePath) {
         ? ROUTINE_KEY_MESSAGES.has(message) ? "" : message
         : message || "Choose a key to get started.";
   updateKeyRecoveryDialog();
-  if (state.keyDisconnected && (!wasDisconnected || state.emergencyLocked && !wasEmergencyLocked) && !$("startup-key-dialog").open) {
+  if (state.keyDisconnected && (!state.accessSetupRequired || state.emergencyLocked) && (!wasDisconnected || state.emergencyLocked && !wasEmergencyLocked) && !$("startup-key-dialog").open) {
     showKeyRecoveryDialog();
   } else if (!state.keyDisconnected && $("startup-key-dialog").open) {
     $("startup-key-dialog").close();
   }
   renderControls();
+  if (wasSetupRequired && !state.accessSetupRequired) {
+    keyProtection.firstRunVisible = false;
+    $("key-dialog").classList.toggle("is-first-run", false);
+    if ($("key-dialog").open) $("key-dialog").close();
+  }
+  maybeShowFirstRun();
   updateSandboxRecoveryUI();
   maybeResumeSandbox();
   maybeRestoreSelectedFiles();
@@ -408,7 +430,7 @@ function renderPaged(listId, pagerId, items, renderRow, pageSize = PAGE_SIZE) {
 }
 
 function selectionBlocked() {
-  return state.selectionBusy || (state.busy && state.keyLoaded);
+  return state.accessSetupRequired || state.selectionBusy || (state.busy && state.keyLoaded);
 }
 
 function renderControls() {
@@ -416,7 +438,7 @@ function renderControls() {
   for (const button of fileRemoveButtons) button.disabled = selectionBlocked();
   for (const button of deletionButtons) button.disabled = busy;
   const noFiles = state.files.length === 0;
-  const blocked = busy || !state.keyLoaded || noFiles;
+  const blocked = busy || state.accessSetupRequired || !state.keyLoaded || noFiles;
   $("generate").classList.toggle("primary", !state.keyLoaded && !state.keyDisconnected);
   $("browse-load").classList.toggle("primary", state.keyDisconnected);
   $("encrypt").disabled = blocked;
@@ -447,6 +469,7 @@ function renderControls() {
   $("use-typed").disabled = busy;
   $("open-key-options").disabled = busy;
   renderEmergencyControls();
+  renderKeyProtection();
   $("open-specific-key").disabled = busy;
   $("choose-output").disabled = busy;
   $("clear-output").disabled = busy || $("output-dir").value.trim() === "";
@@ -745,14 +768,35 @@ async function runKeyOption(work, updatePathOnSuccess) {
 }
 
 function openKeyOptions() {
+  const firstRun = state.accessSetupRequired && !state.emergencyLocked;
+  keyProtection.firstRunVisible = firstRun;
   clearAlert();
   $("key-management-view").hidden = false;
   $("specific-key-view").hidden = true;
-  $("key-dialog-heading").textContent = "Key options";
-  $("key-dialog-description").textContent = "Manage the key file used for this workspace.";
+  $("key-dialog").classList.toggle("is-first-run", firstRun);
+  $("close-key-options").hidden = firstRun;
+  $("key-path").readOnly = firstRun && Boolean(state.keyPath);
+  $("key-dialog-heading").textContent = firstRun ? "Create your password" : "Key options";
+  $("key-dialog-description").textContent = firstRun
+    ? state.accessSetupRequiresCurrentReference ? "Enter your existing emergency password once to restore automatic key loading." : "You'll only use this password to leave emergency mode."
+    : "Manage the key file used for this workspace.";
+  if (firstRun) {
+    $("emergency-options").open = true;
+    $("access-settings").open = true;
+    if (!state.keyPath && !$("key-path").value) $("key-path").value = state.accessSetupKeyPath || "";
+    if (!$("first-run-key-path").value) $("first-run-key-path").value = state.accessSetupKeyPath || "";
+  }
+  renderKeyProtection();
   if (!$("key-dialog").open) $("key-dialog").showModal();
-  if (sandbox.recovery?.waitingForUnlock) $("key-passphrase").focus();
+  if (firstRun) $("new-key-passphrase").focus();
+  else if (sandbox.recovery?.waitingForUnlock) $("key-passphrase").focus();
   else $("close-key-options").focus();
+}
+
+function maybeShowFirstRun() {
+  if (!state.accessSetupRequired || state.emergencyLocked) return;
+  if ($("startup-key-dialog").open) $("startup-key-dialog").close();
+  if (!keyProtection.firstRunVisible || !$("key-dialog").open) openKeyOptions();
 }
 
 function renderEmergencyControls() {
@@ -780,8 +824,151 @@ async function unlockEmergency() {
   } catch (error) {
     if ($("startup-key-dialog").open) $("startup-key-dialog").close();
     openKeyOptions();
-    showAlert(normalizeError(error));
+    const message = normalizeError(error);
+    showAlert(message === KEY_READ_ERROR ? "The key reference could not be checked." : message);
+    $("key-passphrase").focus();
   } finally { emergencyUnlockPending = false; }
+}
+
+function resetKeyProtection() {
+  const token = keyProtection.token;
+  keyProtection.token = null;
+  keyProtection.firstRun = false;
+  keyProtection.generation++;
+  for (const id of ["key-passphrase", "new-key-passphrase", "confirm-key-passphrase", "key-recovery-code", "new-recovery-code"]) $(id).value = "";
+  $("recovery-code-saved").checked = false;
+  $("access-recovery-result").hidden = true;
+  $("key-protection-status").textContent = "";
+  if (token) invoke("cancel_key_protection", { token }).catch(() => {});
+}
+
+function renderKeyProtection() {
+  const busy = state.busy || state.selectionBusy || Boolean(keyProtection.operation);
+  const pending = Boolean(keyProtection.token);
+  const firstRun = state.accessSetupRequired && !state.emergencyLocked;
+  const recovering = $("access-recovery").open;
+  const preparing = keyProtection.operation === "prepare";
+  const saving = keyProtection.operation === "save";
+  $("key-protection-loading").hidden = !keyProtection.operation;
+  $("key-protection-loading-title").textContent = saving ? "Saving emergency access…" : "Preparing emergency access…";
+  $("access-fields").setAttribute("aria-busy", String(preparing));
+  $("access-recovery-result").setAttribute("aria-busy", String(saving));
+  $("current-reference-field").hidden = firstRun || recovering;
+  $("key-location-field").hidden = firstRun;
+  $("access-fields").hidden = firstRun && (pending || preparing);
+  $("key-reference-label").textContent = firstRun ? "Current password" : "Key reference";
+  $("key-passphrase").placeholder = "Enter reference, if required";
+  $("key-reference-hint").textContent = "Used only to leave emergency mode or update access. Cleared after use.";
+  $("new-reference-label").textContent = recovering ? "New password" : firstRun ? "Password" : "New reference";
+  $("confirm-reference-label").textContent = recovering ? "Confirm new password" : firstRun ? "Confirm password" : "Repeat reference";
+  $("new-reference-hint").textContent = recovering ? "Choose one new emergency password of at least 12 characters. Enter that same password in both boxes." : firstRun && state.accessSetupRequiresCurrentReference ? "Use your previous password, or open Use recovery code above if you only have its recovery code." : "Use at least 12 characters. Normal key loading and reconnection stay automatic.";
+  $("first-run-location").hidden = !firstRun || Boolean(state.keyPath);
+  $("choose-first-run-location").disabled = busy || pending;
+  $("first-run-key-path").disabled = busy || pending;
+  if (firstRun) {
+    $("key-dialog-heading").textContent = pending ? "Save your recovery code" : state.accessSetupIsUpgrade || state.accessSetupRequiresCurrentReference ? "Update emergency access" : "Create your password";
+    $("key-dialog-description").textContent = pending ? "Keep this code somewhere safe, separate from this device." : state.accessSetupRequiresCurrentReference ? recovering ? "Use your recovery code to set a new emergency password. Your encryption key will stay the same." : "Enter your existing emergency password once to restore automatic key loading." : "You'll only use this password to leave emergency mode.";
+  }
+  $("prepare-key-protection").disabled = busy || pending || state.emergencyLocked;
+  $("prepare-key-protection").hidden = recovering;
+  $("prepare-key-protection").textContent = preparing ? "Preparing…" : firstRun ? "Continue" : "Update access";
+  $("commit-key-protection").textContent = saving ? "Saving…" : state.accessSetupRequired ? "Finish setup" : "Save access";
+  $("cancel-key-protection").textContent = state.accessSetupRequired ? "Start over" : "Cancel setup";
+  $("access-recovery").hidden = firstRun && !state.accessSetupRequiresCurrentReference;
+  if (state.accessSetupRequired && state.keyPath) $("set-path").disabled = true;
+  $("access-setup-guidance").hidden = firstRun;
+  $("recover-key-protection").disabled = busy || pending;
+  $("recover-key-protection").hidden = !recovering;
+  $("recover-key-protection").textContent = "Set new emergency password";
+  $("commit-key-protection").disabled = busy || !pending || !$("recovery-code-saved").checked;
+  $("cancel-key-protection").disabled = busy;
+  for (const id of ["key-passphrase", "new-key-passphrase", "confirm-key-passphrase", "key-recovery-code"]) $(id).disabled = busy || pending;
+  $("recovery-code-saved").disabled = busy;
+}
+
+async function runKeyProtection(work, updatePathOnSuccess, operation) {
+  if (state.busy || state.selectionBusy || keyProtection.operation) return;
+  keyProtection.operation = operation;
+  try {
+    return await run(work, updatePathOnSuccess);
+  } finally {
+    keyProtection.operation = null;
+    renderKeyProtection();
+  }
+}
+
+async function prepareKeyProtection(recovery = false) {
+  if (state.busy || state.selectionBusy || keyProtection.operation || keyProtection.token) return;
+  const firstRun = state.accessSetupRequired && (!state.emergencyLocked || recovery);
+  const args = {
+    passphrase: recovery ? "" : $("key-passphrase").value,
+    newPassphrase: $("new-key-passphrase").value,
+    confirmation: $("confirm-key-passphrase").value,
+    recoveryCode: recovery ? $("key-recovery-code").value : null,
+    path: firstRun ? state.keyPath || $("first-run-key-path").value : $("key-path").value,
+  };
+  if (recovery) {
+    let message, field;
+    if (!args.recoveryCode.trim()) {
+      message = "Enter your saved recovery code.";
+      field = "key-recovery-code";
+    } else if ([...args.newPassphrase.trim()].length < 12) {
+      message = "Choose a new emergency password of at least 12 characters. You don't need your old password.";
+      field = "new-key-passphrase";
+    } else if (args.newPassphrase !== args.confirmation) {
+      message = "Enter the same new password in Confirm new password.";
+      field = "confirm-key-passphrase";
+    }
+    if (message) { showAlert(message); $(field).focus(); return; }
+  }
+  if ([...args.newPassphrase.trim()].length < 12 || args.newPassphrase !== args.confirmation) {
+    showAlert(firstRun ? "Enter matching passwords of at least 12 characters." : "Enter matching new references of at least 12 characters.");
+    return;
+  }
+  for (const id of ["key-passphrase", "new-key-passphrase", "confirm-key-passphrase", "key-recovery-code"]) $(id).value = "";
+  const generation = keyProtection.generation;
+  const revision = state.keyRevision;
+  const path = state.keyPath;
+  const prepared = await runKeyProtection(() => invoke(firstRun ? "prepare_first_run" : "prepare_key_protection", args), false, "prepare");
+  args.passphrase = args.newPassphrase = args.confirmation = args.recoveryCode = "";
+  if (!prepared) return;
+  if (keyProtection.generation !== generation || state.keyRevision !== revision || state.keyPath !== path) {
+    prepared.recoveryCode = "";
+    await invoke("cancel_key_protection", { token: prepared.token }).catch(() => {});
+    return;
+  }
+  keyProtection.token = prepared.token;
+  keyProtection.firstRun = firstRun;
+  $("new-recovery-code").value = prepared.recoveryCode;
+  prepared.recoveryCode = "";
+  $("access-recovery-result").hidden = false;
+  $("recovery-code-saved").checked = false;
+  $("key-protection-status").textContent = firstRun
+    ? "Save this code, check the box, then finish setup."
+    : "Emergency access has not changed yet. Save the code, then save access.";
+  if (prepared.migrationBackupPath) {
+    $("key-protection-status").textContent += ` Your existing encryption key will be preserved. Before updating its file, the app will save an exact backup at ${prepared.migrationBackupPath}.`;
+  }
+  renderKeyProtection();
+}
+
+async function commitKeyProtection() {
+  if (state.busy || state.selectionBusy || keyProtection.operation || !keyProtection.token || !$("recovery-code-saved").checked) return;
+  const firstRun = keyProtection.firstRun;
+  const result = await runKeyProtection(() => invoke("commit_key_protection", {
+    token: keyProtection.token, recoverySaved: true,
+    activationCode: firstRun ? $("new-recovery-code").value : null,
+  }), firstRun, "save");
+  if (!result) return; // Keep the displayed code if publication failed or was uncertain.
+  resetKeyProtection();
+  if (firstRun) {
+    if ($("key-dialog").open) $("key-dialog").close();
+    return;
+  }
+  $("key-protection-status").textContent = state.emergencyLocked
+    ? "Access updated. Enter the new reference above, then use the unlock shortcut."
+    : "Emergency access updated. Normal key loading stays automatic.";
+  renderKeyProtection();
 }
 
 function handleEmergencyShortcut(event) {
@@ -1382,7 +1569,27 @@ async function init() {
     run(() => invoke("arm_emergency_deletion", { enabled: false }), false);
   });
   $("sandbox-key-options").addEventListener("click", openKeyOptions);
+  $("prepare-key-protection").addEventListener("click", () => prepareKeyProtection());
+  $("choose-first-run-location").addEventListener("click", async () => {
+    if (!state.accessSetupRequired || state.keyPath) return;
+    const path = await run(() => invoke("pick_save_path"), false);
+    if (path) $("first-run-key-path").value = path;
+  });
+  $("recover-key-protection").addEventListener("click", () => prepareKeyProtection(true));
+  $("access-recovery").addEventListener("toggle", () => {
+    renderKeyProtection();
+    if ($("access-recovery").open && !state.busy && !keyProtection.token) {
+      clearAlert();
+      $("key-recovery-code").focus();
+    }
+  });
+  $("commit-key-protection").addEventListener("click", commitKeyProtection);
+  $("recovery-code-saved").addEventListener("change", renderKeyProtection);
+  $("cancel-key-protection").addEventListener("click", () => { resetKeyProtection(); renderKeyProtection(); });
   $("close-key-options").addEventListener("click", () => $("key-dialog").close());
+  $("key-dialog").addEventListener("cancel", (event) => {
+    if (state.accessSetupRequired && !state.emergencyLocked) event.preventDefault();
+  });
   $("startup-key-dialog").addEventListener("cancel", (event) => event.preventDefault());
   $("startup-key-dialog").addEventListener("close", () => {
     if (!$("key-dialog").open) {
@@ -1396,9 +1603,13 @@ async function init() {
   });
   $("key-dialog").addEventListener("close", () => {
     $("key-text").value = "";
+    $("key-passphrase").value = "";
+    resetKeyProtection();
+    keyProtection.firstRunVisible = false;
     if ($("sandbox-dialog").open) $("close-sandbox").focus();
     else $("open-key-options").focus();
     maybeResumeSandbox();
+    maybeShowFirstRun();
   });
   $("open-specific-key").addEventListener("click", () => showSpecificKeyView(true));
   $("back-to-key-options").addEventListener("click", () => showSpecificKeyView(false));
@@ -1411,18 +1622,18 @@ async function init() {
   });
 
   $("browse-load").addEventListener("click", () => {
-    run(() => invokeWithPassphrase("browse_key"), true);
+    run(() => invoke("browse_key"), true);
   });
 
   $("generate").addEventListener("click", () => {
     run(
-      () => invokeWithPassphrase("generate_key", { path: $("key-path").value }),
+      () => invoke("generate_key", { path: $("key-path").value }),
       true,
     );
   });
 
   $("load").addEventListener("click", () => {
-    runKeyOption(() => invokeWithPassphrase("load_key", { path: $("key-path").value }), true);
+    runKeyOption(() => invoke("load_key", { path: $("key-path").value }), true);
   });
 
   $("unload").addEventListener("click", () => {
@@ -1433,7 +1644,7 @@ async function init() {
     runKeyOption(async () => {
       const keyText = $("key-text").value;
       $("key-text").value = "";
-      const status = await invokeWithPassphrase("save_typed_key", {
+      const status = await invoke("save_typed_key", {
         path: $("key-path").value,
         keyText,
       });
@@ -1454,20 +1665,22 @@ async function init() {
     }, true);
   });
 
-  $("backup-key").addEventListener("click", () => runKeyOption(() => invokeWithPassphrase("backup_key"), false));
+  $("backup-key").addEventListener("click", () => runKeyOption(() => invoke("backup_key"), false));
   $("check-backup").addEventListener("click", () =>
-    runKeyOption(() => invokeWithPassphrase("check_key_backup"), false));
+    runKeyOption(() => invoke("check_key_backup"), false));
 
   $("rotate-key").addEventListener("click", async () => {
     if (state.busy || !state.keyLoaded || !state.files.length) return;
     $("key-dialog").close();
     state.jobRunning = true;
+    invalidatePreview();
+    resetFileVerification();
     $("progress-panel").hidden = false;
     $("job-progress").value = 0;
     $("progress-label").textContent = "Choose a new key-file path...";
     try {
       await run(async () => {
-        const report = await invokeWithPassphrase("rotate_key", {
+        const report = await invoke("rotate_key", {
           paths: [...state.files],
           outputDir: $("output-dir").value,
           removeOriginal: $("remove-original").checked,
@@ -1475,6 +1688,7 @@ async function init() {
         if (report) {
           renderResults(report.results, "rotate");
           applyStatus(report.status, true);
+          if (report.notice) showAlert(report.notice);
         }
         return null;
       }, false);
@@ -1722,7 +1936,7 @@ function formatBytes(bytes) {
 
 async function startJob() {
   const job = state.pendingJob;
-  if (state.busy || !state.keyLoaded || !job?.preview?.canRun || job.revision !== state.planRevision) return;
+  if (state.accessSetupRequired || state.busy || !state.keyLoaded || !job?.preview?.canRun || job.revision !== state.planRevision) return;
   invalidatePreview();
   state.jobRunning = true;
   resetFileVerification();

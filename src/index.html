@@ -251,12 +251,12 @@
         </div>
         <div id="key-dialog-alert" class="alert" role="alert" hidden></div>
         <div class="dialog-shared">
-          <div class="dialog-field">
-            <label class="field-label" for="key-passphrase">Key file passphrase</label>
-            <input id="key-passphrase" type="password" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" placeholder="Optional for new keys" />
-            <p class="sub">Required to open protected keys. The passphrase is cleared after use.</p>
+          <div id="current-reference-field" class="dialog-field">
+            <label id="key-reference-label" class="field-label" for="key-passphrase">Key reference</label>
+            <input id="key-passphrase" type="password" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" placeholder="Enter reference, if required" />
+            <p id="key-reference-hint" class="sub">Used only to leave emergency mode or update access. Cleared after use.</p>
           </div>
-          <div class="dialog-field">
+          <div id="key-location-field" class="dialog-field">
             <label class="field-label" for="key-path">Key file path</label>
             <input id="key-path" type="text" spellcheck="false" autocomplete="off" placeholder="Choose or enter a path" />
             <div class="row path-actions">
@@ -278,13 +278,56 @@
             <p class="sub">The old key file remains available for other encrypted files.</p>
           </div>
           <button type="button" class="specific-key-link" id="open-specific-key">Use a specific key <span aria-hidden="true">→</span></button>
-          <details class="emergency-options">
+          <details id="emergency-options" class="emergency-options">
             <summary>Emergency controls</summary>
             <div class="emergency-shortcuts">
               <div><span>Lock key access</span><kbd>Ctrl + Shift + F12</kbd></div>
               <div><span>Unlock and check key</span><kbd>Ctrl + Shift + F11</kbd></div>
             </div>
-            <p class="sub">The lock survives restarting the app. Reconnecting the drive keeps showing a read error until you unlock. Protected keys need their passphrase here before unlocking.</p>
+            <p class="sub">The lock survives restarting the app. Reconnecting the drive keeps showing a read error until you unlock. Enter your emergency reference above before using the unlock shortcut.</p>
+            <details id="access-settings" class="access-settings">
+              <summary>Access settings</summary>
+              <p id="access-setup-guidance" class="sub">This reference is only for leaving emergency mode. Enter the current reference above before updating access. Normal key loading stays automatic.</p>
+              <div id="access-fields" class="access-fields">
+                <details id="access-recovery" class="access-recovery">
+                  <summary>Use recovery code</summary>
+                  <p class="sub">Enter your saved code below, then choose one new emergency password in the two boxes that follow. You don't need your old password.</p>
+                  <label class="field-label" for="key-recovery-code">Recovery code</label>
+                  <input id="key-recovery-code" type="password" maxlength="128" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" />
+                </details>
+                <label id="new-reference-label" class="field-label" for="new-key-passphrase">New reference</label>
+                <input id="new-key-passphrase" type="password" minlength="12" maxlength="1024" autocomplete="new-password" spellcheck="false" autocapitalize="off" autocorrect="off" />
+                <label id="confirm-reference-label" class="field-label" for="confirm-key-passphrase">Repeat reference</label>
+                <input id="confirm-key-passphrase" type="password" minlength="12" maxlength="1024" autocomplete="new-password" spellcheck="false" autocapitalize="off" autocorrect="off" />
+                <p id="new-reference-hint" class="sub">Use at least 12 characters. Normal key loading and reconnection stay automatic.</p>
+                <details id="first-run-location" class="first-run-location" hidden>
+                  <summary>Choose where to save the key</summary>
+                  <label class="field-label" for="first-run-key-path">File location</label>
+                  <input id="first-run-key-path" type="text" spellcheck="false" autocomplete="off" />
+                  <button type="button" id="choose-first-run-location">Choose location</button>
+                </details>
+                <button type="button" id="prepare-key-protection">Update access</button>
+                <button type="button" id="recover-key-protection" hidden>Set new emergency password</button>
+              </div>
+              <div id="access-recovery-result" class="access-recovery-result" hidden>
+                <label class="field-label" for="new-recovery-code">Save this recovery code</label>
+                <textarea id="new-recovery-code" rows="3" readonly spellcheck="false" autocomplete="off"></textarea>
+                <p class="sub">Shown only during this setup. Store it separately from this device. This code can reset your emergency password. Setup expires after 10 minutes.</p>
+                <label class="check"><input id="recovery-code-saved" type="checkbox" /> I saved this code in a separate, safe location</label>
+                <div class="row access-actions">
+                  <button type="button" class="primary" id="commit-key-protection" disabled>Save access</button>
+                  <button type="button" id="cancel-key-protection">Cancel setup</button>
+                </div>
+              </div>
+              <div id="key-protection-loading" class="key-protection-loading" role="status" aria-live="polite" hidden>
+                <span class="key-protection-spinner" aria-hidden="true"></span>
+                <div>
+                  <strong id="key-protection-loading-title">Preparing emergency access…</strong>
+                  <p class="sub">This may take a few seconds. Keep this window open.</p>
+                </div>
+              </div>
+              <p id="key-protection-status" class="sub" role="status"></p>
+            </details>
             <div class="emergency-deletion">
               <label class="check"><input id="enable-emergency-deletion" type="checkbox" /> Enable emergency key deletion for this session</label>
               <p class="sub">Deletes only the armed key file. Without a backup, its encrypted files may become permanently inaccessible. This is file deletion, not secure erasure.</p>
@@ -327,7 +370,7 @@
               <p id="startup-key-path" class="startup-key-path"></p>
             </div>
           </div>
-          <p id="startup-key-instructions" class="sub">For protected keys, enter your passphrase in Key options.</p>
+          <p id="startup-key-instructions" class="sub">The same key will load automatically when its drive returns.</p>
           <p id="key-recovery-sandbox" class="sub" hidden>Your sandbox is waiting. It will reload automatically when the same key is loaded.</p>
           <p id="key-recovery-alert" class="alert" role="alert" hidden></p>
         </div>

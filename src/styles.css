@@ -43,6 +43,10 @@
 
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
+/* Keep the workspace centered at the same width when modal scroll locking changes. */
+html:has(.app) { scrollbar-gutter: stable both-edges; }
+html:has(.key-dialog[open]),
+body:has(.key-dialog[open]) { overflow: hidden; }
 body {
   min-width: 320px;
   min-height: 100vh;
@@ -211,6 +215,8 @@ h3 { margin-bottom: 0; font-size: 0.9rem; letter-spacing: -0.01em; }
 .key-actions button { min-height: 34px; padding: 7px 14px; white-space: nowrap; }
 .key-options-button { margin: 0 0 0 -6px; font-weight: 600; }
 .key-dialog {
+  position: fixed;
+  inset: 0;
   width: min(620px, calc(100% - 32px));
   max-height: calc(100vh - 40px);
   margin: auto;
@@ -232,9 +238,6 @@ h3 { margin-bottom: 0; font-size: 0.9rem; letter-spacing: -0.01em; }
   -webkit-backdrop-filter: blur(5px);
   backdrop-filter: blur(5px);
 }
-html:has(#startup-key-dialog[open]),
-body:has(#startup-key-dialog[open]) { overflow: hidden; scrollbar-gutter: stable; }
-body:has(#startup-key-dialog[open]) :is(.file-list, .preview-list, .sandbox-files, .key-dialog:not(#startup-key-dialog)) { overflow: hidden; }
 body:has(#startup-key-dialog[open]) .key-status { visibility: hidden; }
 .recovery-heading { display: flex; gap: 14px; align-items: flex-start; min-width: 0; }
 .recovery-heading > div { min-width: 0; padding-top: 2px; }
@@ -274,6 +277,34 @@ body:has(#startup-key-dialog[open]) .key-status { visibility: hidden; }
 .specific-key-link span { margin-left: auto; font-size: 1.1rem; }
 .emergency-options { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); }
 .emergency-options summary { cursor: pointer; font-size: 0.86rem; font-weight: 600; }
+.access-settings { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+.access-fields { display: grid; gap: 8px; margin-top: 14px; }
+.access-fields .field-label { margin: 4px 0 0; }
+.access-fields > button, .access-recovery > button { justify-self: start; margin-top: 5px; }
+.access-recovery { display: grid; gap: 8px; margin-top: 10px; }
+.access-recovery .field-label { margin: 12px 0 7px; }
+.access-recovery-result { margin-top: 16px; padding: 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--inset); }
+#new-recovery-code { width: 100%; padding: 10px; resize: none; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--text); font: 0.85rem var(--mono); overflow-wrap: anywhere; }
+.access-recovery-result .check { align-items: flex-start; margin-top: 12px; }
+.access-actions { margin-top: 14px; }
+.key-protection-loading { display: flex; align-items: center; gap: 14px; margin-top: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 9px; background: var(--inset); }
+.key-protection-loading strong { font-size: 0.9rem; }
+.key-protection-loading .sub { margin: 5px 0 0; }
+.key-protection-spinner { flex: 0 0 24px; height: 24px; border: 3px solid var(--line); border-top-color: var(--focus); border-radius: 50%; animation: key-protection-spin 0.8s linear infinite; }
+@keyframes key-protection-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .key-protection-spinner { animation: none; } }
+.key-dialog.is-first-run .dialog-head .step { display: none; }
+.key-dialog.is-first-run :is(.dialog-section, .specific-key-link, .emergency-shortcuts, .emergency-deletion, .emergency-options > summary, .emergency-options > .sub, .access-settings > summary, #load, #unload) { display: none; }
+.key-dialog.is-first-run :is(.emergency-options, .access-settings) { margin-top: 0; padding-top: 0; border-top: 0; }
+.key-dialog.is-first-run .dialog-view { padding-top: 18px; }
+.key-dialog.is-first-run .dialog-shared { display: block; padding-block: 0; }
+.key-dialog.is-first-run #current-reference-field { padding-top: 18px; }
+.key-dialog.is-first-run #access-fields { margin-top: 0; }
+.key-dialog.is-first-run .access-recovery-result { margin-top: 0; }
+.first-run-location { margin-block: 8px; }
+.first-run-location .field-label { margin: 12px 0 7px; }
+.first-run-location button { margin-top: 8px; }
+.key-dialog.is-first-run #new-recovery-code { border-color: var(--focus); }
 .emergency-shortcuts { display: grid; gap: 10px; margin: 16px 0 12px; }
 .emergency-shortcuts > div { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; font-size: 0.82rem; }
 .emergency-options kbd { padding: 3px 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--inset); color: var(--text); font: 0.73rem ui-monospace, monospace; white-space: nowrap; }
@@ -534,7 +565,6 @@ footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: s
 }
 .sandbox-dialog[open] { display: flex; flex-direction: column; }
 .sandbox-dialog::backdrop { background: #161c2b66; backdrop-filter: blur(5px); }
-body:has(.sandbox-dialog[open]) { overflow: hidden; }
 .sandbox-dialog svg { display: block; width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
 .sandbox-dialog button { font-weight: 500; }
 .sandbox-dialog button:hover:not(:disabled) { box-shadow: none; }

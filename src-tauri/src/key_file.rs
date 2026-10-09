@@ -10,7 +10,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::Path;
 
 use aegis::aegis256::Aegis256;
@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{self, CryptoError};
+use crate::publication::{self, PublishedFile};
 
 const HEADER: &str = "FileEncrypt-Key-v1";
 const PROTECTED_HEADER: &str = "FileEncrypt-Key-v2";
@@ -50,14 +51,16 @@ pub fn fingerprint(key: &[u8]) -> String {
 }
 
 pub fn write_key_file(path: &Path, key: &[u8; 32]) -> Result<(), CryptoError> {
-    let encoded = Zeroizing::new(STANDARD.encode(key));
-    let mut body = format!("{HEADER}\n{}\n", encoded.as_str());
-    let result = crypto::atomic_write(path, body.as_bytes());
-    body.zeroize();
-    result
+    let body = plain_key_text(key);
+    crypto::atomic_write(path, body.as_bytes())
 }
 
-fn derive_passphrase_key(
+fn plain_key_text(key: &[u8; 32]) -> Zeroizing<String> {
+    let encoded = Zeroizing::new(STANDARD.encode(key));
+    Zeroizing::new(format!("{HEADER}\n{}\n", encoded.as_str()))
+}
+
+pub(crate) fn derive_passphrase_key(
     passphrase: &str,
     salt: &[u8; 16],
     rounds: u32,
@@ -96,6 +99,11 @@ pub fn write_protected_key_file(
     key: &[u8; 32],
     passphrase: &str,
 ) -> Result<(), CryptoError> {
+    let text = protected_key_text(key, passphrase)?;
+    crypto::atomic_write(path, text.as_bytes())
+}
+
+fn protected_key_text(key: &[u8; 32], passphrase: &str) -> Result<Zeroizing<String>, CryptoError> {
     if passphrase.is_empty() {
         return Err(CryptoError::InvalidKeyFile(
             "enter a passphrase to protect the key".into(),
@@ -108,20 +116,68 @@ pub fn write_protected_key_file(
     let mut nonce = [0u8; 32];
     nonce.copy_from_slice(&nonce_random);
     let wrapping = derive_passphrase_key(passphrase, &salt, KDF_ROUNDS)?;
-    let mut body = key.to_vec();
+    let mut body = Zeroizing::new(key.to_vec());
     let tag = Aegis256::<32>::new(&wrapping, &nonce)
         .encrypt_in_place(&mut body, PROTECTED_HEADER.as_bytes());
     body.extend_from_slice(&tag);
-    let mut text = format!(
+    let text = Zeroizing::new(format!(
         "{PROTECTED_HEADER}\npbkdf2-sha256:{KDF_ROUNDS}\n{}\n{}\n{}\n",
         STANDARD.encode(salt),
         STANDARD.encode(nonce),
-        STANDARD.encode(&body)
-    );
-    let result = crypto::atomic_write(path, text.as_bytes());
-    body.zeroize();
-    text.zeroize();
-    result
+        STANDARD.encode(body.as_slice())
+    ));
+    Ok(text)
+}
+
+/// Keep the recovery key protected for the entire rotation, including deletion.
+pub(crate) struct RotationKey {
+    file: PublishedFile,
+    hash: [u8; 32],
+}
+
+impl RotationKey {
+    pub(crate) fn check(&self) -> io::Result<()> {
+        self.file.check().map_err(|error| {
+            io::Error::other(format!(
+                "New key file is unavailable at {}: {error}",
+                self.file.path.display()
+            ))
+        })
+    }
+
+    pub(crate) fn checked_hash(&self) -> Result<[u8; 32], CryptoError> {
+        self.check()?;
+        let bytes = read_key_snapshot(&self.file.path)?;
+        let actual: [u8; 32] = Sha256::digest(bytes.as_slice()).into();
+        self.check()?;
+        if actual != self.hash {
+            return Err(CryptoError::InvalidKeyFile(
+                "new key file changed during rotation".into(),
+            ));
+        }
+        Ok(actual)
+    }
+}
+
+pub(crate) fn create_rotation_key(
+    path: &Path,
+    key: &[u8; 32],
+    passphrase: Option<&str>,
+    callback: Option<&crypto::ProgressCallback<'_>>,
+) -> Result<RotationKey, CryptoError> {
+    let text = match passphrase.filter(|value| !value.is_empty()) {
+        Some(value) => protected_key_text(key, value)?,
+        None => plain_key_text(key),
+    };
+    let hash = Sha256::digest(text.as_bytes()).into();
+    // Publication refuses replacement atomically, even if a file appears after preflight.
+    let file = publication::write(path, false, callback, |writer| {
+        writer.write_all(text.as_bytes())?;
+        Ok(())
+    })?;
+    let saved = RotationKey { file, hash };
+    saved.checked_hash()?;
+    Ok(saved)
 }
 
 #[cfg(test)]
@@ -180,6 +236,9 @@ pub(crate) fn parse_key_snapshot(
     bytes: &[u8],
     passphrase: Option<&str>,
 ) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+    if crate::key_protection::is_recoverable(bytes) {
+        return crate::key_protection::open(bytes, passphrase, None);
+    }
     let text = std::str::from_utf8(bytes)
         .map_err(|_| CryptoError::InvalidKeyFile("key file is not valid text".into()))?;
     parse_key_file(path, text, passphrase)
@@ -323,6 +382,54 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn rotation_key_refuses_a_destination_created_during_publication() {
+        let dir = TempDir::new();
+        let path = dir.path.join("new.key");
+        let callback = |_| {
+            fs::write(&path, b"another application's file")?;
+            Ok(())
+        };
+        assert!(matches!(
+            create_rotation_key(&path, &[7; 32], None, Some(&callback)),
+            Err(CryptoError::OutputExists(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"another application's file");
+        assert_eq!(fs::read_dir(&dir.path).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rotation_keys_keep_the_hash_of_the_saved_bytes() {
+        let dir = TempDir::new();
+        for passphrase in [None, Some("rotation passphrase")] {
+            let path = dir.path.join(if passphrase.is_some() {
+                "protected.key"
+            } else {
+                "plain.key"
+            });
+            let key = [7; 32];
+            let saved = create_rotation_key(&path, &key, passphrase, None).unwrap();
+            assert_eq!(
+                saved.checked_hash().unwrap(),
+                checked_file_hash(&path, &key, passphrase).unwrap()
+            );
+            #[cfg(windows)]
+            {
+                assert!(fs::write(&path, b"changed").is_err());
+                assert!(fs::remove_file(&path).is_err());
+                assert_eq!(saved.checked_hash().unwrap(), saved.hash);
+            }
+            #[cfg(not(windows))]
+            {
+                let bytes = fs::read(&path).unwrap();
+                fs::write(&path, vec![b'x'; bytes.len()]).unwrap();
+                assert!(saved.checked_hash().is_err());
+            }
+            drop(saved);
+            fs::remove_file(&path).unwrap();
         }
     }
 

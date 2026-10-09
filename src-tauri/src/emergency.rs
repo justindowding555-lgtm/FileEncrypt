@@ -91,7 +91,7 @@ pub(crate) fn lock_key(state: &AppState) -> Result<(), String> {
     lock_inner(state)
 }
 
-fn unlock_key(state: &AppState, passphrase: Option<&str>) -> Result<(), String> {
+pub(crate) fn unlock_key(state: &AppState, passphrase: Option<&str>) -> Result<(), String> {
     let (revision, path) = {
         let _change = lock(&state.key_change);
         if !state.emergency_locked.load(Ordering::Acquire) {
@@ -105,12 +105,18 @@ fn unlock_key(state: &AppState, passphrase: Option<&str>) -> Result<(), String> 
             lock(&state.key_path).clone(),
         )
     };
+    let mut attempt = crate::key_protection::Attempt::begin(state)?;
+    crate::key_protection::verify_emergency_password(state, passphrase)?;
     // Read outside key_change, keeping the persistent lock until validation succeeds.
     let loaded = path
         .as_ref()
         .map(|path| {
             let bytes = key_file::read_key_snapshot(path).map_err(|_| UNAVAILABLE.to_string())?;
-            let key = key_file::parse_key_snapshot(path, &bytes, passphrase)
+            let key = key_file::parse_key_snapshot(path, &bytes, None).or_else(|error| {
+                if crate::key_protection::setup_required(state) {
+                    key_file::parse_key_snapshot(path, &bytes, passphrase)
+                } else { Err(error) }
+            })
                 .map_err(|error| error.to_string())?;
             Ok::<_, String>((key, Sha256::digest(bytes.as_slice()).into()))
         })
@@ -140,6 +146,7 @@ fn unlock_key(state: &AppState, passphrase: Option<&str>) -> Result<(), String> 
         *lock(&state.key_file_hash) = Some(hash);
     }
     commands::finish_emergency_unlock(state);
+    attempt.success();
     Ok(())
 }
 
@@ -409,6 +416,11 @@ pub(crate) fn start_shortcuts(app: tauri::AppHandle) {
 pub(crate) fn start_shortcuts(_: tauri::AppHandle) {}
 
 #[cfg(test)]
+pub(crate) fn set_test_marker(state: &AppState, path: PathBuf) {
+    lock(&state.emergency).marker = Some(path);
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::TestDir;
@@ -417,6 +429,7 @@ mod tests {
         let dir = TestDir::new();
         let state = AppState::default();
         lock(&state.emergency).marker = Some(dir.0.join("emergency.lock"));
+        crate::key_protection::set_test_access(&state, dir.0.join("access-setup.complete"), "correct passphrase");
         let path = dir.0.join("saved.key");
         key_file::write_key_file(&path, &[42; 32]).unwrap();
         commands::restore_saved_key_from_path(&state, &path);
@@ -444,9 +457,11 @@ mod tests {
             .emergency_locked
             .store(marker.try_exists().unwrap(), Ordering::Release);
         lock(&restarted.emergency).marker = Some(marker);
+        crate::key_protection::restore_setup(&restarted, dir.0.join("access-setup.complete"));
         commands::restore_saved_key_from_path(&restarted, &path);
         assert!(lock(&restarted.key).is_none());
-        unlock_key(&restarted, None).unwrap();
+        assert!(unlock_key(&restarted, None).is_err());
+        unlock_key(&restarted, Some("correct passphrase")).unwrap();
         assert!(lock(&restarted.key).is_some());
         assert!(!restarted.emergency_locked.load(Ordering::Acquire));
     }
@@ -462,10 +477,8 @@ mod tests {
     }
 
     #[test]
-    fn protected_unlock_requires_a_valid_passphrase() {
-        let (_dir, state, path) = fixture();
-        key_file::write_protected_key_file(&path, &[42; 32], "correct passphrase").unwrap();
-        commands::restore_saved_key_from_path(&state, &path);
+    fn unprotected_key_still_requires_the_emergency_password_to_unlock() {
+        let (_dir, state, _path) = fixture();
         lock_key(&state).unwrap();
         assert!(unlock_key(&state, None).is_err());
         assert!(state.emergency_locked.load(Ordering::Acquire));

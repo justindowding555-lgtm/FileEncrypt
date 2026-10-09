@@ -165,6 +165,69 @@ test("large selections stay paged and unrelated actions do not recreate rows", a
   assert.equal(ui.evaluate("state.fileSet.size"), 10000);
 });
 
+test("selection additions enforce the total limit before changing files or roots", () => {
+  const calls = [];
+  const ui = fixture(async (command) => { calls.push(command); });
+  ui.evaluate('savedSelection.ready=true; addSelectedFiles(Array.from({length:6000},(_,i)=>`C:/first/${i}.txt`))');
+  const before = calls.length;
+  assert.throws(() => ui.evaluate('addSelectedFiles({paths:["C:/first/0.txt",...Array.from({length:6000},(_,i)=>`C:/second/${i}.txt`)],roots:{"C:/first/0.txt":"C:/changed"}})'), /at most 10,000 files in total/);
+  assert.equal(ui.evaluate("state.files.length"), 6000);
+  assert.equal(ui.evaluate("state.fileSet.size"), 6000);
+  assert.equal(ui.evaluate("state.folderRoots.size"), 0);
+  assert.equal(calls.length, before);
+  ui.evaluate('addSelectedFiles(Array.from({length:4000},(_,i)=>`C:/second/${i}.txt`)); addSelectedFiles(["C:/second/0.txt","C:/second/0.txt"])');
+  assert.equal(ui.evaluate("state.files.length"), 10000);
+  assert.throws(() => ui.evaluate('addSelectedFiles(["C:/extra.txt"])'), /at most 10,000/);
+});
+
+test("partial key rotation rechecks selected files even when the old key stays loaded", async () => {
+  let rotated = false;
+  let checks = 0;
+  const status = { ...savedKeyStatus, keyRevision: 1 };
+  const ui = fixture(async (command, args) => {
+    if (command === "get_status") return status;
+    if (command === "restore_selected_files") return { paths: [], roots: {} };
+    if (command === "verify_selected_files") {
+      checks++;
+      return args.paths.map((input) => ({ input, state: rotated && input === "C:/first.fenc" ? "failed" : "verified", complete: true }));
+    }
+    if (command === "rotate_key") {
+      rotated = true;
+      return { results: [{ input: "C:/first.fenc", output: "C:/rotated.fenc", ok: true }, { input: "C:/second.fenc", ok: false }], status, newKeyPath: "C:/new.key", notice: "Rotation was incomplete. New key file: C:/new.key." };
+    }
+  }, "main", true);
+  await ui.evaluate("init()");
+  ui.evaluate('addSelectedFiles(["C:/first.fenc","C:/second.fenc"])');
+  await settle();
+  assert.equal(checks, 1);
+  assert.equal(ui.evaluate('fileVerification.entries.get("C:/first.fenc").state'), "verified");
+  await ui.refs.get("rotate-key").handlers.get("click")();
+  await settle();
+  assert.equal(checks, 2);
+  assert.equal(ui.evaluate('fileVerification.entries.get("C:/first.fenc").state'), "failed");
+  assert.equal(ui.evaluate('fileVerification.entries.get("C:/second.fenc").state'), "verified");
+  assert.equal(ui.evaluate("state.results.length"), 2);
+  assert.match(ui.refs.get("alert").textContent, /C:\/new\.key/);
+});
+
+test("rotation reports preserve recovery instructions during emergency lock", async () => {
+  const ui = fixture(async (command) => {
+    if (command === "get_status") return { ...savedKeyStatus, keyRevision: 1 };
+    if (command === "restore_selected_files") return { paths: [], roots: {} };
+    if (command === "rotate_key") return {
+      results: [{ input: "C:/first.fenc", output: "C:/rotated.fenc", ok: true }],
+      status: { ...savedKeyStatus, keyRevision: 2, keyLoaded: false, emergencyLocked: true, message: "Unable to read the saved key." },
+      newKeyPath: "C:/new.key", notice: "Files were rotated, but the new key could not be activated. New key file: C:/new.key.",
+    };
+  });
+  await ui.evaluate("init()");
+  ui.evaluate('addSelectedFiles(["C:/first.fenc"])');
+  await ui.refs.get("rotate-key").handlers.get("click")();
+  assert.equal(ui.evaluate("state.results.length"), 1);
+  assert.equal(ui.refs.get("startup-key-dialog").open, true);
+  assert.match(ui.refs.get("key-recovery-alert").textContent, /New key file: C:\/new\.key/);
+});
+
 test("removing a file on a later page updates the correct selection", () => {
   const ui = fixture();
   ui.evaluate('addSelectedFiles(Array.from({length:250},(_,i)=>`C:/folder/${i}.txt`))');
@@ -1619,6 +1682,406 @@ test("key loss events clear a native preview immediately instead of waiting for 
   assert.equal(ui.timers.size, 0);
   const closed = calls.find(({ command }) => command === "close_sandbox_preview");
   assert.equal(closed.args.locked, true);
+});
+
+test("key protection clears entered secrets and waits for recovery-code acknowledgement before saving", async () => {
+  const calls = [];
+  const ui = fixture(async (command, args) => {
+    calls.push({ command, args: { ...args } });
+    if (command === "get_status") return savedKeyStatus;
+    if (command === "prepare_key_protection") return { token: "setup-1", recoveryCode: "FE-R1-example", keyPath: savedKeyStatus.keyPath };
+    if (command === "commit_key_protection") return { ...savedKeyStatus, keyRevision: 1 };
+  });
+  await ui.evaluate("init()");
+  ui.evaluate("openKeyOptions()");
+  ui.evaluate('document.getElementById("key-passphrase").value="current reference"');
+  ui.refs.get("new-key-passphrase").value = "a long new reference";
+  ui.refs.get("confirm-key-passphrase").value = "a long new reference";
+  await ui.evaluate("prepareKeyProtection()");
+  const prepared = calls.find(({ command }) => command === "prepare_key_protection");
+  assert.equal(prepared.args.passphrase, "current reference");
+  assert.equal(prepared.args.newPassphrase, "a long new reference");
+  assert.equal(prepared.args.recoveryCode, null);
+  for (const id of ["key-passphrase", "new-key-passphrase", "confirm-key-passphrase"]) assert.equal(ui.refs.get(id).value, "");
+  assert.equal(ui.refs.get("new-recovery-code").value, "FE-R1-example");
+  assert.equal(ui.refs.get("commit-key-protection").disabled, true);
+  await ui.evaluate("commitKeyProtection()");
+  assert.equal(calls.some(({ command }) => command === "commit_key_protection"), false);
+  ui.refs.get("recovery-code-saved").checked = true;
+  ui.refs.get("recovery-code-saved").handlers.get("change")();
+  assert.equal(ui.refs.get("commit-key-protection").disabled, false);
+  await ui.evaluate("commitKeyProtection()");
+  assert.equal(ui.refs.get("new-recovery-code").value, "");
+  assert.equal(ui.refs.get("access-recovery-result").hidden, true);
+  assert.equal(ui.evaluate("keyProtection.token"), null);
+  assert.equal(calls.find(({ command }) => command === "commit_key_protection").args.recoverySaved, true);
+});
+
+test("closing Key options cancels a prepared setup and clears its recovery code", async () => {
+  const calls = [];
+  const ui = fixture(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "get_status") return savedKeyStatus;
+    if (command === "prepare_key_protection") return { token: "cancel-me", recoveryCode: "FE-R1-example" };
+  });
+  await ui.evaluate("init()");
+  ui.evaluate("openKeyOptions()");
+  ui.refs.get("new-key-passphrase").value = "a long new reference";
+  ui.refs.get("confirm-key-passphrase").value = "a long new reference";
+  await ui.evaluate("prepareKeyProtection()");
+  ui.refs.get("key-dialog").close();
+  assert.equal(ui.refs.get("new-recovery-code").value, "");
+  assert.equal(ui.evaluate("keyProtection.token"), null);
+  assert.equal(calls.find(({ command }) => command === "cancel_key_protection").args.token, "cancel-me");
+});
+
+test("late protection setup cannot reveal a recovery code after closing its dialog", async () => {
+  let finish;
+  const calls = [];
+  const ui = fixture(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "get_status") return savedKeyStatus;
+    if (command === "prepare_key_protection") return new Promise((resolve) => { finish = resolve; });
+  });
+  await ui.evaluate("init()");
+  ui.evaluate("openKeyOptions()");
+  ui.refs.get("new-key-passphrase").value = "a long new reference";
+  ui.refs.get("confirm-key-passphrase").value = "a long new reference";
+  const pending = ui.evaluate("prepareKeyProtection()");
+  ui.refs.get("key-dialog").close();
+  finish({ token: "late-setup", recoveryCode: "FE-R1-example" });
+  await pending;
+  assert.equal(ui.refs.get("new-recovery-code").value, "");
+  assert.equal(ui.evaluate("keyProtection.token"), null);
+  assert.equal(calls.find(({ command }) => command === "cancel_key_protection").args.token, "late-setup");
+});
+
+test("recovery submits the saved code and new reference while leaving emergency lock active", async () => {
+  const calls = [];
+  const locked = { ...savedKeyStatus, keyLoaded: false, emergencyLocked: true, keyRevision: 1 };
+  const ui = fixture(async (command, args) => {
+    calls.push({ command, args: { ...args } });
+    if (command === "get_status") return locked;
+    if (command === "prepare_key_protection") return { token: "recovery", recoveryCode: "FE-R1-replacement" };
+    if (command === "commit_key_protection") return { ...locked, keyRevision: 2 };
+  });
+  await ui.evaluate("init()");
+  ui.refs.get("choose-recovery-key").handlers.get("click")();
+  ui.evaluate("openKeyOptions()");
+  ui.refs.get("new-key-passphrase").value = "a long new reference";
+  ui.refs.get("confirm-key-passphrase").value = "a long new reference";
+  ui.refs.get("key-recovery-code").value = "FE-R1-saved";
+  await ui.evaluate("prepareKeyProtection(true)");
+  assert.equal(ui.refs.get("key-recovery-code").value, "");
+  assert.equal(calls.find(({ command }) => command === "prepare_key_protection").args.recoveryCode, "FE-R1-saved");
+  ui.refs.get("recovery-code-saved").checked = true;
+  await ui.evaluate("commitKeyProtection()");
+  assert.equal(ui.evaluate("state.emergencyLocked"), true);
+  assert.equal(ui.evaluate("state.keyLoaded"), false);
+  assert.match(ui.refs.get("key-protection-status").textContent, /unlock shortcut/);
+});
+
+test("routine status updates do not erase a reference being entered during emergency lock", async () => {
+  const locked = { ...savedKeyStatus, keyLoaded: false, emergencyLocked: true, keyRevision: 1 };
+  const ui = fixture(async (command) => command === "get_status" ? locked : undefined);
+  await ui.evaluate("init()");
+  ui.refs.get("key-passphrase").value = "typing my reference";
+  ui.events.get("key-status-changed")({ payload: locked });
+  assert.equal(ui.refs.get("key-passphrase").value, "typing my reference");
+  ui.events.get("key-status-changed")({ payload: { ...locked, keyRevision: 2 } });
+  assert.equal(ui.refs.get("key-passphrase").value, "");
+});
+
+test("failed protection publication preserves the displayed recovery code", async () => {
+  const ui = fixture(async (command) => {
+    if (command === "get_status") return savedKeyStatus;
+    if (command === "prepare_key_protection") return { token: "uncertain", recoveryCode: "FE-R1-keep-this" };
+    if (command === "commit_key_protection") throw "Key publication could not be verified. Keep the recovery code.";
+  });
+  await ui.evaluate("init()");
+  ui.evaluate("openKeyOptions()");
+  ui.refs.get("new-key-passphrase").value = "a long new reference";
+  ui.refs.get("confirm-key-passphrase").value = "a long new reference";
+  await ui.evaluate("prepareKeyProtection()");
+  ui.refs.get("recovery-code-saved").checked = true;
+  await ui.evaluate("commitKeyProtection()");
+  assert.equal(ui.refs.get("new-recovery-code").value, "FE-R1-keep-this");
+  assert.equal(ui.refs.get("access-recovery-result").hidden, false);
+});
+
+test("first launch requires a reference and saved recovery code before opening the workspace", async () => {
+  const calls = [];
+  const firstLaunch = { keyLoaded: false, keyPath: null, accessSetupRequired: true, accessSetupKeyPath: "C:/profile/workspace.key", keyRevision: 0 };
+  const completed = { ...savedKeyStatus, keyPath: firstLaunch.accessSetupKeyPath, accessSetupRequired: false, keyRevision: 1 };
+  const ui = fixture(async (command, args) => {
+    calls.push({ command, args: { ...args } });
+    if (command === "get_status") return firstLaunch;
+    if (command === "prepare_first_run") return { token: "first-run", recoveryCode: "FE-R1-first", keyPath: firstLaunch.accessSetupKeyPath };
+    if (command === "commit_key_protection") return completed;
+  });
+  await ui.evaluate("init()");
+  assert.equal(ui.refs.get("key-dialog").open, true);
+  assert.equal(ui.refs.get("key-dialog-heading").textContent, "Create your password");
+  assert.equal(ui.refs.get("new-reference-label").textContent, "Password");
+  assert.equal(ui.refs.get("confirm-reference-label").textContent, "Confirm password");
+  assert.equal(ui.refs.get("current-reference-field").hidden, true);
+  assert.equal(ui.refs.get("key-location-field").hidden, true);
+  assert.equal(ui.refs.get("new-key-passphrase"), ui.evaluate("document.activeElement"));
+  assert.equal(ui.refs.get("key-path").value, firstLaunch.accessSetupKeyPath);
+  assert.equal(ui.refs.get("close-key-options").hidden, true);
+  assert.equal(ui.refs.get("prepare-key-protection").disabled, false);
+  assert.equal(ui.evaluate("selectionBlocked()"), true);
+  let prevented = false;
+  ui.refs.get("key-dialog").handlers.get("cancel")({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  ui.refs.get("key-dialog").close();
+  assert.equal(ui.refs.get("key-dialog").open, true);
+  ui.refs.get("new-key-passphrase").value = "first long reference";
+  ui.refs.get("confirm-key-passphrase").value = "first long reference";
+  await ui.evaluate("prepareKeyProtection()");
+  assert.equal(ui.refs.get("key-dialog-heading").textContent, "Save your recovery code");
+  assert.equal(ui.refs.get("access-fields").hidden, true);
+  assert.equal(calls.find(({ command }) => command === "prepare_first_run").args.path, firstLaunch.accessSetupKeyPath);
+  assert.equal(ui.refs.get("new-key-passphrase").value, "");
+  await ui.evaluate("commitKeyProtection()");
+  assert.equal(calls.some(({ command }) => command === "commit_key_protection"), false);
+  ui.refs.get("recovery-code-saved").checked = true;
+  await ui.evaluate("commitKeyProtection()");
+  assert.equal(calls.find(({ command }) => command === "commit_key_protection").args.activationCode, "FE-R1-first");
+  assert.equal(ui.evaluate("state.accessSetupRequired"), false);
+  assert.equal(ui.evaluate("state.keyLoaded"), true);
+  assert.equal(ui.refs.get("key-dialog").open, false);
+  assert.equal(ui.refs.get("new-recovery-code").value, "");
+});
+
+test("slow password preparation shows activity and rejects duplicate submissions", async () => {
+  let finish;
+  let preparations = 0;
+  const firstLaunch = { keyLoaded: false, accessSetupRequired: true, accessSetupKeyPath: "C:/profile/workspace.key", keyRevision: 0 };
+  const ui = fixture(async (command) => {
+    if (command === "get_status") return firstLaunch;
+    if (command === "prepare_first_run") {
+      preparations++;
+      return new Promise((resolve) => { finish = resolve; });
+    }
+  });
+  await ui.evaluate("init()");
+  ui.refs.get("new-key-passphrase").value = "first long password";
+  ui.refs.get("confirm-key-passphrase").value = "first long password";
+  const pending = ui.evaluate("prepareKeyProtection()");
+  assert.equal(ui.refs.get("key-protection-loading").hidden, false);
+  assert.equal(ui.refs.get("key-protection-loading-title").textContent, "Preparing emergency access…");
+  assert.equal(ui.refs.get("access-fields").hidden, true);
+  assert.equal(ui.refs.get("prepare-key-protection").disabled, true);
+  ui.events.get("key-status-changed")({ payload: firstLaunch });
+  assert.equal(ui.refs.get("key-protection-loading").hidden, false);
+  await ui.evaluate("prepareKeyProtection()");
+  assert.equal(preparations, 1);
+  finish({ token: "slow-setup", recoveryCode: "FE-R1-example" });
+  await pending;
+  assert.equal(ui.refs.get("key-protection-loading").hidden, true);
+  assert.equal(ui.refs.get("access-recovery-result").hidden, false);
+  assert.equal(ui.refs.get("new-recovery-code").value, "FE-R1-example");
+});
+
+test("password preparation failure removes activity and allows a retry", async () => {
+  let fail;
+  const firstLaunch = { keyLoaded: false, accessSetupRequired: true, accessSetupKeyPath: "C:/profile/workspace.key", keyRevision: 0 };
+  const ui = fixture(async (command) => {
+    if (command === "get_status") return firstLaunch;
+    if (command === "prepare_first_run") return new Promise((resolve, reject) => { fail = reject; });
+  });
+  await ui.evaluate("init()");
+  ui.refs.get("new-key-passphrase").value = "first long password";
+  ui.refs.get("confirm-key-passphrase").value = "first long password";
+  const pending = ui.evaluate("prepareKeyProtection()");
+  fail("The selected key file is unavailable.");
+  await pending;
+  assert.equal(ui.refs.get("key-protection-loading").hidden, true);
+  assert.equal(ui.refs.get("access-fields").hidden, false);
+  assert.equal(ui.refs.get("prepare-key-protection").disabled, false);
+  assert.equal(ui.refs.get("new-key-passphrase").disabled, false);
+  assert.match(ui.refs.get("key-dialog-alert").textContent, /unavailable/);
+  assert.equal(ui.evaluate("state.busy"), false);
+});
+
+test("slow or failed setup saving keeps the recovery code and prevents duplicate writes", async () => {
+  let fail;
+  let commits = 0;
+  const ui = fixture(async (command) => {
+    if (command === "get_status") return savedKeyStatus;
+    if (command === "prepare_key_protection") return { token: "saving", recoveryCode: "FE-R1-keep-this" };
+    if (command === "commit_key_protection") {
+      commits++;
+      return new Promise((resolve, reject) => { fail = reject; });
+    }
+  });
+  await ui.evaluate("init()");
+  ui.evaluate("openKeyOptions()");
+  ui.refs.get("new-key-passphrase").value = "a long new reference";
+  ui.refs.get("confirm-key-passphrase").value = "a long new reference";
+  await ui.evaluate("prepareKeyProtection()");
+  ui.refs.get("recovery-code-saved").checked = true;
+  const pending = ui.evaluate("commitKeyProtection()");
+  assert.equal(ui.refs.get("key-protection-loading").hidden, false);
+  assert.equal(ui.refs.get("key-protection-loading-title").textContent, "Saving emergency access…");
+  assert.equal(ui.refs.get("commit-key-protection").disabled, true);
+  assert.equal(ui.refs.get("cancel-key-protection").disabled, true);
+  assert.equal(ui.refs.get("recovery-code-saved").disabled, true);
+  assert.equal(ui.refs.get("new-recovery-code").value, "FE-R1-keep-this");
+  await ui.evaluate("commitKeyProtection()");
+  assert.equal(commits, 1);
+  fail("Key publication could not be verified. Keep the recovery code.");
+  await pending;
+  assert.equal(ui.refs.get("key-protection-loading").hidden, true);
+  assert.equal(ui.refs.get("new-recovery-code").value, "FE-R1-keep-this");
+  assert.equal(ui.refs.get("cancel-key-protection").disabled, false);
+  assert.equal(ui.refs.get("recovery-code-saved").disabled, false);
+});
+
+test("existing dev users are prompted while completed profiles do not repeat first-launch setup", async () => {
+  const existing = { ...savedKeyStatus, accessSetupRequired: true, accessSetupKeyPath: savedKeyStatus.keyPath };
+  const ui = fixture(async (command) => command === "get_status" ? existing : undefined);
+  await ui.evaluate("init()");
+  assert.equal(ui.refs.get("key-dialog").open, true);
+  assert.equal(ui.refs.get("key-path").readOnly, true);
+  assert.equal(ui.refs.get("set-path").disabled, true);
+  const completed = fixture(async (command) => command === "get_status" ? { ...savedKeyStatus, accessSetupRequired: false } : undefined);
+  await completed.evaluate("init()");
+  assert.notEqual(completed.refs.get("key-dialog").open, true);
+  assert.equal(completed.evaluate("state.accessSetupRequired"), false);
+});
+
+test("routine first-launch status checks preserve the reference and chosen location", async () => {
+  const firstLaunch = { keyLoaded: false, accessSetupRequired: true, accessSetupKeyPath: "C:/profile/workspace.key", keyRevision: 0 };
+  const ui = fixture(async (command) => command === "get_status" ? firstLaunch : undefined);
+  await ui.evaluate("init()");
+  ui.refs.get("new-key-passphrase").value = "my first reference";
+  ui.refs.get("first-run-key-path").value = "D:/my-key.key";
+  ui.events.get("key-status-changed")({ payload: firstLaunch });
+  assert.equal(ui.refs.get("new-key-passphrase").value, "my first reference");
+  assert.equal(ui.refs.get("first-run-key-path").value, "D:/my-key.key");
+});
+
+test("legacy setup reuses one emergency password without a separate key-password field", async () => {
+  const firstLaunch = { ...savedKeyStatus, accessSetupRequired: true, accessSetupRequiresCurrentReference: true };
+  const ui = fixture(async (command) => command === "get_status" ? firstLaunch : undefined);
+  await ui.evaluate("init()");
+  assert.equal(ui.refs.get("current-reference-field").hidden, true);
+  assert.match(ui.refs.get("new-reference-hint").textContent, /only have its recovery code/);
+  assert.equal(ui.refs.get("new-reference-label").textContent, "Password");
+  assert.equal(ui.refs.get("key-location-field").hidden, true);
+  assert.equal(ui.refs.get("first-run-location").hidden, true);
+  assert.equal(ui.refs.get("key-dialog-heading").textContent, "Update emergency access");
+});
+
+test("recovery-only legacy setup guides entry of a new password and the saved code", async () => {
+  let prepared;
+  const legacy = { ...savedKeyStatus, keyLoaded: false, accessSetupRequired: true, accessSetupRequiresCurrentReference: true };
+  const ui = fixture(async (command, args) => {
+    if (command === "get_status") return legacy;
+    if (command === "prepare_first_run") { prepared = { ...args }; return { token: "recovered-migration", recoveryCode: "FE-R1-replacement", migrationBackupPath: "D:/original-key-backup.key" }; }
+  });
+  await ui.evaluate("init()");
+  ui.refs.get("access-recovery").open = true;
+  ui.refs.get("access-recovery").handlers.get("toggle")();
+  assert.equal(ui.refs.get("new-reference-label").textContent, "New password");
+  assert.equal(ui.refs.get("prepare-key-protection").hidden, true);
+  assert.equal(ui.refs.get("recover-key-protection").textContent, "Set new emergency password");
+  assert.equal(ui.refs.get("confirm-reference-label").textContent, "Confirm new password");
+  ui.refs.get("new-key-passphrase").value = "a new emergency password";
+  ui.refs.get("confirm-key-passphrase").value = "a new emergency password";
+  ui.refs.get("key-recovery-code").value = "FE-R1-previous";
+  await ui.evaluate("prepareKeyProtection(true)");
+  assert.equal(prepared.passphrase, "");
+  assert.equal(prepared.newPassphrase, "a new emergency password");
+  assert.equal(prepared.recoveryCode, "FE-R1-previous");
+  assert.match(ui.refs.get("key-protection-status").textContent, /exact backup at D:\/original-key-backup.key/);
+  assert.equal(ui.refs.get("key-dialog-heading").textContent, "Save your recovery code");
+});
+
+test("recovery validation identifies missing new-password fields without losing the saved code", async () => {
+  const calls = [];
+  const legacy = { ...savedKeyStatus, keyLoaded: false, accessSetupRequired: true, accessSetupRequiresCurrentReference: true };
+  const ui = fixture(async (command, args) => {
+    if (command === "get_status") return legacy;
+    if (command === "prepare_first_run") { calls.push({ ...args }); return { token: "recovered", recoveryCode: "FE-R1-replacement" }; }
+  });
+  await ui.evaluate("init()");
+  ui.refs.get("access-recovery").open = true;
+  ui.refs.get("access-recovery").handlers.get("toggle")();
+  assert.equal(ui.refs.get("key-recovery-code"), ui.evaluate("document.activeElement"));
+  assert.equal(ui.refs.get("key-dialog-alert").hidden, true);
+  await ui.refs.get("recover-key-protection").handlers.get("click")();
+  assert.equal(ui.refs.get("key-dialog-alert").textContent, "Enter your saved recovery code.");
+  ui.refs.get("key-recovery-code").value = "FE-R1-saved";
+  await ui.refs.get("recover-key-protection").handlers.get("click")();
+  assert.match(ui.refs.get("key-dialog-alert").textContent, /Choose a new emergency password/);
+  assert.equal(ui.refs.get("new-key-passphrase"), ui.evaluate("document.activeElement"));
+  assert.equal(ui.refs.get("key-recovery-code").value, "FE-R1-saved");
+  ui.refs.get("new-key-passphrase").value = "my new emergency password";
+  await ui.refs.get("recover-key-protection").handlers.get("click")();
+  assert.equal(ui.refs.get("key-dialog-alert").textContent, "Enter the same new password in Confirm new password.");
+  assert.equal(ui.refs.get("confirm-key-passphrase"), ui.evaluate("document.activeElement"));
+  assert.equal(ui.refs.get("new-key-passphrase").value, "my new emergency password");
+  assert.equal(ui.refs.get("key-recovery-code").value, "FE-R1-saved");
+  assert.equal(calls.length, 0);
+  ui.refs.get("confirm-key-passphrase").value = "my new emergency password";
+  await ui.refs.get("recover-key-protection").handlers.get("click")();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].passphrase, "");
+  assert.equal(calls[0].recoveryCode, "FE-R1-saved");
+  assert.equal(ui.refs.get("new-recovery-code").value, "FE-R1-replacement");
+});
+
+test("ordinary key actions never use the emergency reference to protect or load a file key", async () => {
+  const calls = [];
+  const ui = fixture(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "get_status" || ["generate_key", "load_key", "browse_key"].includes(command)) return savedKeyStatus;
+  });
+  await ui.evaluate("init()");
+  for (const [button, command] of [["generate", "generate_key"], ["load", "load_key"], ["browse-load", "browse_key"]]) {
+    ui.evaluate("openKeyOptions()");
+    ui.refs.get("key-passphrase").value = "my emergency password";
+    ui.refs.get(button).handlers.get("click")();
+    await settle();
+    assert.equal(calls.find((call) => call.command === command).args?.passphrase, undefined);
+  }
+});
+
+test("legacy recovery while locked uses first setup without a second password", async () => {
+  let prepared;
+  const locked = { ...savedKeyStatus, keyLoaded: false, emergencyLocked: true, accessSetupRequired: true, accessSetupRequiresCurrentReference: true };
+  const ui = fixture(async (command, args) => {
+    if (command === "get_status") return locked;
+    if (command === "prepare_first_run") { prepared = { ...args }; return { token: "migration", recoveryCode: "replacement" }; }
+  });
+  await ui.evaluate("init()");
+  ui.evaluate("openKeyOptions()");
+  ui.refs.get("new-key-passphrase").value = "a new emergency password";
+  ui.refs.get("confirm-key-passphrase").value = "a new emergency password";
+  ui.refs.get("key-recovery-code").value = "FE-R1-legacy-code";
+  await ui.evaluate("prepareKeyProtection(true)");
+  assert.equal(prepared.path, savedKeyStatus.keyPath);
+  assert.equal(prepared.passphrase, "");
+  assert.equal(prepared.recoveryCode, "FE-R1-legacy-code");
+  assert.equal(ui.evaluate("state.emergencyLocked"), true);
+});
+
+test("a password mismatch keeps first-launch input available to correct without submitting", async () => {
+  const calls = [];
+  const firstLaunch = { keyLoaded: false, accessSetupRequired: true, accessSetupKeyPath: "C:/profile/workspace.key" };
+  const ui = fixture(async (command) => { calls.push(command); if (command === "get_status") return firstLaunch; });
+  await ui.evaluate("init()");
+  ui.refs.get("new-key-passphrase").value = "first long password";
+  ui.refs.get("confirm-key-passphrase").value = "different password";
+  await ui.evaluate("prepareKeyProtection()");
+  assert.equal(calls.includes("prepare_first_run"), false);
+  assert.equal(ui.refs.get("new-key-passphrase").value, "first long password");
+  assert.equal(ui.refs.get("confirm-key-passphrase").value, "different password");
+  assert.match(ui.refs.get("key-dialog-alert").textContent, /matching passwords/);
+  assert.equal(ui.refs.get("key-dialog").open, true);
 });
 
 test("manually closing a preview does not request key recovery", async () => {

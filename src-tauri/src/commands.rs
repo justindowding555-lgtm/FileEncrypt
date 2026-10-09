@@ -31,6 +31,7 @@ pub struct AppState {
     pub(crate) emergency_locked: AtomicBool,
     pub(crate) emergency_delete_held: AtomicBool,
     pub(crate) emergency: Mutex<crate::emergency::Controls>,
+    pub(crate) protection: Mutex<crate::key_protection::Session>,
     pub(crate) sandbox: Mutex<crate::sandbox::Registry>,
     output_dir: Mutex<Option<PathBuf>>,
     message: Mutex<String>,
@@ -51,6 +52,7 @@ impl Default for AppState {
             emergency_locked: AtomicBool::new(false),
             emergency_delete_held: AtomicBool::new(false),
             emergency: Mutex::new(crate::emergency::Controls::default()),
+            protection: Mutex::new(crate::key_protection::Session::default()),
             sandbox: Mutex::new(crate::sandbox::Registry::default()),
             output_dir: Mutex::new(None),
             message: Mutex::new(String::new()),
@@ -65,6 +67,10 @@ impl Default for AppState {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppStatus {
+    access_setup_required: bool,
+    access_setup_is_upgrade: bool,
+    access_setup_key_path: Option<String>,
+    access_setup_requires_current_reference: bool,
     emergency_locked: bool,
     emergency_deletion_armed: bool,
     emergency_deletion_path: Option<String>,
@@ -94,9 +100,12 @@ pub struct FileOutcome {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RotationReport {
     results: Vec<FileOutcome>,
     status: AppStatus,
+    new_key_path: String,
+    notice: Option<String>,
 }
 
 const UPDATE_URL: &str =
@@ -468,6 +477,7 @@ fn restore_saved_settings(state: &AppState, settings: Settings) {
 
 pub(crate) fn restore_saved_key_from_path(state: &AppState, path: &Path) {
     let _key_change = lock(&state.key_change);
+    crate::key_protection::cancel(state);
     state.key_revision.fetch_add(1, Ordering::AcqRel);
     state
         .startup_key_unavailable
@@ -481,6 +491,7 @@ pub(crate) fn restore_saved_key_from_path(state: &AppState, path: &Path) {
         return;
     }
     match key_file::read_key_snapshot(path).and_then(|bytes| {
+        crate::key_protection::observe_key_file(state, &bytes);
         let key = key_file::parse_key_snapshot(path, &bytes, None)?;
         use sha2::Digest;
         Ok((key, sha2::Sha256::digest(bytes.as_slice()).into()))
@@ -500,7 +511,11 @@ pub(crate) fn restore_saved_key_from_path(state: &AppState, path: &Path) {
                 );
                 return;
             }
-            set_message(state, format!("Could not load the saved key: {err}"));
+            if crate::key_protection::setup_required(state) && crate::key_protection::needs_current_reference(state) {
+                set_message(state, "Update emergency access setup with your existing password to restore automatic key loading.");
+            } else {
+                set_message(state, format!("Could not load the saved key: {err}"));
+            }
         }
     }
 }
@@ -615,6 +630,7 @@ fn finish_key_file_check(
 // Caller holds key_change. Keep only the non-secret file digest on disconnect
 // so reconnecting a different file at the same path cannot silently switch keys.
 pub(crate) fn deactivate_file_key(state: &AppState, disconnected: bool, message: String) {
+    crate::key_protection::cancel(state);
     crate::sandbox::revoke(state);
     *lock(&state.key) = None;
     if !disconnected {
@@ -899,6 +915,7 @@ fn activate_session_key(
 ) -> Result<(), String> {
     let _key_change = lock(&state.key_change);
     crate::emergency::ensure_unlocked(state)?;
+    crate::key_protection::cancel(state);
     // Remember only preferences and clear the old file path before activating
     // this key, so a later launch cannot silently restore a previous file key.
     let settings = Settings {
@@ -1084,6 +1101,7 @@ pub fn unload_key(state: tauri::State<'_, AppState>) -> AppStatus {
 
 fn unload_key_from_memory(state: &AppState) {
     let _key_change = lock(&state.key_change);
+    crate::key_protection::cancel(state);
     lock(&state.emergency).disarm();
     crate::sandbox::revoke(state);
     *lock(&state.key) = None;
@@ -1097,6 +1115,7 @@ fn unload_key_from_memory(state: &AppState) {
 
 pub fn clear_key_on_close(state: &AppState) {
     let _key_change = lock(&state.key_change);
+    crate::key_protection::cancel(state);
     lock(&state.emergency).disarm();
     crate::sandbox::revoke(state);
     state.cancelled.store(true, Ordering::Release);
@@ -1183,30 +1202,51 @@ pub async fn rotate_key(
     };
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        if state.running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        if state
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
             return Err("A job is already running.".into());
         }
         struct Running<'a>(&'a AppState);
         impl Drop for Running<'_> {
-            fn drop(&mut self) { self.0.running.store(false, Ordering::Release); }
+            fn drop(&mut self) {
+                self.0.running.store(false, Ordering::Release);
+            }
         }
         let _running = Running(&state);
         state.cancelled.store(false, Ordering::Release);
         let verifier = app.state::<crate::verification::VerificationState>();
         let _verification = lock(&verifier.work);
-        let old_key = lock(&state.key).clone().ok_or("Load the current key first.")?;
+        crate::emergency::ensure_unlocked(&state)?;
+        let old_key = lock(&state.key)
+            .clone()
+            .ok_or("Load the current key first.")?;
         let old_path = lock(&state.key_path).clone();
-        if new_path.exists() || old_path.as_ref().is_some_and(|path| comparison_path(&new_path) == comparison_path(path))
-            || paths.iter().any(|path| comparison_path(Path::new(path)) == comparison_path(&new_path)) {
-            return Err("Choose a new key-file path that does not exist or overlap an input.".into());
+        if new_path.exists()
+            || old_path
+                .as_ref()
+                .is_some_and(|path| comparison_path(&new_path) == comparison_path(path))
+            || paths
+                .iter()
+                .any(|path| comparison_path(Path::new(path)) == comparison_path(&new_path))
+        {
+            return Err(
+                "Choose a new key-file path that does not exist or overlap an input.".into(),
+            );
         }
         let dir = output_directory(&output_dir)?;
-        if dir.as_ref().is_some_and(|dir| comparison_path(dir) == comparison_path(&new_path)) {
+        if dir
+            .as_ref()
+            .is_some_and(|dir| comparison_path(dir) == comparison_path(&new_path))
+        {
             return Err("The key-file path cannot be the output folder.".into());
         }
         let mut seen = HashSet::new();
         let mut total = 0u64;
         for path in &paths {
+            check_rotation(&state, None).map_err(|err| err.to_string())?;
             let input = Path::new(path);
             if !seen.insert(comparison_path(input)) {
                 return Err("The same input was selected more than once.".into());
@@ -1214,69 +1254,155 @@ pub async fn rotate_key(
             file_guard::regular(&fs::symlink_metadata(input).map_err(|error| error.to_string())?)
                 .map_err(|error| format!("{}: {error}", input.display()))?;
             let meta = fs::metadata(input).map_err(|err| err.to_string())?;
-            if !meta.is_file() { return Err(format!("Not a file: {}", input.display())); }
-            if input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
+            if !meta.is_file() {
+                return Err(format!("Not a file: {}", input.display()));
+            }
+            if input
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+            {
                 let entries = archive_read::entries(input).map_err(|err| err.to_string())?;
-                archive_read::inspect_names(input, &old_key, &entries).map_err(|err| err.to_string())?;
-                total = entries.iter().fold(total,|sum,entry|sum.saturating_add(entry.size));
+                archive_read::inspect_names(input, &old_key, &entries)
+                    .map_err(|err| err.to_string())?;
+                total = entries
+                    .iter()
+                    .fold(total, |sum, entry| sum.saturating_add(entry.size));
             } else {
                 crypto::inspect_output_name(&old_key, input).map_err(|err| err.to_string())?;
                 total = total.saturating_add(meta.len());
             }
         }
         let new_key = key_file::generate_key();
-        let written = if let Some(value) = passphrase.as_deref().filter(|value| !value.is_empty()) {
-            key_file::write_protected_key_file(&new_path, &new_key, value)
-        } else { key_file::write_key_file(&new_path, &new_key) };
-        written.map_err(|err| err.to_string())?;
+        let key_progress = |_| check_rotation(&state, None);
+        let saved_key = key_file::create_rotation_key(
+            &new_path,
+            &new_key,
+            passphrase.as_deref().map(String::as_str),
+            Some(&key_progress),
+        )
+        .map_err(|err| err.to_string())?;
         let options = JobOptions {
-            overwrite: false, remove_original, key_file: old_path, output_dir: dir,
+            overwrite: false,
+            remove_original,
+            key_file: old_path,
+            output_dir: dir,
         };
         let processed = AtomicU64::new(0);
-        let last_emit=Mutex::new(Instant::now()-Duration::from_secs(1));
+        let last_emit = Mutex::new(Instant::now() - Duration::from_secs(1));
         let mut results = Vec::with_capacity(paths.len());
         let batch = DeletionBatch::new(&state);
         for (index, path) in paths.into_iter().enumerate() {
-            if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire) { break; }
+            if state.cancelled.load(Ordering::Acquire)
+                || state.emergency_locked.load(Ordering::Acquire)
+            {
+                break;
+            }
             let input = PathBuf::from(&path);
-            *lock(&last_emit)=Instant::now()-Duration::from_secs(1);
+            *lock(&last_emit) = Instant::now() - Duration::from_secs(1);
             let progress = |bytes: u64| -> io::Result<()> {
-                if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire) {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"));
-                }
-                let done = processed.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
-                let mut last=lock(&last_emit);
-                if last.elapsed()>=Duration::from_millis(80) {
-                    let _ = app.emit("job-progress", JobProgress {
-                        processed_bytes: done, total_bytes: total, current_file: path.clone(),
-                        file_index: index + 1, file_count: seen.len(), stage: "Rotating key".into(),
-                    });
-                    *last=Instant::now();
+                check_rotation(&state, Some(&saved_key))?;
+                let done = processed
+                    .fetch_add(bytes, Ordering::Relaxed)
+                    .saturating_add(bytes);
+                let mut last = lock(&last_emit);
+                if last.elapsed() >= Duration::from_millis(80) {
+                    let _ = app.emit(
+                        "job-progress",
+                        JobProgress {
+                            processed_bytes: done,
+                            total_bytes: total,
+                            current_file: path.clone(),
+                            file_index: index + 1,
+                            file_count: seen.len(),
+                            stage: "Rotating key".into(),
+                        },
+                    );
+                    *last = Instant::now();
                 }
                 Ok(())
             };
-            let rotated = if input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
-                archive::rotate_zip_with_deletion(&old_key, &new_key, &input, &options, Some(&progress))
+            let rotated = if input
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+            {
+                archive::rotate_zip_with_deletion(
+                    &old_key,
+                    &new_key,
+                    &input,
+                    &options,
+                    Some(&progress),
+                )
             } else {
-                crypto::rotate_file_with_deletion(&old_key, &new_key, &input, &options, Some(&progress))
+                crypto::rotate_file_with_deletion(
+                    &old_key,
+                    &new_key,
+                    &input,
+                    &options,
+                    Some(&progress),
+                )
             };
-            let _=app.emit("job-progress",JobProgress{processed_bytes:processed.load(Ordering::Relaxed),total_bytes:total,current_file:path.clone(),file_index:index+1,file_count:seen.len(),stage:"Rotating key".into()});
+            let _ = app.emit(
+                "job-progress",
+                JobProgress {
+                    processed_bytes: processed.load(Ordering::Relaxed),
+                    total_bytes: total,
+                    current_file: path.clone(),
+                    file_index: index + 1,
+                    file_count: seen.len(),
+                    stage: "Rotating key".into(),
+                },
+            );
             results.push(match rotated {
                 Ok(result) => transformed_outcome(&state, path, result, "Rotated to new key"),
                 Err(error) => failed_outcome(path, error),
             });
         }
-        let success = results.len() == seen.len() && results.iter().all(|item| item.ok);
-        if success {
-            let hash = key_file::checked_file_hash(&new_path, &new_key, passphrase.as_deref().map(String::as_str)).ok();
-            let extra = remember_key(&app, &state, new_path.clone(), new_key, hash)?;
-            set_message(&state, format!("Selected files rotated. New key: {}. Keep the old key for any files you did not select.{extra}", new_path.display()));
-        } else {
-            set_message(&state, format!("Rotation was incomplete. The old key remains loaded. The new key file is at {} for any successful outputs.", new_path.display()));
+        let report = finish_rotation(&state, batch, results, seen.len(), &new_path, || {
+            let hash = saved_key.checked_hash().map_err(|err| err.to_string())?;
+            remember_key(&app, &state, new_path.clone(), new_key, Some(hash))
+        });
+        Ok(Some(report))
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+fn check_rotation(state: &AppState, saved_key: Option<&key_file::RotationKey>) -> io::Result<()> {
+    if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"));
+    }
+    if let Some(saved_key) = saved_key {
+        saved_key.check()?;
+    }
+    Ok(())
+}
+
+fn finish_rotation(
+    state: &AppState,
+    batch: DeletionBatch<'_>,
+    results: Vec<FileOutcome>,
+    selected_count: usize,
+    new_path: &Path,
+    activate: impl FnOnce() -> Result<String, String>,
+) -> RotationReport {
+    // Completed outputs and cleanup receipts survive a failed final activation.
+    batch.commit();
+    let success = results.len() == selected_count && results.iter().all(|item| item.ok);
+    let (message, notice) = if success {
+        match activate() {
+            Ok(extra) => (format!("Selected files rotated. New key: {}. Keep the old key for any files you did not select.{extra}", new_path.display()), false),
+            Err(error) => (format!("Files were rotated, but the new key could not be activated: {error}. New key file: {}. Keep it for the successful outputs, and keep the old key for any files you did not select.", new_path.display()), true),
         }
-        batch.commit();
-        Ok(Some(RotationReport { results, status: status(&state) }))
-    }).await.map_err(|err| err.to_string())?
+    } else {
+        (format!("Rotation was incomplete. New key file: {}. Keep it for any successful outputs, and keep the old key for retained inputs and files you did not select.", new_path.display()), true)
+    };
+    set_message(state, &message);
+    RotationReport {
+        results,
+        status: status(state),
+        new_key_path: new_path.display().to_string(),
+        notice: notice.then_some(message),
+    }
 }
 
 fn planned_output(input: &Path, dir: Option<&Path>, name: &std::ffi::OsStr) -> PathBuf {
@@ -1287,12 +1413,17 @@ fn planned_output(input: &Path, dir: Option<&Path>, name: &std::ffi::OsStr) -> P
 }
 
 fn comparison_path(path: &Path) -> PathBuf {
-    let absolute = fs::canonicalize(path)
-        .or_else(|_| {
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            fs::canonicalize(parent).map(|value| value.join(path.file_name().unwrap_or_default()))
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    // Resolve the nearest existing ancestor so nested, not-yet-created outputs
+    // use the same volume/path representation as their parent outputs.
+    let absolute = absolute
+        .ancestors()
+        .find_map(|ancestor| {
+            fs::canonicalize(ancestor)
+                .ok()
+                .map(|parent| parent.join(absolute.strip_prefix(ancestor).unwrap()))
         })
-        .unwrap_or_else(|_| path.to_path_buf());
+        .unwrap_or(absolute);
     if cfg!(windows) {
         PathBuf::from(absolute.to_string_lossy().to_lowercase())
     } else {
@@ -1347,7 +1478,7 @@ fn plan_job(state: &AppState, request: &JobRequest) -> Result<JobPreview, String
         .iter()
         .map(|path| comparison_path(Path::new(path)))
         .collect::<HashSet<_>>();
-    let mut seen_outputs = HashSet::new();
+    let mut seen_outputs = PlannedOutputs::default();
     let mut total_bytes = 0u64;
     let mut warnings = Vec::new();
     if request.remove_original && request.operation != "verify" {
@@ -1464,6 +1595,33 @@ fn plan_job(state: &AppState, request: &JobRequest) -> Result<JobPreview, String
     })
 }
 
+#[derive(Default)]
+struct PlannedOutputs {
+    files: HashSet<PathBuf>,
+    directories: HashSet<PathBuf>,
+}
+
+impl PlannedOutputs {
+    fn insert(&mut self, path: &Path) -> Option<&'static str> {
+        let issue = if self.files.contains(path) {
+            Some("Another selected file has the same output path.")
+        } else if self.directories.contains(path)
+            || path
+                .ancestors()
+                .skip(1)
+                .any(|parent| self.files.contains(parent))
+        {
+            Some("Selected outputs conflict: a file is also needed as a folder.")
+        } else {
+            None
+        };
+        self.files.insert(path.to_path_buf());
+        self.directories
+            .extend(path.ancestors().skip(1).map(Path::to_path_buf));
+        issue
+    }
+}
+
 fn preview_issue(
     input: &Path,
     output: Option<&Path>,
@@ -1471,7 +1629,7 @@ fn preview_issue(
     overwrite: bool,
     duplicate: bool,
     all_inputs: &HashSet<PathBuf>,
-    seen_outputs: &mut HashSet<PathBuf>,
+    seen_outputs: &mut PlannedOutputs,
 ) -> Option<String> {
     if duplicate {
         return Some("This input was selected more than once.".into());
@@ -1480,13 +1638,29 @@ fn preview_issue(
         return Some("This is the key file.".into());
     }
     let output = output?;
-    if !seen_outputs.insert(comparison_path(output)) {
-        return Some("Another selected file has the same output path.".into());
+    let normalized = comparison_path(output);
+    if let Some(issue) = seen_outputs.insert(&normalized) {
+        return Some(issue.into());
     }
-    if all_inputs.contains(&comparison_path(output))
-        || key_path.is_some_and(|key| comparison_path(key) == comparison_path(output))
+    if normalized.ancestors().any(|path| all_inputs.contains(path))
+        || key_path.is_some_and(|key| normalized.starts_with(comparison_path(key)))
     {
         return Some("Output conflicts with an input or key file.".into());
+    }
+    for parent in output
+        .ancestors()
+        .skip(1)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        match fs::metadata(parent) {
+            Ok(metadata) if !metadata.is_dir() => {
+                return Some("An output parent path is not a folder.".into())
+            }
+            Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                return Some(format!("Cannot inspect output folder: {err}"))
+            }
+            _ => {}
+        }
     }
     match fs::symlink_metadata(output) {
         Ok(_) if !overwrite => {
@@ -1857,6 +2031,10 @@ pub(crate) fn status(state: &AppState) -> AppStatus {
     let emergency = lock(&state.emergency);
     let emergency_deletion_path = emergency.armed_path();
     AppStatus {
+        access_setup_required: crate::key_protection::setup_required(state),
+        access_setup_is_upgrade: crate::key_protection::setup_is_upgrade(state),
+        access_setup_requires_current_reference: crate::key_protection::needs_current_reference(state),
+        access_setup_key_path: key_path.clone().or_else(|| crate::key_protection::default_key_path(state).map(|path| path.display().to_string())),
         emergency_locked,
         emergency_deletion_armed: emergency_deletion_path.is_some(),
         emergency_deletion_path,
@@ -1905,6 +2083,7 @@ fn remember_key(
 ) -> Result<String, String> {
     let _key_change = lock(&state.key_change);
     crate::emergency::ensure_unlocked(state)?;
+    crate::key_protection::cancel(state);
     lock(&state.emergency).disarm();
     crate::sandbox::revoke(state);
     *lock(&state.key) = Some(key);
@@ -2011,18 +2190,23 @@ fn confirm_replace(app: &tauri::AppHandle, path: &Path) -> bool {
         .blocking_show()
 }
 
-fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_config_dir().map_err(|err| err.to_string())?;
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
     Ok(dir.join("settings.json"))
 }
 
 fn write_settings(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    write_settings_to_path(state, &settings_path(app)?)
+}
+
+// Caller may hold key_change while committing first-launch protection.
+pub(crate) fn write_settings_to_path(state: &AppState, path: &Path) -> Result<(), String> {
     let settings = Settings {
         key_path: lock(&state.key_path).clone(),
         output_dir: lock(&state.output_dir).clone(),
     };
-    write_settings_file(&settings_path(app)?, &settings)
+    write_settings_file(path, &settings)
 }
 
 fn write_settings_file(path: &Path, settings: &Settings) -> Result<(), String> {
@@ -2039,6 +2223,225 @@ fn read_settings(app: &tauri::AppHandle) -> Option<Settings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_rotation_survives_emergency_lock_during_activation() {
+        let state = AppState::default();
+        let deletion = Removal::retained(Path::new("input.fenc"), "locked original").info;
+        lock(&state.deletions)
+            .confirmed
+            .insert("previous".into(), deletion.clone());
+        let batch = DeletionBatch::new(&state);
+        #[cfg(windows)]
+        let dir = crate::test_support::TestDir::new();
+        #[cfg(windows)]
+        let deletion = register_removal(&state, crate::test_support::retained_removal(&dir));
+        let retry_id = deletion.retry_id.clone();
+        let report = finish_rotation(
+            &state,
+            batch,
+            vec![FileOutcome {
+                deletion: Some(deletion),
+                input: "input.fenc".into(),
+                output: Some("rotated.fenc".into()),
+                original_name: None,
+                ok: true,
+                message: "Rotated".into(),
+            }],
+            1,
+            Path::new("new.key"),
+            || {
+                state.emergency_locked.store(true, Ordering::Release);
+                crate::emergency::ensure_unlocked(&state)?;
+                Ok(String::new())
+            },
+        );
+        assert_eq!(report.results.len(), 1);
+        assert!(report.results[0].ok);
+        assert!(report.results[0].deletion.is_some());
+        assert!(report.status.emergency_locked);
+        assert_eq!(report.new_key_path, "new.key");
+        assert!(report.notice.as_deref().unwrap().contains("new.key"));
+        assert!(lock(&state.deletions).staged.is_none());
+        assert!(lock(&state.deletions).confirmed.is_empty());
+        if let Some(id) = retry_id {
+            assert!(lock(&state.deletions).current.contains_key(&id));
+        }
+        assert!(lock(&state.key).is_none());
+    }
+
+    #[test]
+    fn partial_rotation_does_not_activate_the_new_key() {
+        let state = AppState::default();
+        *lock(&state.key) = Some(Zeroizing::new([4; 32]));
+        let report = finish_rotation(
+            &state,
+            DeletionBatch::new(&state),
+            vec![],
+            2,
+            Path::new("new.key"),
+            || panic!("partial rotation must retain the old key"),
+        );
+        assert!(report.notice.unwrap().contains("incomplete"));
+        assert_eq!(lock(&state.key).as_ref().unwrap().as_slice(), &[4; 32]);
+    }
+
+    #[test]
+    fn rotation_checks_the_recovery_key_before_publishing_or_deleting() {
+        let dir = crate::test_support::TestDir::new();
+        let input = dir.0.join("input.txt");
+        fs::write(&input, b"keep this recoverable").unwrap();
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: false,
+            key_file: None,
+            output_dir: Some(dir.0.join("encrypted")),
+        };
+        let old_key = [4; 32];
+        let encrypted = crypto::encrypt_file(&old_key, &input, &options).unwrap();
+        let new_key = [5; 32];
+        let key_path = dir.0.join("new.key");
+        let saved_key = key_file::create_rotation_key(&key_path, &new_key, None, None).unwrap();
+        let state = AppState::default();
+        let attempted = AtomicBool::new(false);
+        let progress = |bytes| {
+            if bytes > 0 && !attempted.swap(true, Ordering::AcqRel) {
+                #[cfg(windows)]
+                {
+                    assert!(fs::remove_file(&key_path).is_err());
+                    assert!(fs::write(&key_path, b"replacement").is_err());
+                }
+                #[cfg(not(windows))]
+                fs::remove_file(&key_path)?;
+            }
+            check_rotation(&state, Some(&saved_key))
+        };
+        let rotation = JobOptions {
+            remove_original: true,
+            output_dir: Some(dir.0.join("rotated")),
+            ..options
+        };
+        let result = crypto::rotate_file_with_deletion(
+            &old_key,
+            &new_key,
+            &encrypted,
+            &rotation,
+            Some(&progress),
+        );
+        assert!(attempted.load(Ordering::Acquire));
+        #[cfg(windows)]
+        {
+            let result = result.unwrap();
+            assert_eq!(result.removal.info.state, DeletionState::Removed);
+            assert!(!encrypted.exists());
+            assert!(crypto::inspect_output_name(&new_key, &result.path).is_ok());
+            assert!(saved_key.checked_hash().is_ok());
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(result.is_err());
+            assert!(encrypted.exists());
+        }
+    }
+
+    #[test]
+    fn preview_blocks_output_file_and_folder_conflicts_in_either_order() {
+        let dir = crate::test_support::TestDir::new();
+        let input = dir.0.join("input.fenc");
+        let outputs = [
+            dir.0.join("restored/report.txt"),
+            dir.0.join("restored/report.txt/notes.txt"),
+        ];
+        for order in [[0, 1], [1, 0]] {
+            let mut seen = PlannedOutputs::default();
+            assert!(preview_issue(
+                &input,
+                Some(&outputs[order[0]]),
+                None,
+                false,
+                false,
+                &HashSet::new(),
+                &mut seen
+            )
+            .is_none());
+            let issue = preview_issue(
+                &input,
+                Some(&outputs[order[1]]),
+                None,
+                false,
+                false,
+                &HashSet::new(),
+                &mut seen,
+            )
+            .unwrap();
+            assert!(issue.contains("also needed as a folder"));
+        }
+        fs::create_dir_all(dir.0.join("restored")).unwrap();
+        fs::write(&outputs[0], b"existing file").unwrap();
+        let issue = preview_issue(
+            &input,
+            Some(&outputs[1]),
+            None,
+            false,
+            false,
+            &HashSet::new(),
+            &mut PlannedOutputs::default(),
+        )
+        .unwrap();
+        assert!(issue.contains("not a folder"));
+    }
+
+    #[test]
+    fn preview_rejects_conflicting_paths_from_separate_valid_bundles() {
+        let dir = crate::test_support::TestDir::new();
+        let key = [4; 32];
+        let options = JobOptions {
+            overwrite: false,
+            remove_original: false,
+            key_file: None,
+            output_dir: Some(dir.0.join("encrypted")),
+        };
+        let mut bundles = Vec::new();
+        for (folder, relative) in [("one", "report.txt"), ("two", "report.txt/notes.txt")] {
+            let root = dir.0.join(folder);
+            let input = root.join(relative);
+            fs::create_dir_all(input.parent().unwrap()).unwrap();
+            fs::write(&input, b"bundle contents").unwrap();
+            let bundle = archive::encrypt_to_zip_with_progress(
+                &key,
+                &[input],
+                &options,
+                Some(&root),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+            bundles.push(bundle.path.display().to_string());
+        }
+        let state = AppState::default();
+        *lock(&state.key) = Some(Zeroizing::new(key));
+        for paths in [bundles.clone(), bundles.into_iter().rev().collect()] {
+            let request = JobRequest {
+                paths,
+                folder_roots: HashMap::new(),
+                output_dir: dir.0.join("restored").display().to_string(),
+                overwrite: false,
+                remove_original: true,
+                zip: false,
+                compress: false,
+                operation: "decrypt".into(),
+            };
+            let preview = plan_job(&state, &request).unwrap();
+            assert!(!preview.can_run);
+            assert!(preview.items.iter().any(|item| item
+                .issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("also needed as a folder"))));
+            assert!(!dir.0.join("restored").exists());
+            assert!(request.paths.iter().all(|path| Path::new(path).exists()));
+        }
+    }
 
     #[test]
     fn emergency_browse_opens_the_picker_but_rejects_selection_without_changing_keys() {
@@ -2478,7 +2881,7 @@ mod tests {
             true,
             false,
             &HashSet::from([comparison_path(&input)]),
-            &mut HashSet::new(),
+            &mut PlannedOutputs::default(),
         );
         assert_eq!(
             issue.as_deref(),

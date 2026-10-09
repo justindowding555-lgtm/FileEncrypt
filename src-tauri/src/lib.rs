@@ -7,6 +7,7 @@ mod emergency;
 mod file_guard;
 mod file_selection;
 mod key_file;
+mod key_protection;
 mod publication;
 mod sandbox;
 mod source;
@@ -43,6 +44,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            key_protection::restore(app.handle(), app.state::<commands::AppState>().inner())?;
             emergency::restore(app.handle(), app.state::<commands::AppState>().inner())?;
             commands::restore_saved_key(app.handle(), app.state::<commands::AppState>().inner());
             emergency::start_shortcuts(app.handle().clone());
@@ -56,6 +58,10 @@ pub fn run() {
             emergency::emergency_lock,
             emergency::emergency_unlock,
             emergency::arm_emergency_deletion,
+            key_protection::prepare_key_protection,
+            key_protection::prepare_first_run,
+            key_protection::commit_key_protection,
+            key_protection::cancel_key_protection,
             commands::pick_input_files,
             commands::pick_input_folder,
             commands::expand_dropped_paths,
