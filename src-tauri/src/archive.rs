@@ -843,7 +843,7 @@ mod tests {
         };
         let result = encrypt_to_zip_with_progress(
             &[1; 32],
-            &[input.clone()],
+            std::slice::from_ref(&input),
             &options,
             None,
             false,
@@ -878,7 +878,7 @@ mod tests {
         };
         assert!(encrypt_to_zip_with_progress(
             &[1; 32],
-            &[input.clone()],
+            std::slice::from_ref(&input),
             &options,
             None,
             true,

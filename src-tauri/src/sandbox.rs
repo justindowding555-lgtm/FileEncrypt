@@ -1233,7 +1233,7 @@ mod tests {
         fs::write(&input, b"compressed private contents").unwrap();
         let zipped = archive::encrypt_to_zip_with_progress(
             &key,
-            &[input.clone()],
+            std::slice::from_ref(&input),
             &JobOptions {
                 output_dir: Some(dir.0.clone()),
                 ..options()
@@ -1265,7 +1265,7 @@ mod tests {
         fs::write(&input, vec![b'x'; MAX_TEXT_BYTES + 1]).unwrap();
         let zipped = archive::encrypt_to_zip_with_progress(
             &key,
-            &[input.clone()],
+            std::slice::from_ref(&input),
             &options(),
             None,
             true,

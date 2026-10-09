@@ -228,6 +228,7 @@ mod tests {
     fn failed_plaintext_cleanup_reports_the_exact_retained_path() {
         let dir = TestDir::new();
         let path = dir.0.join("restored.txt");
+        let mut original_permissions = None;
         let error = write(&path, false, None, |w| {
             w.write_all(b"partial plaintext")?;
             w.flush()?;
@@ -238,6 +239,7 @@ mod tests {
                 .unwrap()
                 .path();
             let mut permissions = fs::metadata(&partial)?.permissions();
+            original_permissions = Some(permissions.clone());
             permissions.set_readonly(true);
             fs::set_permissions(partial, permissions)?;
             Err(CryptoError::AuthenticationFailed)
@@ -250,9 +252,7 @@ mod tests {
         assert_eq!(partial.parent(), Some(dir.0.as_path()));
         assert_eq!(fs::read(&partial).unwrap(), b"partial plaintext");
         assert!(!path.exists());
-        let mut permissions = fs::metadata(&partial).unwrap().permissions();
-        permissions.set_readonly(false);
-        fs::set_permissions(&partial, permissions).unwrap();
+        fs::set_permissions(&partial, original_permissions.unwrap()).unwrap();
         fs::remove_file(partial).unwrap();
     }
 }

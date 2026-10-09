@@ -511,7 +511,9 @@ pub(crate) fn refresh_key_file(state: &AppState) -> bool {
     let deletion_changed = crate::emergency::check_deletion(state);
     let check = {
         let _key_change = lock(&state.key_change);
-        if crate::emergency::ensure_unlocked(state).is_err() { return deletion_changed; }
+        if crate::emergency::ensure_unlocked(state).is_err() {
+            return deletion_changed;
+        }
         let loaded = lock(&state.key).is_some();
         if !loaded
             && (!state.startup_key_unavailable.load(Ordering::Acquire)
@@ -631,8 +633,14 @@ pub(crate) fn deactivate_file_key(state: &AppState, disconnected: bool, message:
 
 pub(crate) fn start_key_monitor(app: tauri::AppHandle) {
     std::thread::spawn(move || loop {
-        let armed = lock(&app.state::<AppState>().emergency).armed_path().is_some();
-        std::thread::sleep(if armed { Duration::from_millis(250) } else { Duration::from_secs(1) });
+        let armed = lock(&app.state::<AppState>().emergency)
+            .armed_path()
+            .is_some();
+        std::thread::sleep(if armed {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(1)
+        });
         if app.get_webview_window("main").is_none() {
             break;
         }
@@ -1528,7 +1536,9 @@ fn zip_outcomes(
     let mut all_ok = true;
     let mut protected = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
-        let result = if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire) {
+        let result = if state.cancelled.load(Ordering::Acquire)
+            || state.emergency_locked.load(Ordering::Acquire)
+        {
             Err(CryptoError::Io(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "Not processed: job cancelled",
@@ -1656,7 +1666,8 @@ fn execute_job(
         }
     };
     let progress = |bytes: u64| -> io::Result<()> {
-        if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire) {
+        if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire)
+        {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"));
         }
         processed.fetch_add(bytes, Ordering::Relaxed);
@@ -1706,7 +1717,8 @@ fn execute_job(
         return Ok(outcomes);
     }
     for path in request.paths {
-        if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire) {
+        if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire)
+        {
             break;
         }
         let input = PathBuf::from(&path);
@@ -1837,7 +1849,11 @@ pub(crate) fn status(state: &AppState) -> AppStatus {
         .as_ref()
         .map(|path| path.display().to_string());
     let emergency_locked = state.emergency_locked.load(Ordering::Acquire);
-    let message = if emergency_locked { crate::emergency::UNAVAILABLE.into() } else { lock(&state.message).clone() };
+    let message = if emergency_locked {
+        crate::emergency::UNAVAILABLE.into()
+    } else {
+        lock(&state.message).clone()
+    };
     let emergency = lock(&state.emergency);
     let emergency_deletion_path = emergency.armed_path();
     AppStatus {
@@ -1853,7 +1869,8 @@ pub(crate) fn status(state: &AppState) -> AppStatus {
         output_dir,
         fingerprint,
         message,
-        startup_key_unavailable: emergency_locked || state.startup_key_unavailable.load(Ordering::Acquire),
+        startup_key_unavailable: emergency_locked
+            || state.startup_key_unavailable.load(Ordering::Acquire),
         updates_configured: updater_key().is_ok(),
     }
 }
@@ -1912,9 +1929,18 @@ fn remember_key(
 
 // Caller holds key_change and has successfully removed the persistent lock.
 pub(crate) fn finish_emergency_unlock(state: &AppState) {
-    state.startup_key_unavailable.store(false, Ordering::Release);
+    state
+        .startup_key_unavailable
+        .store(false, Ordering::Release);
     state.key_revision.fetch_add(1, Ordering::AcqRel);
-    set_message(state, if lock(&state.key).is_some() { "Key loaded." } else { "Choose a key to get started." });
+    set_message(
+        state,
+        if lock(&state.key).is_some() {
+            "Key loaded."
+        } else {
+            "Choose a key to get started."
+        },
+    );
 }
 
 fn resolve_save_path(app: &tauri::AppHandle, path: &str) -> Result<Option<PathBuf>, String> {
@@ -2023,7 +2049,9 @@ mod tests {
         let mut picker_opened = false;
         let result = pick_key_for_load(&state, || {
             picker_opened = true;
-            Ok(Some(PathBuf::from("a-different-key-that-does-not-exist.key")))
+            Ok(Some(PathBuf::from(
+                "a-different-key-that-does-not-exist.key",
+            )))
         });
         assert!(picker_opened);
         assert_eq!(result.unwrap_err(), crate::emergency::UNAVAILABLE);
@@ -2042,8 +2070,10 @@ mod tests {
         key_file::write_key_file(&path, &[42; 32]).unwrap();
         restore_saved_key_from_path(&state, &path);
         let check = KeyFileCheck {
-            revision: state.key_revision.load(Ordering::Acquire), path: path.clone(),
-            loaded: false, expected_hash: *lock(&state.key_file_hash),
+            revision: state.key_revision.load(Ordering::Acquire),
+            path: path.clone(),
+            loaded: false,
+            expected_hash: *lock(&state.key_file_hash),
         };
         let snapshot = key_file::read_key_snapshot(&path);
         state.emergency_locked.store(true, Ordering::Release);
@@ -2051,7 +2081,10 @@ mod tests {
         assert!(!finish_key_file_check(&state, check, snapshot));
         assert!(lock(&state.key).is_none());
         let settings_path = dir.0.join("settings.json");
-        assert_eq!(activate_session_key(&state, Zeroizing::new([9; 32]), &settings_path).unwrap_err(), crate::emergency::UNAVAILABLE);
+        assert_eq!(
+            activate_session_key(&state, Zeroizing::new([9; 32]), &settings_path).unwrap_err(),
+            crate::emergency::UNAVAILABLE
+        );
         assert!(!settings_path.exists());
         assert!(lock(&state.key).is_none());
     }

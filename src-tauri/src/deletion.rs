@@ -582,7 +582,8 @@ mod tests {
         let dir = TestDir::new();
         let original = dir.0.join("readonly.txt");
         fs::write(&original, b"bytes").unwrap();
-        let mut permissions = fs::metadata(&original).unwrap().permissions();
+        let original_permissions = fs::metadata(&original).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
         permissions.set_readonly(true);
         fs::set_permissions(&original, permissions).unwrap();
         let result =
@@ -590,9 +591,7 @@ mod tests {
                 .unwrap();
         assert_eq!(result.removal.info.state, DeletionState::Retained);
         assert!(original.exists());
-        let mut permissions = fs::metadata(&original).unwrap().permissions();
-        permissions.set_readonly(false);
-        fs::set_permissions(&original, permissions).unwrap();
+        fs::set_permissions(&original, original_permissions).unwrap();
         assert_eq!(
             retry(result.removal.retry.unwrap(), None).info.state,
             DeletionState::Removed
