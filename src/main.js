@@ -430,11 +430,11 @@ function renderPaged(listId, pagerId, items, renderRow, pageSize = PAGE_SIZE) {
 }
 
 function selectionBlocked() {
-  return state.accessSetupRequired || state.selectionBusy || (state.busy && state.keyLoaded);
+  return emergencyUnlockPending || state.accessSetupRequired || state.selectionBusy || (state.busy && state.keyLoaded);
 }
 
 function renderControls() {
-  const busy = state.busy || state.selectionBusy;
+  const busy = state.busy || state.selectionBusy || emergencyUnlockPending;
   for (const button of fileRemoveButtons) button.disabled = selectionBlocked();
   for (const button of deletionButtons) button.disabled = busy;
   const noFiles = state.files.length === 0;
@@ -734,7 +734,7 @@ async function selectFiles(work) {
 }
 
 async function run(work, updatePathOnSuccess) {
-  if (state.busy || state.selectionBusy) return;
+  if (state.busy || state.selectionBusy || emergencyUnlockPending) return;
   state.busy = true;
   renderControls();
   clearAlert();
@@ -816,18 +816,27 @@ function renderEmergencyControls() {
 
 let emergencyUnlockPending = false;
 async function unlockEmergency() {
-  if (!state.emergencyLocked || emergencyUnlockPending) return;
+  if (!state.emergencyLocked || emergencyUnlockPending || state.busy || state.selectionBusy || keyProtection.operation) return;
+  if ($("startup-key-dialog").open) $("startup-key-dialog").close();
+  if (!$("key-dialog").open) openKeyOptions();
   emergencyUnlockPending = true;
+  clearAlert();
+  renderControls();
+  let failed = false;
   try {
     applyStatus(await invokeWithPassphrase("emergency_unlock"), true);
     clearAlert();
   } catch (error) {
+    failed = true;
     if ($("startup-key-dialog").open) $("startup-key-dialog").close();
     openKeyOptions();
     const message = normalizeError(error);
     showAlert(message === KEY_READ_ERROR ? "The key reference could not be checked." : message);
-    $("key-passphrase").focus();
-  } finally { emergencyUnlockPending = false; }
+  } finally {
+    emergencyUnlockPending = false;
+    renderControls();
+    if (failed) $("key-passphrase").focus();
+  }
 }
 
 function resetKeyProtection() {
@@ -843,12 +852,14 @@ function resetKeyProtection() {
 }
 
 function renderKeyProtection() {
-  const busy = state.busy || state.selectionBusy || Boolean(keyProtection.operation);
+  const busy = state.busy || state.selectionBusy || emergencyUnlockPending || Boolean(keyProtection.operation);
   const pending = Boolean(keyProtection.token);
   const firstRun = state.accessSetupRequired && !state.emergencyLocked;
   const recovering = $("access-recovery").open;
   const preparing = keyProtection.operation === "prepare";
   const saving = keyProtection.operation === "save";
+  $("key-unlock-loading").hidden = !emergencyUnlockPending;
+  $("current-reference-field").setAttribute("aria-busy", String(emergencyUnlockPending));
   $("key-protection-loading").hidden = !keyProtection.operation;
   $("key-protection-loading-title").textContent = saving ? "Saving emergency access…" : "Preparing emergency access…";
   $("access-fields").setAttribute("aria-busy", String(preparing));

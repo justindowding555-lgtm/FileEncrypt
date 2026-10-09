@@ -250,6 +250,13 @@
           <button type="button" class="dialog-close" id="close-key-options" aria-label="Close key options">×</button>
         </div>
         <div id="key-dialog-alert" class="alert" role="alert" hidden></div>
+        <div id="key-unlock-loading" class="key-protection-loading key-unlock-loading" role="status" aria-live="polite" hidden>
+          <span class="key-protection-spinner" aria-hidden="true"></span>
+          <div>
+            <strong>Checking password…</strong>
+            <p class="sub">Please wait while your key is unlocked.</p>
+          </div>
+        </div>
         <div class="dialog-shared">
           <div id="current-reference-field" class="dialog-field">
             <label id="key-reference-label" class="field-label" for="key-passphrase">Key reference</label>

@@ -290,6 +290,7 @@ body:has(#startup-key-dialog[open]) .key-status { visibility: hidden; }
 .key-protection-loading { display: flex; align-items: center; gap: 14px; margin-top: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 9px; background: var(--inset); }
 .key-protection-loading strong { font-size: 0.9rem; }
 .key-protection-loading .sub { margin: 5px 0 0; }
+.key-unlock-loading { margin: 16px 24px 0; }
 .key-protection-spinner { flex: 0 0 24px; height: 24px; border: 3px solid var(--line); border-top-color: var(--focus); border-radius: 50%; animation: key-protection-spin 0.8s linear infinite; }
 @keyframes key-protection-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .key-protection-spinner { animation: none; } }

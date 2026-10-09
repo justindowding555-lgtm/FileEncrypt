@@ -19,7 +19,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; media-src data:; frame-src 'self'; object-src 'none'; base-uri 'self'; style-src 'self' 'sha256-WoisBQe0FAesjdVAjzZrTC4cTxcvlcXlPzCdXwxtD1k='; script-src 'self' 'sha256-69QcX2tUZWI4GABTIsqj810FhMbwKT7kZ/G/LQrAqkA='"
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; media-src data:; frame-src 'self'; object-src 'none'; base-uri 'self'; style-src 'self' 'sha256-WoisBQe0FAesjdVAjzZrTC4cTxcvlcXlPzCdXwxtD1k='; script-src 'self' 'sha256-Bt0FPLgbpL9zAITJCQO7E2fWsyPp4YUgOzcHFM9wlb8='"
     }
   },
   "plugins": {

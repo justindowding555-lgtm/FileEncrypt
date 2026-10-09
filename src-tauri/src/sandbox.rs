@@ -698,6 +698,11 @@ pub async fn open_sandbox_preview(
             url.path() == "/sandbox-preview.html"
                 || matches!(url.as_str(), "about:blank" | "about:srcdoc")
         });
+        // Wry also uses this flag for WebView2's IsPinchZoomEnabled. Allow
+        // image gestures through; the isolated viewer cancels browser zoom
+        // and applies them to the image instead.
+        #[cfg(windows)]
+        let builder = builder.zoom_hotkeys_enabled(format(&item.name).0 == "image");
         // Owned windows on Windows have no taskbar entry and minimize to a
         // small floating title bar. Keep previews as regular top-level windows;
         // the sandbox monitor still closes them when the main window exits.

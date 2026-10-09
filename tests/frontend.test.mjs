@@ -796,25 +796,43 @@ test("Browse and load remains usable during emergency lock and reports the fake 
 
 test("protected emergency unlock clears each submitted passphrase and stays locked after failure", async () => {
   const calls = [];
+  let finishUnlock;
   const locked = { ...savedKeyStatus, keyRevision: 1, keyLoaded: false, emergencyLocked: true,
     emergencyShortcutsNative: true, startupKeyUnavailable: true, sandboxAvailable: false };
   const ui = fixture(async (command, args) => {
     calls.push({ command, args });
     if (command === "get_status") return locked;
     if (command === "emergency_unlock") {
+      await new Promise((resolve) => { finishUnlock = resolve; });
       if (args.passphrase !== "correct") throw "This key file needs its passphrase.";
       return { ...savedKeyStatus, keyRevision: 2, emergencyLocked: false, emergencyShortcutsNative: true };
     }
   });
   await ui.evaluate("init()");
+  const failedUnlock = ui.events.get("emergency-unlock-requested")();
+  assert.equal(ui.refs.get("key-unlock-loading").hidden, false);
+  assert.equal(ui.refs.get("key-dialog").open, true);
+  assert.equal(ui.refs.get("key-passphrase").disabled, true);
+  assert.equal(ui.refs.get("load").disabled, true);
   await ui.events.get("emergency-unlock-requested")();
+  assert.equal(calls.filter(({ command }) => command === "emergency_unlock").length, 1);
+  finishUnlock();
+  await failedUnlock;
+  assert.equal(ui.refs.get("key-unlock-loading").hidden, true);
+  assert.equal(ui.refs.get("key-passphrase").disabled, false);
+  assert.equal(ui.refs.get("load").disabled, false);
   assert.equal(ui.evaluate("state.emergencyLocked"), true);
   assert.equal(ui.refs.get("key-dialog").open, true);
   assert.equal(ui.refs.get("startup-key-dialog").open, false);
   assert.match(ui.refs.get("key-dialog-alert").textContent, /passphrase/);
   ui.refs.get("key-passphrase").value = "correct";
-  await ui.events.get("emergency-unlock-requested")();
+  const successfulUnlock = ui.events.get("emergency-unlock-requested")();
+  assert.equal(ui.refs.get("key-unlock-loading").hidden, false);
   assert.equal(ui.refs.get("key-passphrase").value, "");
+  finishUnlock();
+  await successfulUnlock;
+  assert.equal(ui.refs.get("key-unlock-loading").hidden, true);
+  assert.equal(ui.refs.get("key-passphrase").disabled, false);
   assert.equal(ui.evaluate("state.emergencyLocked"), false);
   assert.equal(ui.evaluate("state.keyLoaded"), true);
   assert.equal(calls.filter(({ command }) => command === "emergency_unlock").length, 2);
@@ -1293,8 +1311,29 @@ test("pinch zoom changes image scale, clamps extreme gestures, and preserves nor
   assert.equal(viewer.sent.at(-1).fit, false);
   for (let i = 0; i < 20; i++) wheel.action({ ctrlKey: true, deltaY: -1000, deltaMode: 0, clientX: 200, clientY: 180, preventDefault() {} });
   assert.equal(viewer.sent.at(-1).scale, 4);
+  viewer.mediaHandlers.get("error")();
+  wheel.action({ ctrlKey: true, deltaY: -30, preventDefault() { prevented++; } });
+  assert.equal(prevented, 2);
+  assert.equal(viewer.sent.at(-1).type, "error");
   assert.equal(viewerFixture("video").stageHandlers.has("wheel"), false);
   assert.equal(viewerFixture("audio").stageHandlers.has("gesturestart"), false);
+});
+
+test("Ctrl zoom shortcuts change the image instead of the webview page", () => {
+  const viewer = viewerFixture();
+  let prevented = 0;
+  const key = (value) => viewer.handlers.get("keydown")({ key: value, ctrlKey: true, preventDefault() { prevented++; } });
+  key("+");
+  assert.equal(viewer.sent.at(-1).fit, false);
+  const enlarged = viewer.sent.at(-1).scale;
+  key("-");
+  assert.ok(viewer.sent.at(-1).scale < enlarged);
+  key("0");
+  assert.equal(viewer.sent.at(-1).fit, true);
+  assert.equal(prevented, 3);
+  const count = viewer.sent.length;
+  key("ArrowRight");
+  assert.equal(viewer.sent.length, count);
 });
 
 test("viewer forwards Escape and media errors, and rejects zoom messages from other windows", () => {

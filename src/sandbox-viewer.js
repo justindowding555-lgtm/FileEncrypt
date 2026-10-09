@@ -48,8 +48,8 @@ const SANDBOX_VIEWER_SCRIPT = String.raw`(() => {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") { event.preventDefault(); send("close"); }
-    else if (kind === "image" && !event.altKey && !event.ctrlKey && !event.metaKey) {
-      if (fit && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+    else if (kind === "image" && !event.altKey) {
+      if (!event.ctrlKey && !event.metaKey && fit && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
         event.preventDefault(); send("navigate", { direction: event.key === "ArrowRight" ? 1 : -1 });
       } else if (event.key === "+" || event.key === "=") { event.preventDefault(); zoom(scale * 1.25); }
       else if (event.key === "-") { event.preventDefault(); zoom(scale * 0.8); }
@@ -61,10 +61,12 @@ const SANDBOX_VIEWER_SCRIPT = String.raw`(() => {
     if (kind === "image") {
       media.addEventListener("load", loaded);
       if (media.complete) loaded();
-      // Precision-trackpad pinch arrives as a Ctrl+wheel event in WebView2.
+      // WebView2 must have native pinch enabled to deliver trackpad gestures.
+      // Cancel its Ctrl+wheel default so only the image, not the page, zooms.
       stage.addEventListener("wheel", (event) => {
-        if (!event.ctrlKey || !ready || failed) return;
+        if (!event.ctrlKey) return;
         event.preventDefault();
+        if (!ready || failed) return;
         const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? stage.clientHeight : 1;
         const delta = Math.max(-100, Math.min(100, event.deltaY * unit));
         zoom(scale * Math.exp(-delta * 0.01), { x: event.clientX, y: event.clientY });
@@ -84,4 +86,4 @@ const SANDBOX_VIEWER_SCRIPT = String.raw`(() => {
   } else loaded();
 })();`;
 
-const SANDBOX_VIEWER_SCRIPT_HASH = "sha256-69QcX2tUZWI4GABTIsqj810FhMbwKT7kZ/G/LQrAqkA=";
+const SANDBOX_VIEWER_SCRIPT_HASH = "sha256-Bt0FPLgbpL9zAITJCQO7E2fWsyPp4YUgOzcHFM9wlb8=";

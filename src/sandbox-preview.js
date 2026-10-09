@@ -209,10 +209,20 @@ async function initPrivatePreview() {
   previewElement("preview-previous-image").addEventListener("click", () => navigatePrivatePreview(-1));
   previewElement("preview-next-image").addEventListener("click", () => navigatePrivatePreview(1));
   window.addEventListener("message", handlePrivatePreviewMessage);
+  // Wheel events inside the opaque frame are handled by its viewer. Cancel
+  // browser zoom over the toolbar or loading/error screen as well.
+  window.addEventListener("wheel", (event) => {
+    if (event.ctrlKey) event.preventDefault();
+  }, { passive: false });
   previewElement("retry-private-preview").addEventListener("click", () => loadPrivatePreview());
   window.addEventListener("pagehide", () => { clearPrivatePreview(); void previewInvoke("cancel_sandbox_preview_read").catch(() => {}); });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") closePrivatePreview();
+    else if (!event.altKey && (event.ctrlKey || event.metaKey) && ["+", "=", "-", "0"].includes(event.key)) {
+      event.preventDefault();
+      if (event.key === "0") sendPrivatePreviewZoom({ value: "fit" });
+      else sendPrivatePreviewZoom({ direction: event.key === "-" ? -1 : 1 });
+    }
     else if (!event.altKey && !event.ctrlKey && !event.metaKey && !["SELECT", "INPUT", "TEXTAREA"].includes(event.target?.tagName)) {
       if (event.key === "ArrowLeft" || event.key === "ArrowRight") navigatePrivatePreview(event.key === "ArrowRight" ? 1 : -1);
     }
