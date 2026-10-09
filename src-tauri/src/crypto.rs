@@ -23,7 +23,7 @@
 
 use std::cell::Cell;
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
@@ -270,9 +270,71 @@ pub(crate) fn inspect_named_reader(
 pub(crate) fn verify_named_reader(
     key: &[u8; 32],
     reader: &mut dyn Read,
+) -> Result<String, CryptoError> {
+    let opened = open_named(reader, key)?;
+    decrypt_named_body(reader, &mut io::sink(), &opened)?;
+    Ok(opened.name)
+}
+
+/// Inspect/decrypt the same opened source used by the in-memory viewer. These
+/// functions never create an output path or publish partially authenticated data.
+pub(crate) fn sandbox_name<R: Read + Seek>(
+    key: &[u8; 32],
+    input: &Path,
+    reader: &mut R,
+) -> Result<String, CryptoError> {
+    let version = sandbox_version(reader)?;
+    match version {
+        NAMED_VERSION
+        | BUNDLE_VERSION
+        | COMPRESSED_BUNDLE_VERSION
+        | AUTH_BUNDLE_VERSION
+        | AUTH_COMPRESSED_BUNDLE_VERSION => Ok(open_named(reader, key)?.name),
+        LEGACY_VERSION | AEGIS_VERSION => Ok(decrypted_file_name(file_name(input)?)?
+            .to_string_lossy()
+            .into_owned()),
+        version => Err(CryptoError::UnsupportedVersion(version)),
+    }
+}
+
+fn sandbox_version<R: Read + Seek>(reader: &mut R) -> Result<u8, CryptoError> {
+    reader.rewind()?;
+    let mut header = [0u8; 5];
+    reader.read_exact(&mut header).map_err(short_read)?;
+    reader.rewind()?;
+    if &header[..4] != MAGIC {
+        return Err(CryptoError::NotEncrypted);
+    }
+    Ok(header[4])
+}
+
+pub(crate) fn sandbox_decrypt<R: Read + Seek>(
+    key: &[u8; 32],
+    reader: &mut R,
+    writer: &mut dyn Write,
+) -> Result<(), CryptoError> {
+    match sandbox_version(reader)? {
+        NAMED_VERSION
+        | BUNDLE_VERSION
+        | COMPRESSED_BUNDLE_VERSION
+        | AUTH_BUNDLE_VERSION
+        | AUTH_COMPRESSED_BUNDLE_VERSION => {
+            let opened = open_named(reader, key)?;
+            decrypt_named_body(reader, writer, &opened)
+        }
+        AEGIS_VERSION => decrypt_aegis(key, reader, writer),
+        LEGACY_VERSION => decrypt_stream(key, reader, writer),
+        version => Err(CryptoError::UnsupportedVersion(version)),
+    }
+}
+
+pub(crate) fn sandbox_decrypt_entry(
+    key: &[u8; 32],
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
 ) -> Result<(), CryptoError> {
     let opened = open_named(reader, key)?;
-    decrypt_named_body(reader, &mut io::sink(), &opened)
+    decrypt_named_body(reader, writer, &opened)
 }
 
 pub(crate) fn decrypt_named_reader(
@@ -596,7 +658,7 @@ pub fn verify_file(
     key: &[u8; 32],
     input: &Path,
     callback: Option<&ProgressCallback<'_>>,
-) -> Result<(), CryptoError> {
+) -> Result<String, CryptoError> {
     let file = File::open(input)?;
     let mut reader = BufReader::new(file);
     let mut sink = io::sink();
@@ -616,22 +678,32 @@ fn verify_reader(
     input: &Path,
     reader: &mut dyn Read,
     sink: &mut dyn Write,
-) -> Result<(), CryptoError> {
-    match legacy_version(input)? {
-        Some(
-            NAMED_VERSION
-            | BUNDLE_VERSION
-            | COMPRESSED_BUNDLE_VERSION
-            | AUTH_BUNDLE_VERSION
-            | AUTH_COMPRESSED_BUNDLE_VERSION,
-        ) => {
-            let opened = open_named(reader, key)?;
-            decrypt_named_body(reader, sink, &opened)
+) -> Result<String, CryptoError> {
+    // Select the format from the same stream being verified, then replay the
+    // prefix to the decoder. Return a name only after the entire body passes.
+    let mut prefix = [0u8; 5];
+    reader.read_exact(&mut prefix).map_err(short_read)?;
+    if &prefix[..4] != MAGIC {
+        return Err(CryptoError::NotEncrypted);
+    }
+    let mut reader = io::Cursor::new(prefix).chain(reader);
+    match prefix[4] {
+        NAMED_VERSION
+        | BUNDLE_VERSION
+        | COMPRESSED_BUNDLE_VERSION
+        | AUTH_BUNDLE_VERSION
+        | AUTH_COMPRESSED_BUNDLE_VERSION => verify_named_reader(key, &mut reader),
+        AEGIS_VERSION | LEGACY_VERSION => {
+            if prefix[4] == AEGIS_VERSION {
+                decrypt_aegis(key, &mut reader, sink)?;
+            } else {
+                decrypt_stream(key, &mut reader, sink)?;
+            }
+            Ok(decrypted_file_name(file_name(input)?)?
+                .to_string_lossy()
+                .into_owned())
         }
-        Some(AEGIS_VERSION) => decrypt_aegis(key, reader, sink),
-        Some(LEGACY_VERSION) => decrypt_stream(key, reader, sink),
-        Some(version) => Err(CryptoError::UnsupportedVersion(version)),
-        None => Err(CryptoError::NotEncrypted),
+        version => Err(CryptoError::UnsupportedVersion(version)),
     }
 }
 
@@ -1876,6 +1948,51 @@ mod tests {
     }
 
     #[test]
+    fn verification_returns_names_only_after_authentication_without_creating_plaintext() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = TempDir::new();
+        let name = "private-\u{e9}-\u{937}.txt";
+        let input = dir.path().join(name);
+        fs::write(&input, vec![7; CHUNK_SIZE as usize * 2 + 1]).unwrap();
+        let key = test_key(1);
+        let encrypted = encrypt_file(&key, &input, &options(false, false)).unwrap();
+        fs::remove_file(&input).unwrap();
+        let bytes = AtomicU64::new(0);
+        assert_eq!(
+            verify_file(
+                &key,
+                &encrypted,
+                Some(&|count| {
+                    bytes.fetch_add(count, Ordering::Relaxed);
+                    Ok(())
+                })
+            )
+            .unwrap(),
+            name
+        );
+        assert_eq!(
+            bytes.load(Ordering::Relaxed),
+            fs::metadata(&encrypted).unwrap().len()
+        );
+        assert_eq!(verify_file(&key, &encrypted, None).unwrap(), name);
+        assert!(verify_file(&test_key(2), &encrypted, None).is_err());
+        let mut damaged = fs::read(&encrypted).unwrap();
+        *damaged.last_mut().unwrap() ^= 1;
+        fs::write(&encrypted, &damaged).unwrap();
+        // Metadata alone still authenticates, but a failed body returns no name.
+        assert_eq!(
+            inspect_output_name(&key, &encrypted).unwrap(),
+            std::ffi::OsString::from(name)
+        );
+        assert!(verify_file(&key, &encrypted, None).is_err());
+        damaged.pop();
+        fs::write(&encrypted, &damaged).unwrap();
+        assert!(verify_file(&key, &encrypted, None).is_err());
+        assert!(!input.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn legacy_aes_gcm_files_still_decrypt() {
         let dir = TempDir::new();
         let input = dir.path().join("old.txt");
@@ -1890,6 +2007,16 @@ mod tests {
         .unwrap();
         assert!(fs::read(&encrypted).unwrap().starts_with(b"FENC"));
         fs::remove_file(&input).unwrap();
+        assert_eq!(verify_file(&key, &encrypted, None).unwrap(), "old.txt");
+        let mut sandbox_reader = BufReader::new(File::open(&encrypted).unwrap());
+        assert_eq!(
+            sandbox_name(&key, &encrypted, &mut sandbox_reader).unwrap(),
+            "old.txt"
+        );
+        let mut preview = Zeroizing::new(Vec::new());
+        sandbox_decrypt(&key, &mut sandbox_reader, &mut *preview).unwrap();
+        assert_eq!(preview.as_slice(), data);
+        assert!(!input.exists());
         let decrypted = decrypt_file(&key, &encrypted, &options(false, false)).unwrap();
         assert_eq!(fs::read(&decrypted).unwrap(), data);
         fs::remove_file(decrypted).unwrap();

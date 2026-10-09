@@ -202,6 +202,8 @@ h3 { margin-bottom: 0; font-size: 0.9rem; letter-spacing: -0.01em; }
   background: var(--muted);
 }
 .fingerprint.is-loaded::before { background: var(--success); }
+.fingerprint.is-disconnected { color: var(--danger); }
+.fingerprint.is-disconnected::before { background: var(--danger); }
 .message { margin: 3px 0 0 17px; overflow-wrap: anywhere; }
 .message:empty { display: none; }
 .key-actions { display: grid; grid-template-columns: 1fr; gap: 7px; }
@@ -223,10 +225,29 @@ h3 { margin-bottom: 0; font-size: 0.9rem; letter-spacing: -0.01em; }
 .dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 21px 24px 16px; border-bottom: 1px solid var(--line); }
 .dialog-head .sub { margin-top: 4px; }
 .dialog-close { width: 32px; min-height: 32px; padding: 0; flex: none; font-size: 1.35rem; font-weight: 400; }
-.startup-key-dialog { width: min(520px, calc(100% - 32px)); }
-.startup-key-body { padding: 20px 24px 24px; }
+.startup-key-dialog { width: min(560px, calc(100% - 32px)); }
+.startup-key-dialog::backdrop {
+  background: rgba(18, 21, 26, 0.48);
+  -webkit-backdrop-filter: blur(7px);
+  backdrop-filter: blur(7px);
+}
+html:has(#startup-key-dialog[open]),
+body:has(#startup-key-dialog[open]) { overflow: hidden; scrollbar-gutter: stable; }
+body:has(#startup-key-dialog[open]) :is(.file-list, .preview-list, .sandbox-files, .key-dialog:not(#startup-key-dialog)) { overflow: hidden; }
+.startup-key-dialog .dialog-head { padding-block: 24px; }
+.recovery-heading { display: flex; gap: 14px; align-items: flex-start; min-width: 0; }
+.recovery-icon { display: grid; place-items: center; width: 44px; height: 44px; flex: none; border-radius: 12px; color: var(--danger); background: var(--danger-bg); }
+.recovery-icon svg { width: 26px; height: 26px; }
+.recovery-eyebrow { display: block; margin-bottom: 4px; color: var(--danger); font-size: 0.68rem; font-weight: 700; letter-spacing: 0.08em; }
+.startup-key-body { display: grid; gap: 18px; padding: 22px 24px; }
+.startup-key-body > p { margin: 0; }
+.recovery-watch { display: flex; gap: 11px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--inset); }
+.recovery-watch strong { display: block; font-size: 0.9rem; }
+.recovery-watch .sub { margin: 3px 0 0; font-size: 0.8rem; }
+.recovery-dot { width: 8px; height: 8px; flex: none; margin-top: 6px; border-radius: 50%; background: var(--focus); box-shadow: 0 0 0 4px var(--panel); }
+.recovery-location .field-label { margin-bottom: 7px; }
 .startup-key-path {
-  margin: 0 0 16px;
+  margin: 0;
   padding: 12px 14px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -235,7 +256,13 @@ h3 { margin-bottom: 0; font-size: 0.9rem; letter-spacing: -0.01em; }
   font-size: 0.82rem;
   overflow-wrap: anywhere;
 }
-.startup-key-actions { margin-top: 20px; }
+.recovery-sandbox-note { padding: 12px 14px; border-left: 3px solid var(--focus); border-radius: 0 8px 8px 0; background: var(--inset); font-size: 0.84rem; }
+.recovery-impact { color: var(--muted); font-size: 0.78rem; }
+.startup-key-body #key-recovery-alert { margin: 0; }
+.startup-key-footer { padding: 18px 24px 14px; border-top: 1px solid var(--line); background: var(--inset); }
+.startup-key-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.startup-key-actions > button { flex: 1; }
+.startup-key-secondary { display: flex; justify-content: space-between; gap: 10px; margin: 10px -6px 0; }
 .key-dialog .alert { margin: 16px 24px 0; }
 .dialog-shared { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 18px 24px; }
 .dialog-field { min-width: 0; }
@@ -437,6 +464,11 @@ footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: s
   .dialog-shared { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 430px) {
+  .startup-key-dialog .dialog-head { gap: 10px; padding: 20px 16px; }
+  .startup-key-body, .startup-key-footer { padding-inline: 16px; }
+  .recovery-heading { gap: 10px; }
+  .recovery-icon { width: 36px; height: 36px; border-radius: 10px; }
+  .startup-key-actions { flex-direction: column; }
   .panel { padding: 17px; }
   .key-main { grid-template-columns: minmax(0, 1fr); }
   .key-actions { grid-column: auto; }
@@ -458,3 +490,23 @@ footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: s
 
 .deletion-status { margin-top: 5px; color: var(--muted); font-size: 0.8rem; overflow-wrap: anywhere; }
 .deletion-retry { margin-top: 5px; font-size: 0.8rem; }
+
+.sandbox-dialog { width: min(1000px, calc(100vw - 48px)); max-width: none; }
+.sandbox-status { margin: 14px 24px; font-size: 0.85rem; overflow-wrap: anywhere; }
+.sandbox-recovery { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin: 0 24px 16px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--inset); font-size: 0.84rem; }
+.sandbox-warnings { margin: 12px 24px; white-space: pre-line; }
+.sandbox-warnings:empty { display: none; }
+.sandbox-layout { display: grid; grid-template-columns: minmax(180px, 25%) minmax(0, 1fr); min-height: 350px; margin: 0 24px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.sandbox-files { max-height: 55vh; overflow: auto; background: var(--inset); border-right: 1px solid var(--line); }
+#sandbox-list { margin: 0; padding: 8px; list-style: none; }
+.sandbox-file { width: 100%; text-align: left; overflow-wrap: anywhere; margin-bottom: 4px; }
+.sandbox-view { min-width: 0; display: flex; flex-direction: column; }
+#sandbox-file-name { margin: 0; padding: 12px; overflow-wrap: anywhere; border-bottom: 1px solid var(--line); }
+#sandbox-file-name:empty { display: none; }
+#sandbox-preview { flex: 1; display: flex; min-height: 350px; }
+#sandbox-preview iframe { width: 100%; min-height: 350px; height: 50vh; border: 0; background: var(--panel); }
+.sandbox-limit { margin: 12px 24px 20px; font-size: 0.76rem; }
+@media (max-width: 720px) {
+  .sandbox-layout { grid-template-columns: minmax(0, 1fr); }
+  .sandbox-files { max-height: 140px; border-right: 0; border-bottom: 1px solid var(--line); }
+}

@@ -125,6 +125,7 @@ pub fn write_protected_key_file(
     result
 }
 
+#[cfg(test)]
 pub fn read_key_file(path: &Path) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     read_key_file_with_passphrase(path, None)
 }
@@ -157,6 +158,23 @@ pub(crate) fn read_key_snapshot(path: &Path) -> Result<Zeroizing<Vec<u8>>, Crypt
         return Err(CryptoError::InvalidKeyFile("key file is too large".into()));
     }
     Ok(bytes)
+}
+
+/// Bind sandbox access to the exact file bytes that were validated, including
+/// passphrase-protected files, without retaining their passphrase.
+pub(crate) fn checked_file_hash(
+    path: &Path,
+    key: &[u8; 32],
+    passphrase: Option<&str>,
+) -> Result<[u8; 32], CryptoError> {
+    let bytes = read_key_snapshot(path)?;
+    let reopened = parse_key_snapshot(path, &bytes, passphrase)?;
+    if reopened.as_slice() != key {
+        return Err(CryptoError::InvalidKeyFile(
+            "key file changed; load it again".into(),
+        ));
+    }
+    Ok(Sha256::digest(bytes.as_slice()).into())
 }
 pub(crate) fn parse_key_snapshot(
     path: &Path,

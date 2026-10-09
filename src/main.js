@@ -1,19 +1,26 @@
 const state = {
   files: [],
   results: [],
+  resultsOperation: "",
   fileSet: new Set(),
   folderRoots: new Map(),
   busy: false,
   keyLoaded: false,
+  keyDisconnected: false,
+  keyRevision: 0,
   keyHasFile: false,
+  sandboxAvailable: false,
   keyFingerprint: null,
+  keyPath: null,
   pendingJob: null,
+  planRevision: 0,
   jobRunning: false,
   updatesConfigured: false,
   updateAvailable: false,
 };
 
 const $ = (id) => document.getElementById(id);
+const KEY_DISCONNECTED_GUIDANCE = "Reconnect the drive containing your saved key. FileEncrypt checks for it automatically. If the file moved or the drive letter changed, use Browse and load.";
 
 function invoke(command, args) {
   const call = window.__TAURI__?.core?.invoke;
@@ -42,13 +49,14 @@ function baseName(path) {
 }
 
 function showAlert(message) {
-  const alert = $("key-dialog").open ? $("key-dialog-alert") : $("alert");
+  const alert = $("startup-key-dialog").open ? $("key-recovery-alert")
+    : $("key-dialog").open ? $("key-dialog-alert") : $("alert");
   alert.hidden = false;
   alert.textContent = message;
 }
 
 function clearAlert() {
-  for (const id of ["alert", "key-dialog-alert"]) {
+  for (const id of ["alert", "key-dialog-alert", "key-recovery-alert"]) {
     const alert = $(id);
     alert.hidden = true;
     alert.textContent = "";
@@ -71,6 +79,7 @@ function showSpecificKeyView(show) {
 }
 
 function invalidatePreview() {
+  state.planRevision++;
   state.pendingJob = null;
   $("preview-panel").hidden = true;
 }
@@ -95,15 +104,47 @@ function addSelectedFiles(selected) {
 }
 
 function applyStatus(status, updatePath) {
-  if (state.keyFingerprint !== null && state.keyFingerprint !== status.fingerprint) {
+  const keyRevisionChanged = typeof status.keyRevision === "number" && status.keyRevision !== state.keyRevision;
+  if (typeof status.keyRevision === "number") {
+    if (status.keyRevision < state.keyRevision) return;
+    state.keyRevision = status.keyRevision;
+  }
+  const wasDisconnected = state.keyDisconnected;
+  if (keyRevisionChanged || (state.keyFingerprint !== null && state.keyFingerprint !== status.fingerprint)) {
     invalidatePreview();
   }
   state.keyFingerprint = status.fingerprint;
+  state.keyPath = status.keyPath || null;
   state.keyLoaded = Boolean(status.keyLoaded);
+  state.keyDisconnected = !state.keyLoaded && Boolean(status.startupKeyUnavailable);
   state.keyHasFile = state.keyLoaded && Boolean(status.keyPath);
+  state.sandboxAvailable = state.keyHasFile && Boolean(status.sandboxAvailable);
+  if (sandbox.paths.length && (!state.sandboxAvailable || state.keyFingerprint !== sandbox.fingerprint)) {
+    lockSandbox(state.keyDisconnected
+      ? "Sandbox locked because the key disconnected."
+      : "Sandbox locked because the loaded key changed.", state.keyDisconnected);
+  }
+  if (sandbox.recovery) {
+    if (state.keyLoaded && state.keyFingerprint !== sandbox.recovery.fingerprint) {
+      cancelSandboxRecovery();
+      $("sandbox-status").textContent = "Sandbox stays locked because a different key was loaded. Close this viewer to start a new sandbox.";
+    } else if (!state.keyLoaded && !state.keyDisconnected) {
+      if (wasDisconnected || sandbox.recovery.waitingForUnlock) {
+        sandbox.recovery.waitingForUnlock = true;
+        clearTimeout(sandbox.recoveryTimer);
+        sandbox.recoveryTimer = null;
+        $("sandbox-status").textContent = "Key file found. Open Key options to load it; the viewer will reload when the same key is unlocked.";
+      } else {
+        cancelSandboxRecovery();
+      }
+    } else if (state.sandboxAvailable) {
+      sandbox.recovery.ready = true;
+    }
+  }
   state.updatesConfigured = Boolean(status.updatesConfigured);
   if (!state.updatesConfigured) $("update-status").textContent = "Signed updates are not configured in this build.";
   $("fingerprint").classList.toggle("is-loaded", state.keyLoaded);
+  $("fingerprint").classList.toggle("is-disconnected", state.keyDisconnected);
   if (updatePath) {
     $("key-path").value = status.keyPath || "";
   }
@@ -112,13 +153,26 @@ function applyStatus(status, updatePath) {
   }
   $("fingerprint").textContent = status.keyLoaded
     ? `${state.keyHasFile ? "Key loaded" : "Session key"} · ${status.fingerprint}`
-    : "No key loaded";
-  $("key-message").textContent =
-    status.message ||
-    (status.keyLoaded
+    : state.keyDisconnected
+      ? "Key disconnected"
+      : "No key loaded";
+  $("key-message").textContent = state.keyDisconnected
+    ? KEY_DISCONNECTED_GUIDANCE
+    : status.message || (state.keyLoaded
       ? "Ready to encrypt or decrypt your files."
       : "Choose a key to get started.");
+  if (state.keyDisconnected && !wasDisconnected && !$("startup-key-dialog").open) {
+    $("key-recovery-alert").hidden = true;
+    $("key-recovery-status").textContent = "Watching for your key";
+    $("startup-key-path").textContent = status.keyPath || "Unknown location";
+    $("startup-key-dialog").showModal();
+    $("check-key-again").focus();
+  } else if (!state.keyDisconnected && $("startup-key-dialog").open) {
+    $("startup-key-dialog").close();
+  }
   renderControls();
+  updateSandboxRecoveryUI();
+  maybeResumeSandbox();
 }
 
 let fileRemoveButtons = [];
@@ -146,6 +200,7 @@ function renderPaged(listId, pagerId, items, renderRow) {
       const start = view.page * PAGE_SIZE;
       if (listId === "file-list") fileRemoveButtons = [];
       if (listId === "results") deletionButtons = [];
+      if (listId === "sandbox-list") sandbox.buttons = [];
       const fragment = document.createDocumentFragment();
       for (let index = start; index < Math.min(start + PAGE_SIZE, view.items.length); index++) {
         fragment.append(view.renderRow(view.items[index], index));
@@ -170,9 +225,26 @@ function renderControls() {
   for (const button of [...fileRemoveButtons, ...deletionButtons]) button.disabled = state.busy;
   const noFiles = state.files.length === 0;
   const blocked = state.busy || !state.keyLoaded || noFiles;
-  $("generate").classList.toggle("primary", !state.keyLoaded);
+  $("key-recovery-files").hidden = noFiles;
+  $("key-recovery-files").textContent = `${state.files.length} selected ${state.files.length === 1 ? "file is" : "files are"} kept for this app session. They will be ready when your key is loaded again.`;
+  $("missing-key-warning").hidden = state.keyLoaded
+    || !state.files.some((path) => /\.(fenc|zip)$/i.test(path));
+  $("missing-key-title").textContent = state.keyDisconnected
+    ? "Key disconnected."
+    : "No encryption key loaded.";
+  $("missing-key-guidance").textContent = state.keyDisconnected
+    ? KEY_DISCONNECTED_GUIDANCE
+    : "Use Browse and load to load the key used to encrypt these files before viewing, decrypting, or verifying them.";
+  $("generate").classList.toggle("primary", !state.keyLoaded && !state.keyDisconnected);
+  $("browse-load").classList.toggle("primary", state.keyDisconnected);
   $("encrypt").disabled = blocked;
   $("decrypt").disabled = blocked;
+  $("view-sandbox").disabled = blocked || !state.sandboxAvailable;
+  $("view-sandbox").title = state.sandboxAvailable
+    ? "View without saving decrypted files; the key file must stay readable."
+    : state.keyDisconnected
+      ? "Reconnect your key drive; the sandbox is available once the key is loaded."
+      : "Load a saved key file to use the sandbox. Session-only keys cannot keep it active.";
   $("verify").disabled = blocked;
   $("add-files").disabled = state.busy;
   $("add-folder").disabled = state.busy;
@@ -180,6 +252,11 @@ function renderControls() {
   $("generate").disabled = state.busy;
   $("load").disabled = state.busy;
   $("unload").disabled = state.busy || !state.keyLoaded;
+  $("check-key-again").disabled = state.busy;
+  $("choose-recovery-key").disabled = state.busy;
+  $("startup-key-options").disabled = state.busy;
+  $("sandbox-key-options").disabled = state.busy;
+  $("check-key-again").textContent = state.busy ? "Please wait…" : "Check again";
   $("set-path").disabled = state.busy;
   $("browse-load").disabled = state.busy;
   $("backup-key").disabled = state.busy || !state.keyHasFile;
@@ -200,20 +277,23 @@ function renderControls() {
   $("overwrite").disabled = state.busy;
   $("remove-original").disabled = state.busy;
   $("output-dir").disabled = state.busy;
-  $("start-job").disabled = state.busy || !state.pendingJob?.preview?.canRun;
+  $("start-job").disabled = state.busy || !state.keyLoaded || !state.pendingJob?.preview?.canRun
+    || state.pendingJob.revision !== state.planRevision;
   $("cancel-job").disabled = !state.jobRunning;
   $("check-update").disabled = state.busy || !state.updatesConfigured;
   $("install-update").disabled = state.busy || !state.updateAvailable;
   $("file-count").textContent = noFiles ? "" : `(${state.files.length})`;
   $("action-hint").textContent = state.busy
     ? "Working. Please wait…"
-    : !state.keyLoaded && noFiles
-      ? "Load a key and add files to get started."
-      : !state.keyLoaded
-        ? "Load a key to continue."
-        : noFiles
-          ? "Add files to continue."
-          : `${state.files.length} ${state.files.length === 1 ? "file" : "files"} ready to encrypt, decrypt, or verify.`;
+    : state.keyDisconnected
+      ? "Reconnect your key drive; FileEncrypt will check for it automatically."
+      : !state.keyLoaded && noFiles
+        ? "Load a key and add files to get started."
+        : !state.keyLoaded
+          ? "Load a key to continue."
+          : noFiles
+            ? "Add files to continue."
+            : `${state.files.length} ${state.files.length === 1 ? "file" : "files"} ready to encrypt, view, decrypt, or verify.`;
   renderOutputHint();
 }
 
@@ -282,7 +362,7 @@ function renderFiles() {
   renderControls();
 }
 
-function renderResults(results) {
+function renderResults(results, operation = state.resultsOperation) {
   if (state.results !== results) {
     pendingDeletionCursor = 0;
     pendingDeletionDelay = 1000;
@@ -290,11 +370,14 @@ function renderResults(results) {
     pendingDeletionTimer = null;
   }
   state.results = results;
+  state.resultsOperation = operation;
   $("results-panel").hidden = results.length === 0;
   const succeeded = results.filter((result) => result.ok).length;
   const retained = results.filter((result) => result.deletion?.state === "retained").length;
   const pending = results.filter((result) => result.deletion?.state === "pending").length;
-  $("result-summary").textContent = `${succeeded} succeeded, ${results.length - succeeded} failed`
+  $("result-summary").textContent = (operation === "verify"
+    ? `${results.length} ${results.length === 1 ? "file" : "files"} | ${succeeded} verified, ${results.length - succeeded} failed`
+    : `${succeeded} succeeded, ${results.length - succeeded} failed`)
     + (retained ? ` | ${retained} originals retained` : "")
     + (pending ? ` | ${pending} deletions pending` : "");
   renderPaged("results", "result-pages", results, (result) => {
@@ -304,13 +387,18 @@ function renderResults(results) {
     text.className = "result-text";
     const title = document.createElement("div");
     title.className = "result-title";
-    title.textContent = result.output
+    const originalName = result.ok ? result.originalName : null;
+    title.textContent = originalName || (result.output
       ? `${baseName(result.input)} → ${baseName(result.output)}`
-      : baseName(result.input);
-    title.title = result.output ? `${result.input} → ${result.output}` : result.input;
+      : baseName(result.input));
+    title.title = originalName
+      ? `${result.input} → ${originalName}`
+      : result.output ? `${result.input} → ${result.output}` : result.input;
     const message = document.createElement("div");
     message.className = "result-msg";
-    message.textContent = result.output
+    message.textContent = originalName
+      ? `${result.message} · ${result.input}`
+      : result.output
       ? `${result.message} · ${result.output}`
       : result.message;
     text.append(title, message);
@@ -445,6 +533,7 @@ async function run(work, updatePathOnSuccess) {
   } finally {
     state.busy = false;
     renderControls();
+    maybeResumeSandbox();
   }
 }
 
@@ -454,8 +543,297 @@ async function runKeyOption(work, updatePathOnSuccess) {
   return result;
 }
 
+function openKeyOptions() {
+  clearAlert();
+  $("key-management-view").hidden = false;
+  $("specific-key-view").hidden = true;
+  $("key-dialog-heading").textContent = "Key options";
+  $("key-dialog-description").textContent = "Manage the key file used for this workspace.";
+  if (!$("key-dialog").open) $("key-dialog").showModal();
+  if (sandbox.recovery?.waitingForUnlock) $("key-passphrase").focus();
+  else $("close-key-options").focus();
+}
+
+async function recheckKeyFile() {
+  if (state.busy) return;
+  $("key-recovery-status").textContent = "Checking the saved key…";
+  const result = await run(recheckKeyFileStatus, false);
+  if (result && state.keyDisconnected) $("key-recovery-status").textContent = "Still waiting for your key";
+}
+
+let keyFileCheck = null;
+function recheckKeyFileStatus() {
+  // A timeout must not spawn more blocked reads against the same slow drive.
+  if (!keyFileCheck) {
+    const pending = invoke("recheck_key_file");
+    keyFileCheck = pending;
+    const settled = () => { if (keyFileCheck === pending) keyFileCheck = null; };
+    pending.then(settled, settled);
+  }
+  return withSandboxDeadline(keyFileCheck, "The key drive is taking too long to respond. FileEncrypt will keep watching for it.");
+}
+
+const sandbox = {
+  generation: 0, sessionId: null, fingerprint: null,
+  selection: 0, items: [], buttons: [], loading: false, timer: null,
+  paths: [], currentItemId: null, recovery: null, recoveryTimer: null,
+};
+// Keep this exact stylesheet's SHA-256 in tauri.conf.json and the preview CSP.
+const SANDBOX_STYLE = "html{color-scheme:light dark}body{margin:16px;font:14px system-ui,sans-serif}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace,monospace}img,video{display:block;max-width:100%;max-height:85vh;margin:auto}audio{width:100%}";
+const SANDBOX_STYLE_HASH = "sha256-+d/I4iYM/9I6DotUkT3YfqOsiHrpFkzcIQG8DqehNDo=";
+
+function clearSandboxPreview() {
+  // Removing the frame stops playback and destroys the document containing text.
+  $("sandbox-preview").replaceChildren();
+  $("sandbox-file-name").textContent = "";
+}
+
+function resetSandbox() {
+  const sessionId = sandbox.sessionId;
+  sandbox.generation++;
+  sandbox.selection++;
+  sandbox.sessionId = null;
+  sandbox.fingerprint = null;
+  sandbox.items = [];
+  sandbox.buttons = [];
+  sandbox.loading = false;
+  sandbox.paths = [];
+  sandbox.currentItemId = null;
+  cancelSandboxRecovery();
+  clearTimeout(sandbox.timer);
+  sandbox.timer = null;
+  clearSandboxPreview();
+  renderPaged("sandbox-list", "sandbox-pages", [], () => document.createElement("li"));
+  $("sandbox-warnings").textContent = "";
+  $("sandbox-status").textContent = "";
+  if (sessionId) invoke("close_sandbox", { sessionId }).catch(() => {});
+}
+
+function lockSandbox(message = "Sandbox locked because key-file access was lost or changed.", canResume = true) {
+  // Recovery keeps encrypted source paths, a fingerprint, and an item index.
+  // Plaintext, decrypted names, and the revoked session are always discarded.
+  const recovery = canResume ? sandbox.recovery || (sandbox.paths.length && sandbox.fingerprint ? {
+    paths: [...sandbox.paths], fingerprint: sandbox.fingerprint,
+    itemId: sandbox.currentItemId, ready: false, waitingForUnlock: false,
+  } : null) : null;
+  resetSandbox();
+  sandbox.recovery = recovery;
+  $("sandbox-status").textContent = message + (recovery ? " This viewer will reload when the same key is available." : "");
+  updateSandboxRecoveryUI();
+  scheduleSandboxRecoveryCheck();
+}
+
+function cancelSandboxRecovery() {
+  clearTimeout(sandbox.recoveryTimer);
+  sandbox.recoveryTimer = null;
+  sandbox.recovery = null;
+  updateSandboxRecoveryUI();
+}
+
+function updateSandboxRecoveryUI() {
+  $("sandbox-recovery").hidden = !sandbox.recovery;
+  $("key-recovery-sandbox").hidden = !sandbox.recovery;
+}
+
+function scheduleSandboxRecoveryCheck() {
+  clearTimeout(sandbox.recoveryTimer);
+  sandbox.recoveryTimer = null;
+  if (!sandbox.recovery || sandbox.recovery.waitingForUnlock || !$("sandbox-dialog").open) return;
+  sandbox.recoveryTimer = setTimeout(checkSandboxRecovery, 1000);
+}
+
+async function checkSandboxRecovery() {
+  sandbox.recoveryTimer = null;
+  const recovery = sandbox.recovery;
+  if (!recovery || !$("sandbox-dialog").open) return;
+  if (!state.busy) {
+    try {
+      const status = await recheckKeyFileStatus();
+      if (sandbox.recovery === recovery) applyStatus(status, false);
+    } catch {
+      // Stay locked if the drive or IPC is slow; a later check can recover.
+    }
+  }
+  if (sandbox.recovery === recovery) scheduleSandboxRecoveryCheck();
+}
+
+function maybeResumeSandbox() {
+  const recovery = sandbox.recovery;
+  if (!recovery?.ready || state.busy || !state.sandboxAvailable
+      || !$("sandbox-dialog").open || $("key-dialog").open || $("startup-key-dialog").open) return;
+  if (state.keyFingerprint !== recovery.fingerprint) {
+    cancelSandboxRecovery();
+    return;
+  }
+  cancelSandboxRecovery();
+  return openSandbox(recovery);
+}
+
+function withSandboxDeadline(promise, message = "Sandbox locked because key-file access could not be confirmed.") {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), 1500);
+    promise.then((value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); });
+  });
+}
+
+function scheduleSandboxCheck() {
+  clearTimeout(sandbox.timer);
+  if (!sandbox.sessionId) return;
+  sandbox.timer = setTimeout(checkSandboxKey, 500);
+}
+
+async function checkSandboxKey() {
+  const sessionId = sandbox.sessionId;
+  const generation = sandbox.generation;
+  if (!sessionId) return;
+  try {
+    await withSandboxDeadline(invoke("check_sandbox", { sessionId }));
+  } catch (error) {
+    if (generation === sandbox.generation) lockSandbox(normalizeError(error));
+    return;
+  }
+  if (generation === sandbox.generation) scheduleSandboxCheck();
+}
+
+async function openSandbox(options = {}) {
+  const paths = options.paths || [...state.files];
+  if (state.busy || !state.sandboxAvailable || !paths.length) return;
+  resetSandbox();
+  sandbox.paths = [...paths];
+  sandbox.fingerprint = state.keyFingerprint;
+  const generation = sandbox.generation;
+  state.busy = true;
+  renderControls();
+  $("sandbox-status").textContent = "Reading encrypted file names…";
+  if (!$("sandbox-dialog").open) $("sandbox-dialog").showModal();
+  $("close-sandbox").focus();
+  try {
+    const catalog = await invoke("open_sandbox", { paths });
+    if (generation !== sandbox.generation) {
+      invoke("close_sandbox", { sessionId: catalog.sessionId }).catch(() => {});
+      return;
+    }
+    sandbox.sessionId = catalog.sessionId;
+    // A late catalogue response must not reveal names after a key disconnect.
+    await withSandboxDeadline(invoke("check_sandbox", { sessionId: catalog.sessionId }));
+    if (generation !== sandbox.generation) return;
+    sandbox.items = catalog.items;
+    $("sandbox-warnings").textContent = catalog.warnings.join("\n");
+    renderPaged("sandbox-list", "sandbox-pages", sandbox.items, (item) => {
+      const row = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "sandbox-file";
+      button.textContent = item.name;
+      button.disabled = sandbox.loading;
+      sandbox.buttons.push(button);
+      button.addEventListener("click", () => viewSandboxFile(item));
+      row.append(button);
+      return row;
+    });
+    $("sandbox-status").textContent = "Choose a file to preview. Keep the key file connected and readable.";
+    scheduleSandboxCheck();
+    const previous = sandbox.items.find((item) => item.id === options.itemId);
+    if (previous || sandbox.items.length === 1) await viewSandboxFile(previous || sandbox.items[0]);
+  } catch (error) {
+    if (generation === sandbox.generation) {
+      const message = normalizeError(error);
+      lockSandbox(message, state.keyDisconnected || message.startsWith("Sandbox locked"));
+    }
+  } finally {
+    state.busy = false;
+    renderControls();
+    maybeResumeSandbox();
+  }
+}
+
+function escapeSandboxText(text) {
+  return text.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+}
+
+function sandboxDocument(content) {
+  const encoded = content.data;
+  content.data = "";
+  let body;
+  if (content.kind === "text") {
+    const bytes = Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0));
+    try {
+      body = `<pre>${escapeSandboxText(new TextDecoder("utf-8", { fatal: true }).decode(bytes))}</pre>`;
+    } finally {
+      bytes.fill(0);
+    }
+  } else {
+    const allowed = {
+      image: ["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/x-icon"],
+      audio: ["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/flac"],
+      video: ["video/mp4", "video/webm", "video/ogg"],
+    };
+    if (!allowed[content.kind]?.includes(content.mime)) throw new Error("Unsupported preview format.");
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error("Invalid preview data.");
+    // Data URLs work in an opaque-origin frame without granting same-origin
+    // access or exposing a reusable object URL outside that frame.
+    const url = `data:${content.mime};base64,${encoded}`;
+    body = content.kind === "image"
+      ? `<img src="${url}" alt="File preview">`
+      : `<${content.kind} src="${url}" controls controlslist="nodownload noremoteplayback" disablepictureinpicture disableremoteplayback></${content.kind}>`;
+  }
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; media-src data:; style-src '${SANDBOX_STYLE_HASH}'; base-uri 'none'; form-action 'none'"><style>${SANDBOX_STYLE}</style></head><body>${body}</body></html>`;
+}
+
+async function viewSandboxFile(item) {
+  const sessionId = sandbox.sessionId;
+  if (!sessionId || sandbox.loading) return;
+  const generation = sandbox.generation;
+  const selection = ++sandbox.selection;
+  sandbox.currentItemId = item.id;
+  sandbox.loading = true;
+  for (const button of sandbox.buttons) button.disabled = true;
+  clearSandboxPreview();
+  $("sandbox-status").textContent = "Authenticating file in memory…";
+  let content;
+  try {
+    content = await invoke("read_sandbox_file", { sessionId, itemId: item.id });
+    if (generation !== sandbox.generation || selection !== sandbox.selection) return;
+    try {
+      await withSandboxDeadline(invoke("check_sandbox", { sessionId }));
+    } catch (error) {
+      if (generation === sandbox.generation) lockSandbox(normalizeError(error));
+      return;
+    }
+    if (generation !== sandbox.generation || selection !== sandbox.selection) return;
+    const frame = document.createElement("iframe");
+    // No scripts, same-origin access, downloads, popups, forms, or navigation.
+    frame.setAttribute("sandbox", "");
+    frame.setAttribute("referrerpolicy", "no-referrer");
+    frame.setAttribute("allow", "camera 'none'; microphone 'none'; geolocation 'none'; clipboard-write 'none'");
+    frame.title = `Read-only preview: ${item.name}`;
+    frame.srcdoc = sandboxDocument(content);
+    $("sandbox-preview").replaceChildren(frame);
+    $("sandbox-file-name").textContent = item.name;
+    $("sandbox-status").textContent = "Read-only preview • Key file access is checked continuously.";
+  } catch (error) {
+    if (generation === sandbox.generation && selection === sandbox.selection) {
+      clearSandboxPreview();
+      $("sandbox-status").textContent = normalizeError(error);
+    }
+  } finally {
+    if (content) content.data = "";
+    if (generation === sandbox.generation && selection === sandbox.selection) {
+      sandbox.loading = false;
+      for (const button of sandbox.buttons) button.disabled = false;
+    }
+  }
+}
+
 async function init() {
   try {
+    await window.__TAURI__?.event?.listen("key-status-changed", ({ payload }) => {
+      applyStatus(payload, false);
+    });
+    await window.__TAURI__?.event?.listen("sandbox-locked", ({ payload }) => {
+      if (payload === sandbox.sessionId) lockSandbox();
+    });
     await window.__TAURI__?.event?.listen("job-progress", ({ payload }) => {
       const { processedBytes, totalBytes, currentFile, fileIndex, fileCount, stage } = payload;
       const percentage = totalBytes ? Math.min(100, Math.round((processedBytes / totalBytes) * 100)) : 0;
@@ -474,29 +852,33 @@ async function init() {
   } catch (error) {
     showAlert(normalizeError(error));
   }
-  $("open-key-options").addEventListener("click", () => {
-    clearAlert();
-    $("key-management-view").hidden = false;
-    $("specific-key-view").hidden = true;
-    $("key-dialog-heading").textContent = "Key options";
-    $("key-dialog-description").textContent = "Manage the key file used for this workspace.";
-    $("key-dialog").showModal();
-    $("close-key-options").focus();
-  });
+  $("open-key-options").addEventListener("click", openKeyOptions);
+  $("sandbox-key-options").addEventListener("click", openKeyOptions);
   $("close-key-options").addEventListener("click", () => $("key-dialog").close());
   for (const id of ["close-startup-key", "dismiss-startup-key"]) {
     $(id).addEventListener("click", () => $("startup-key-dialog").close());
   }
   $("startup-key-dialog").addEventListener("close", () => {
-    if (!$("key-dialog").open) $("open-key-options").focus();
+    if (!$("key-dialog").open) {
+      if ($("sandbox-dialog").open) $("close-sandbox").focus();
+      else $("open-key-options").focus();
+    }
+    maybeResumeSandbox();
   });
   $("startup-key-options").addEventListener("click", () => {
     $("startup-key-dialog").close();
-    $("open-key-options").click();
+    $("key-path").value = state.keyPath || $("key-path").value;
+    openKeyOptions();
+  });
+  $("check-key-again").addEventListener("click", recheckKeyFile);
+  $("choose-recovery-key").addEventListener("click", () => {
+    run(() => invokeWithPassphrase("browse_key"), true);
   });
   $("key-dialog").addEventListener("close", () => {
     $("key-text").value = "";
-    $("open-key-options").focus();
+    if ($("sandbox-dialog").open) $("close-sandbox").focus();
+    else $("open-key-options").focus();
+    maybeResumeSandbox();
   });
   $("open-specific-key").addEventListener("click", () => showSpecificKeyView(true));
   $("back-to-key-options").addEventListener("click", () => showSpecificKeyView(false));
@@ -571,7 +953,7 @@ async function init() {
           removeOriginal: $("remove-original").checked,
         });
         if (report) {
-          renderResults(report.results);
+          renderResults(report.results, "rotate");
           applyStatus(report.status, true);
         }
         return null;
@@ -648,6 +1030,13 @@ async function init() {
 
   $("encrypt").addEventListener("click", () => prepareJob("encrypt"));
   $("decrypt").addEventListener("click", () => prepareJob("decrypt"));
+  $("view-sandbox").addEventListener("click", openSandbox);
+  $("close-sandbox").addEventListener("click", () => $("sandbox-dialog").close());
+  $("sandbox-dialog").addEventListener("close", () => {
+    resetSandbox();
+    $("view-sandbox").focus();
+  });
+  window.addEventListener("pagehide", () => resetSandbox());
   $("verify").addEventListener("click", () => prepareJob("verify"));
   $("start-job").addEventListener("click", startJob);
   $("dismiss-preview").addEventListener("click", invalidatePreview);
@@ -675,11 +1064,6 @@ async function init() {
   try {
     const initialStatus = await invoke("get_status");
     applyStatus(initialStatus, true);
-    if (initialStatus.startupKeyUnavailable) {
-      $("startup-key-path").textContent = initialStatus.keyPath || "Unknown location";
-      $("startup-key-dialog").showModal();
-      $("startup-key-options").focus();
-    }
   } catch (error) {
     showAlert(normalizeError(error));
     renderControls();
@@ -688,6 +1072,9 @@ async function init() {
 }
 
 async function prepareJob(operation) {
+  if (state.busy || !state.keyLoaded || !state.files.length) return;
+  invalidatePreview();
+  const revision = state.planRevision;
   const request = {
       paths: [...state.files],
       folderRoots: Object.fromEntries(state.folderRoots),
@@ -699,8 +1086,8 @@ async function prepareJob(operation) {
       operation,
   };
   const preview = await run(() => invoke("preview_job", { request }), false);
-  if (!preview) return;
-  state.pendingJob = { request, preview };
+  if (!preview || revision !== state.planRevision || !state.keyLoaded) return;
+  state.pendingJob = { request, preview, revision };
   if (preview.canRun && !$("review-first").checked) {
     await startJob();
     return;
@@ -736,7 +1123,7 @@ function formatBytes(bytes) {
 
 async function startJob() {
   const job = state.pendingJob;
-  if (!job?.preview?.canRun) return;
+  if (state.busy || !state.keyLoaded || !job?.preview?.canRun || job.revision !== state.planRevision) return;
   invalidatePreview();
   state.jobRunning = true;
   $("progress-panel").hidden = false;
@@ -745,7 +1132,7 @@ async function startJob() {
   try {
     await run(async () => {
       const results = await invoke("run_job", { request: job.request });
-      renderResults(results);
+      renderResults(results, job.request.operation);
       return invoke("get_status");
     }, false);
   } finally {

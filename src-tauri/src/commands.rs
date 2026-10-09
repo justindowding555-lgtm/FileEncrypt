@@ -23,8 +23,12 @@ use crate::{
 };
 
 pub struct AppState {
-    key: Mutex<Option<Zeroizing<[u8; 32]>>>,
-    key_path: Mutex<Option<PathBuf>>,
+    key_change: Mutex<()>,
+    key_revision: AtomicU64,
+    pub(crate) key: Mutex<Option<Zeroizing<[u8; 32]>>>,
+    pub(crate) key_path: Mutex<Option<PathBuf>>,
+    pub(crate) key_file_hash: Mutex<Option<[u8; 32]>>,
+    pub(crate) sandbox: Mutex<crate::sandbox::Registry>,
     output_dir: Mutex<Option<PathBuf>>,
     message: Mutex<String>,
     startup_key_unavailable: AtomicBool,
@@ -36,8 +40,12 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            key_change: Mutex::new(()),
+            key_revision: AtomicU64::new(0),
             key: Mutex::new(None),
             key_path: Mutex::new(None),
+            key_file_hash: Mutex::new(None),
+            sandbox: Mutex::new(crate::sandbox::Registry::default()),
             output_dir: Mutex::new(None),
             message: Mutex::new(String::new()),
             startup_key_unavailable: AtomicBool::new(false),
@@ -48,11 +56,13 @@ impl Default for AppState {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppStatus {
+    key_revision: u64,
     key_loaded: bool,
     key_path: Option<String>,
+    sandbox_available: bool,
     output_dir: Option<String>,
     fingerprint: Option<String>,
     message: String,
@@ -66,6 +76,8 @@ pub struct FileOutcome {
     deletion: Option<DeletionInfo>,
     input: String,
     output: Option<String>,
+    #[serde(rename = "originalName", skip_serializing_if = "Option::is_none")]
+    original_name: Option<String>,
     ok: bool,
     message: String,
 }
@@ -207,7 +219,7 @@ struct Settings {
     output_dir: Option<PathBuf>,
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
@@ -295,6 +307,7 @@ fn transformed_outcome(
     FileOutcome {
         input,
         output: Some(result.path.display().to_string()),
+        original_name: None,
         ok: true,
         message: message.into(),
         deletion: (info.state != DeletionState::NotRequested).then_some(info),
@@ -309,6 +322,7 @@ fn failed_outcome(input: String, error: CryptoError) -> FileOutcome {
     FileOutcome {
         input,
         output,
+        original_name: None,
         ok: false,
         message: error.to_string(),
         deletion: None,
@@ -440,24 +454,31 @@ fn restore_saved_settings(state: &AppState, settings: Settings) {
 }
 
 fn restore_saved_key_from_path(state: &AppState, path: &Path) {
+    let _key_change = lock(&state.key_change);
+    state.key_revision.fetch_add(1, Ordering::AcqRel);
     state
         .startup_key_unavailable
         .store(false, Ordering::Release);
     *lock(&state.key_path) = Some(path.to_path_buf());
     *lock(&state.key) = None;
-    match key_file::read_key_file(path) {
-        Ok(key) => {
+    *lock(&state.key_file_hash) = None;
+    match key_file::read_key_snapshot(path).and_then(|bytes| {
+        let key = key_file::parse_key_snapshot(path, &bytes, None)?;
+        use sha2::Digest;
+        Ok((key, sha2::Sha256::digest(bytes.as_slice()).into()))
+    }) {
+        Ok((key, hash)) => {
             *lock(&state.key) = Some(key);
+            *lock(&state.key_file_hash) = Some(hash);
             set_message(state, "Key loaded from the saved location.");
         }
         Err(err) => {
-            // Check the path separately: protected or damaged keys must not be
-            // reported as a disconnected drive.
-            if matches!(fs::metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound) {
+            // Protected or damaged keys keep their actual loading error.
+            if key_file_unavailable(&err) {
                 state.startup_key_unavailable.store(true, Ordering::Release);
                 set_message(
                     state,
-                    "Your saved key file is unavailable. Reconnect its drive and load the key, or use Browse and load if its location changed.",
+                    "Your saved key file is unavailable. Reconnect its drive; FileEncrypt will check for it automatically. Use Browse and load if its location changed.",
                 );
                 return;
             }
@@ -466,9 +487,157 @@ fn restore_saved_key_from_path(state: &AppState, path: &Path) {
     }
 }
 
+/// Watch saved file keys in both directions. Session-only and explicitly
+/// unloaded keys are excluded; a delayed read cannot replace a newer key.
+fn refresh_key_file(state: &AppState) -> bool {
+    let check = {
+        let _key_change = lock(&state.key_change);
+        let loaded = lock(&state.key).is_some();
+        if !loaded
+            && (!state.startup_key_unavailable.load(Ordering::Acquire)
+                || state.running.load(Ordering::Acquire))
+        {
+            return false;
+        }
+        let Some(path) = lock(&state.key_path).clone() else {
+            return false;
+        };
+        KeyFileCheck {
+            revision: state.key_revision.load(Ordering::Acquire),
+            path,
+            loaded,
+            expected_hash: *lock(&state.key_file_hash),
+        }
+    };
+    // Read outside the state lock: an unavailable removable or network drive
+    // must not block manual key changes or app shutdown.
+    let snapshot = key_file::read_key_snapshot(&check.path);
+    finish_key_file_check(state, check, snapshot)
+}
+
+struct KeyFileCheck {
+    revision: u64,
+    path: PathBuf,
+    loaded: bool,
+    expected_hash: Option<[u8; 32]>,
+}
+
+fn key_file_unavailable(error: &CryptoError) -> bool {
+    matches!(error, CryptoError::Io(_))
+        || matches!(error, CryptoError::InvalidKeyFile(message) if message.starts_with("key file not found: "))
+}
+
+fn finish_key_file_check(
+    state: &AppState,
+    check: KeyFileCheck,
+    snapshot: Result<Zeroizing<Vec<u8>>, CryptoError>,
+) -> bool {
+    let _key_change = lock(&state.key_change);
+    if state.key_revision.load(Ordering::Acquire) != check.revision
+        || (!check.loaded && state.running.load(Ordering::Acquire))
+    {
+        return false;
+    }
+    let bytes = match snapshot {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let unavailable = key_file_unavailable(&error);
+            if !check.loaded && unavailable {
+                return false;
+            }
+            deactivate_file_key(
+                state,
+                unavailable,
+                if unavailable {
+                    "Key disconnected and unloaded. Reconnect its drive; FileEncrypt will check for the saved key automatically.".into()
+                } else {
+                    format!("The saved key file cannot be loaded. Open Key options to load it again. {error}")
+                },
+            );
+            return true;
+        }
+    };
+    use sha2::Digest;
+    let hash: [u8; 32] = sha2::Sha256::digest(bytes.as_slice()).into();
+    if check.expected_hash.is_some_and(|expected| expected != hash) {
+        deactivate_file_key(state, false, "The key file changed since it was loaded. Open Key options and load the saved key again.".into());
+        return true;
+    }
+    if check.loaded {
+        return false;
+    }
+    state
+        .startup_key_unavailable
+        .store(false, Ordering::Release);
+    state.key_revision.fetch_add(1, Ordering::AcqRel);
+    match key_file::parse_key_snapshot(&check.path, &bytes, None) {
+        Ok(key) => {
+            *lock(&state.key) = Some(key);
+            *lock(&state.key_file_hash) = Some(hash);
+            set_message(state, "Key reconnected and loaded from the saved location.");
+        }
+        Err(error) => {
+            // A readable protected or damaged file is no longer disconnected.
+            // Keep its actual loading error and do not retain a passphrase.
+            *lock(&state.key_file_hash) = None;
+            set_message(
+                state,
+                format!("Key file reconnected. Open Key options to load it. {error}"),
+            );
+        }
+    }
+    true
+}
+
+// Caller holds key_change. Keep only the non-secret file digest on disconnect
+// so reconnecting a different file at the same path cannot silently switch keys.
+fn deactivate_file_key(state: &AppState, disconnected: bool, message: String) {
+    crate::sandbox::revoke(state);
+    *lock(&state.key) = None;
+    if !disconnected {
+        *lock(&state.key_file_hash) = None;
+    }
+    if state.running.load(Ordering::Acquire) {
+        state.cancelled.store(true, Ordering::Release);
+    }
+    state
+        .startup_key_unavailable
+        .store(disconnected, Ordering::Release);
+    state.key_revision.fetch_add(1, Ordering::AcqRel);
+    set_message(state, message);
+}
+
+pub(crate) fn start_key_monitor(app: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(1));
+        if app.get_webview_window("main").is_none() {
+            break;
+        }
+        let state = app.state::<AppState>();
+        if refresh_key_file(&state) {
+            let _ = app.emit("key-status-changed", status(&state));
+        }
+    });
+}
+
 #[tauri::command]
 pub fn get_status(state: tauri::State<'_, AppState>) -> AppStatus {
     status(&state)
+}
+
+#[tauri::command]
+pub async fn recheck_key_file(app: tauri::AppHandle) -> Result<AppStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let changed = refresh_key_file(&state);
+        let current = status(&state);
+        if changed {
+            let _ = app.emit("key-status-changed", &current);
+        }
+        current
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -628,7 +797,9 @@ pub async fn generate_key(
         key_file::write_key_file(&path, &key)
     };
     written.map_err(|err| err.to_string())?;
-    let extra = remember_key(&app, &state, path, key);
+    let hash =
+        key_file::checked_file_hash(&path, &key, passphrase.as_deref().map(String::as_str)).ok();
+    let extra = remember_key(&app, &state, path, key, hash);
     set_message(&state, format!("New key generated and saved.{extra}"));
     Ok(status(&state))
 }
@@ -662,7 +833,9 @@ pub async fn save_typed_key(
         key_file::write_key_file(&path, &key)
     };
     written.map_err(|err| err.to_string())?;
-    let extra = remember_key(&app, &state, path, key);
+    let hash =
+        key_file::checked_file_hash(&path, &key, passphrase.as_deref().map(String::as_str)).ok();
+    let extra = remember_key(&app, &state, path, key, hash);
     set_message(&state, format!("Key written to the file.{extra}"));
     Ok(status(&state))
 }
@@ -696,8 +869,12 @@ fn activate_session_key(
         output_dir: lock(&state.output_dir).clone(),
     };
     write_settings_file(settings_path, &settings)?;
+    let _key_change = lock(&state.key_change);
+    crate::sandbox::revoke(state);
     *lock(&state.key) = Some(key);
     *lock(&state.key_path) = None;
+    *lock(&state.key_file_hash) = None;
+    state.key_revision.fetch_add(1, Ordering::AcqRel);
     state
         .startup_key_unavailable
         .store(false, Ordering::Release);
@@ -848,16 +1025,34 @@ pub async fn check_key_backup(
 
 #[tauri::command]
 pub fn unload_key(state: tauri::State<'_, AppState>) -> AppStatus {
-    *lock(&state.key) = None;
-    set_message(&state, "Key unloaded from memory.");
+    unload_key_from_memory(&state);
     status(&state)
 }
 
+fn unload_key_from_memory(state: &AppState) {
+    let _key_change = lock(&state.key_change);
+    crate::sandbox::revoke(state);
+    *lock(&state.key) = None;
+    *lock(&state.key_file_hash) = None;
+    state
+        .startup_key_unavailable
+        .store(false, Ordering::Release);
+    state.key_revision.fetch_add(1, Ordering::AcqRel);
+    set_message(state, "Key unloaded from memory.");
+}
+
 pub fn clear_key_on_close(state: &AppState) {
+    let _key_change = lock(&state.key_change);
+    crate::sandbox::revoke(state);
     state.cancelled.store(true, Ordering::Release);
     lock(&state.deletions).clear();
     // Dropping Zeroizing overwrites the stored key bytes before releasing them.
     *lock(&state.key) = None;
+    *lock(&state.key_file_hash) = None;
+    state
+        .startup_key_unavailable
+        .store(false, Ordering::Release);
+    state.key_revision.fetch_add(1, Ordering::AcqRel);
 }
 
 #[tauri::command]
@@ -1014,7 +1209,8 @@ pub async fn rotate_key(
         }
         let success = results.len() == seen.len() && results.iter().all(|item| item.ok);
         if success {
-            let extra = remember_key(&app, &state, new_path.clone(), new_key);
+            let hash = key_file::checked_file_hash(&new_path, &new_key, passphrase.as_deref().map(String::as_str)).ok();
+            let extra = remember_key(&app, &state, new_path.clone(), new_key, hash);
             set_message(&state, format!("Selected files rotated. New key: {}. Keep the old key for any files you did not select.{extra}", new_path.display()));
         } else {
             set_message(&state, format!("Rotation was incomplete. The old key remains loaded. The new key file is at {} for any successful outputs.", new_path.display()));
@@ -1270,6 +1466,7 @@ fn zip_outcomes(
                 deletion: None,
                 input: input.display().to_string(),
                 output: None,
+                original_name: None,
                 ok: false,
                 message: err.to_string(),
             }]
@@ -1293,7 +1490,7 @@ fn zip_outcomes(
             }
             archive_read::entry_reader(&mut file, entry, Some(progress)).and_then(|mut reader| {
                 if verify {
-                    crypto::verify_named_reader(key, &mut reader).map(|()| None)
+                    crypto::verify_named_reader(key, &mut reader).map(|name| (None, Some(name)))
                 } else {
                     crypto::decrypt_named_reader(
                         key,
@@ -1302,16 +1499,20 @@ fn zip_outcomes(
                         &entry_options,
                         Some(progress),
                     )
-                    .map(Some)
+                    .map(|published| (Some(published), None))
                 }
             })
         };
         let ok = result.is_ok();
         all_ok &= ok;
         let output = match &result {
-            Ok(Some(published)) => Some(published.path.display().to_string()),
+            Ok((Some(published), _)) => Some(published.path.display().to_string()),
             Err(CryptoError::PublicationUncertain { output, .. }) => Some(output.clone()),
             _ => None,
+        };
+        let original_name = match &result {
+            Ok((_, name)) => name.clone(),
+            Err(_) => None,
         };
         let message = match &result {
             Ok(_) if !authenticated => format!(
@@ -1331,13 +1532,14 @@ fn zip_outcomes(
             }
             Err(err) => err.to_string(),
         };
-        if let Ok(Some(published)) = result {
+        if let Ok((Some(published), _)) = result {
             protected.push(published);
         }
         outcomes.push(FileOutcome {
             deletion: None,
             input: format!("{} / {}", input.display(), entry.name),
             output,
+            original_name,
             ok,
             message,
         });
@@ -1501,16 +1703,15 @@ fn execute_job(
             );
             report(true);
             let result = match request.operation.as_str() {
-                "encrypt" => {
-                    crypto::encrypt_file_with_progress(&key, &input, &options, &progress).map(Some)
-                }
-                "decrypt" => {
-                    crypto::decrypt_file_with_progress(&key, &input, &options, &progress).map(Some)
-                }
-                _ => crypto::verify_file(&key, &input, Some(&progress)).map(|()| None),
+                "encrypt" => crypto::encrypt_file_with_progress(&key, &input, &options, &progress)
+                    .map(|result| (Some(result), None)),
+                "decrypt" => crypto::decrypt_file_with_progress(&key, &input, &options, &progress)
+                    .map(|result| (Some(result), None)),
+                _ => crypto::verify_file(&key, &input, Some(&progress))
+                    .map(|name| (None, Some(name))),
             };
             outcomes.push(match result {
-                Ok(Some(result)) => transformed_outcome(
+                Ok((Some(result), _)) => transformed_outcome(
                     state,
                     path,
                     result,
@@ -1520,9 +1721,10 @@ fn execute_job(
                         "Decrypted"
                     },
                 ),
-                Ok(None) => FileOutcome {
+                Ok((None, original_name)) => FileOutcome {
                     input: path,
                     output: None,
+                    original_name,
                     ok: true,
                     message: "Verified".into(),
                     deletion: None,
@@ -1538,6 +1740,7 @@ fn execute_job(
                 deletion: None,
                 input: item.input.clone(),
                 output: None,
+                original_name: None,
                 ok: false,
                 message: "Not processed: job cancelled".into(),
             });
@@ -1553,14 +1756,18 @@ fn finish_load(
     path: PathBuf,
     passphrase: Option<&str>,
 ) -> Result<AppStatus, String> {
-    let key = key_file::read_key_file_with_passphrase(&path, passphrase)
-        .map_err(|err| err.to_string())?;
-    let extra = remember_key(app, state, path, key);
+    let bytes = key_file::read_key_snapshot(&path).map_err(|err| err.to_string())?;
+    let key =
+        key_file::parse_key_snapshot(&path, &bytes, passphrase).map_err(|err| err.to_string())?;
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(bytes.as_slice()).into();
+    let extra = remember_key(app, state, path, key, Some(hash));
     set_message(state, format!("Key loaded.{extra}"));
     Ok(status(state))
 }
 
 fn status(state: &AppState) -> AppStatus {
+    let _key_change = lock(&state.key_change);
     let (key_loaded, fingerprint) = {
         let key = lock(&state.key);
         (
@@ -1577,8 +1784,10 @@ fn status(state: &AppState) -> AppStatus {
         .map(|path| path.display().to_string());
     let message = lock(&state.message).clone();
     AppStatus {
+        key_revision: state.key_revision.load(Ordering::Acquire),
         key_loaded,
         key_path,
+        sandbox_available: key_loaded && lock(&state.key_file_hash).is_some(),
         output_dir,
         fingerprint,
         message,
@@ -1613,15 +1822,27 @@ fn remember_key(
     state: &AppState,
     path: PathBuf,
     key: Zeroizing<[u8; 32]>,
+    file_hash: Option<[u8; 32]>,
 ) -> String {
+    let _key_change = lock(&state.key_change);
+    crate::sandbox::revoke(state);
     *lock(&state.key) = Some(key);
     *lock(&state.key_path) = Some(path.clone());
+    *lock(&state.key_file_hash) = file_hash;
+    state.key_revision.fetch_add(1, Ordering::AcqRel);
     state
         .startup_key_unavailable
         .store(false, Ordering::Release);
+    let sandbox_note = if file_hash.is_none() {
+        " Reload the key file to enable sandbox viewing."
+    } else {
+        ""
+    };
     match write_settings(app, state) {
-        Ok(()) => String::new(),
-        Err(err) => format!(" The path could not be remembered for next launch: {err}"),
+        Ok(()) => sandbox_note.into(),
+        Err(err) => {
+            format!(" The path could not be remembered for next launch: {err}{sandbox_note}")
+        }
     }
 }
 
@@ -1755,6 +1976,7 @@ mod tests {
         assert!(current.key_loaded);
         assert!(current.key_path.is_none());
         assert!(!current.startup_key_unavailable);
+        assert!(!refresh_key_file(&state));
         assert_eq!(current.fingerprint, Some(key_file::fingerprint(&key)));
         assert_eq!(fs::read(&old_path).unwrap(), original_key_file);
         assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
@@ -1854,15 +2076,165 @@ mod tests {
         assert!(current.message.contains("saved key file is unavailable"));
         let payload = serde_json::to_value(&current).unwrap();
         assert_eq!(payload["startupKeyUnavailable"], true);
+        assert_eq!(payload["keyRevision"], current.key_revision);
+        assert!(!refresh_key_file(&state));
 
         fs::create_dir(&root).unwrap();
         let key = [7; 32];
         key_file::write_key_file(&path, &key).unwrap();
-        restore_saved_key_from_path(&state, &path);
+        assert!(refresh_key_file(&state));
         let current = status(&state);
         assert!(current.key_loaded);
+        assert!(current.sandbox_available);
         assert!(!current.startup_key_unavailable);
         assert_eq!(current.fingerprint, Some(key_file::fingerprint(&key)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removed_key_unloads_cancels_and_reloads_only_after_the_job_stops() {
+        let root = std::env::temp_dir().join(format!(
+            "fileencrypt-key-monitor-{}",
+            crypto::opaque_file_name().to_string_lossy()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("usb.key");
+        let key = [7; 32];
+        key_file::write_key_file(&path, &key).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let state = AppState::default();
+        restore_saved_key_from_path(&state, &path);
+        let hash = *lock(&state.key_file_hash);
+        let revision = status(&state).key_revision;
+        state.running.store(true, Ordering::Release);
+
+        fs::remove_file(&path).unwrap();
+        assert!(refresh_key_file(&state));
+        let current = status(&state);
+        assert!(!current.key_loaded);
+        assert!(!current.sandbox_available);
+        assert!(current.fingerprint.is_none());
+        assert!(current.startup_key_unavailable);
+        assert_eq!(current.key_path.as_deref(), path.to_str());
+        assert!(current.key_revision > revision);
+        assert_eq!(*lock(&state.key_file_hash), hash);
+        assert!(state.cancelled.load(Ordering::Acquire));
+        assert!(!refresh_key_file(&state));
+
+        fs::write(&path, bytes).unwrap();
+        assert!(!refresh_key_file(&state));
+        state.running.store(false, Ordering::Release);
+        assert!(refresh_key_file(&state));
+        let current = status(&state);
+        assert!(current.key_loaded);
+        assert!(current.sandbox_available);
+        assert!(!current.startup_key_unavailable);
+        assert_eq!(current.fingerprint, Some(key_file::fingerprint(&key)));
+        assert!(!refresh_key_file(&state));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_key_file_never_silently_switches_the_loaded_key() {
+        let root = std::env::temp_dir().join(format!(
+            "fileencrypt-key-monitor-{}",
+            crypto::opaque_file_name().to_string_lossy()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("usb.key");
+        let state = AppState::default();
+        for disconnect_first in [false, true] {
+            if path.exists() {
+                fs::remove_file(&path).unwrap();
+            }
+            key_file::write_key_file(&path, &[7; 32]).unwrap();
+            restore_saved_key_from_path(&state, &path);
+            fs::remove_file(&path).unwrap();
+            if disconnect_first {
+                assert!(refresh_key_file(&state));
+                assert!(status(&state).startup_key_unavailable);
+            }
+            key_file::write_key_file(&path, &[8; 32]).unwrap();
+            assert!(refresh_key_file(&state));
+            let current = status(&state);
+            assert!(!current.key_loaded);
+            assert!(!current.startup_key_unavailable);
+            assert!(current.message.contains("key file changed"));
+            assert!(!refresh_key_file(&state));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn protected_key_reconnection_clears_disconnect_and_keeps_the_passphrase_error() {
+        let root = std::env::temp_dir().join(format!(
+            "fileencrypt-key-monitor-{}",
+            crypto::opaque_file_name().to_string_lossy()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("usb.key");
+        let state = AppState::default();
+        restore_saved_key_from_path(&state, &path);
+        assert!(status(&state).startup_key_unavailable);
+        // The protected header requests a passphrase before sealed bytes are decoded.
+        fs::write(
+            &path,
+            "FileEncrypt-Key-v2\npbkdf2-sha256:600000\nunused\nunused\nunused\n",
+        )
+        .unwrap();
+        assert!(refresh_key_file(&state));
+        let current = status(&state);
+        assert!(!current.startup_key_unavailable);
+        assert!(!current.key_loaded);
+        assert!(current.message.contains("needs its passphrase"));
+        assert!(!refresh_key_file(&state));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delayed_file_reads_cannot_reverse_an_explicit_unload() {
+        let root = std::env::temp_dir().join(format!(
+            "fileencrypt-key-monitor-{}",
+            crypto::opaque_file_name().to_string_lossy()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("usb.key");
+        key_file::write_key_file(&path, &[7; 32]).unwrap();
+        let state = AppState::default();
+        restore_saved_key_from_path(&state, &path);
+        let check = KeyFileCheck {
+            revision: state.key_revision.load(Ordering::Acquire),
+            path: path.clone(),
+            loaded: true,
+            expected_hash: *lock(&state.key_file_hash),
+        };
+        unload_key_from_memory(&state);
+        assert!(!finish_key_file_check(
+            &state,
+            check,
+            Err(io::Error::from(io::ErrorKind::NotFound).into())
+        ));
+        assert!(!status(&state).startup_key_unavailable);
+        assert_eq!(status(&state).message, "Key unloaded from memory.");
+        assert!(!refresh_key_file(&state));
+
+        restore_saved_key_from_path(&state, &path);
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(refresh_key_file(&state));
+        let check = KeyFileCheck {
+            revision: state.key_revision.load(Ordering::Acquire),
+            path: path.clone(),
+            loaded: false,
+            expected_hash: *lock(&state.key_file_hash),
+        };
+        fs::write(&path, bytes).unwrap();
+        let snapshot = key_file::read_key_snapshot(&path);
+        unload_key_from_memory(&state);
+        assert!(!finish_key_file_check(&state, check, snapshot));
+        assert!(!status(&state).key_loaded);
+        assert!(!status(&state).startup_key_unavailable);
+        assert!(!refresh_key_file(&state));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2014,6 +2386,7 @@ mod tests {
             deletion: None,
             input: "first.fenc".into(),
             output: Some("first.txt".into()),
+            original_name: None,
             ok: true,
             message: "Decrypted".into(),
         }];
@@ -2081,6 +2454,15 @@ mod tests {
             );
             assert_eq!(verified.len(), 2);
             assert!(verified.iter().all(|r| r.ok));
+            assert_eq!(verified[0].original_name.as_deref(), Some("a.txt"));
+            assert_eq!(verified[1].original_name.as_deref(), Some("b.txt"));
+            assert!(verified
+                .iter()
+                .all(|r| r.output.is_none() && r.deletion.is_none()));
+            assert_eq!(
+                serde_json::to_value(&verified[0]).unwrap()["originalName"],
+                "a.txt"
+            );
             assert!(archive.exists());
             assert!(!root.join("restored").exists());
             let damaged = root.join("damaged.zip");

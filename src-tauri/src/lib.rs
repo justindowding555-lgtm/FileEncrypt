@@ -6,6 +6,7 @@ mod deletion;
 mod file_guard;
 mod key_file;
 mod publication;
+mod sandbox;
 mod source;
 #[cfg(test)]
 mod test_support;
@@ -35,10 +36,13 @@ pub fn run() {
         })
         .setup(|app| {
             commands::restore_saved_key(app.handle(), app.state::<commands::AppState>().inner());
+            commands::start_key_monitor(app.handle().clone());
+            sandbox::start_monitor(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
+            commands::recheck_key_file,
             commands::pick_input_files,
             commands::pick_input_folder,
             commands::expand_dropped_paths,
@@ -61,6 +65,10 @@ pub fn run() {
             commands::rotate_key,
             commands::check_for_updates,
             commands::install_update,
+            sandbox::open_sandbox,
+            sandbox::read_sandbox_file,
+            sandbox::check_sandbox,
+            sandbox::close_sandbox,
         ])
         .build(tauri::generate_context!())
         .expect("error while building FileEncrypt")

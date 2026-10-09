@@ -49,12 +49,15 @@
               <div>
                 <span class="step">STEP 02</span>
                 <h2 id="files-heading">Files <span id="file-count"></span></h2>
-                <p class="sub">Choose the files you want to protect or restore.</p>
+                <p class="sub">Choose the files you want to protect, view, or restore.</p>
               </div>
               <div class="row">
                 <button type="button" id="add-files"><span aria-hidden="true">+</span> Add files</button>
                 <button type="button" id="add-folder">Add folder</button>
               </div>
+            </div>
+            <div id="missing-key-warning" class="alert" role="alert" hidden>
+              <strong id="missing-key-title">No encryption key loaded.</strong> <span id="missing-key-guidance">Use Browse and load to load the key used to encrypt these files before viewing, decrypting, or verifying them.</span>
             </div>
             <div class="files-body">
               <div id="selection-area" class="selection-area">
@@ -109,6 +112,7 @@
             </div>
             <div class="actions">
               <button type="button" class="primary" id="encrypt" disabled>Encrypt files</button>
+              <button type="button" id="view-sandbox" disabled>View in sandbox</button>
               <button type="button" id="decrypt" disabled>Decrypt files</button>
               <button type="button" id="verify" disabled>Verify files</button>
               <label class="check review-option"><input id="review-first" type="checkbox" />Review plan first</label>
@@ -145,6 +149,33 @@
           <nav id="result-pages" class="list-pages" aria-label="Result pages" hidden></nav>
         </section>
       </main>
+      <dialog id="sandbox-dialog" class="key-dialog sandbox-dialog" aria-labelledby="sandbox-heading" aria-describedby="sandbox-description">
+        <div class="dialog-head">
+          <div>
+            <span class="step">READ-ONLY VIEWER</span>
+            <h2 id="sandbox-heading">File sandbox</h2>
+            <p id="sandbox-description" class="sub">Preview encrypted files without saving decrypted copies. Keep the saved key file readable; losing access locks the viewer.</p>
+          </div>
+          <button type="button" class="dialog-close" id="close-sandbox" aria-label="Close sandbox">&times;</button>
+        </div>
+        <p id="sandbox-status" class="sandbox-status" role="status" aria-live="polite"></p>
+        <div id="sandbox-recovery" class="sandbox-recovery" hidden>
+          <span>The viewer reloads automatically when the same key is loaded.</span>
+          <button type="button" id="sandbox-key-options">Key options</button>
+        </div>
+        <p id="sandbox-warnings" class="sub sandbox-warnings"></p>
+        <div class="sandbox-layout">
+          <nav class="sandbox-files" aria-label="Sandbox files">
+            <ul id="sandbox-list"></ul>
+            <nav id="sandbox-pages" class="list-pages" aria-label="Sandbox file pages" hidden></nav>
+          </nav>
+          <section class="sandbox-view" aria-label="Read-only file preview">
+            <h3 id="sandbox-file-name"></h3>
+            <div id="sandbox-preview"></div>
+          </section>
+        </div>
+        <p class="sub sandbox-limit">UTF-8 text up to 2 MiB; images, audio, and video up to 32 MiB. PDF and Office files have no preview. HTML and SVG appear as plain text. Screenshots and system memory are outside this viewer's protection.</p>
+      </dialog>
       <dialog id="key-dialog" class="key-dialog" aria-labelledby="key-dialog-heading" aria-describedby="key-dialog-description">
         <div class="dialog-head">
           <div>
@@ -199,21 +230,41 @@
       </dialog>
       <dialog id="startup-key-dialog" class="key-dialog startup-key-dialog" aria-labelledby="startup-key-heading" aria-describedby="startup-key-description startup-key-instructions">
         <div class="dialog-head">
-          <div>
-            <span class="step">KEY ACCESS</span>
-            <h2 id="startup-key-heading">Key file unavailable</h2>
-            <p id="startup-key-description" class="sub">Your saved key could not be found. Its drive may be disconnected, or the file may have moved.</p>
+          <div class="recovery-heading">
+            <span class="recovery-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3v4m6-4v4M7 7h10v3a5 5 0 0 1-5 5m0 4v2M3 3l18 18M7 10a5 5 0 0 0 5 5"/></svg>
+            </span>
+            <div>
+              <span class="recovery-eyebrow">FILE ACCESS PAUSED</span>
+              <h2 id="startup-key-heading">Key disconnected</h2>
+              <p id="startup-key-description" class="sub">The saved key was removed or can no longer be read.</p>
+            </div>
           </div>
-          <button type="button" class="dialog-close" id="close-startup-key" aria-label="Close key warning">&times;</button>
+          <button type="button" class="dialog-close" id="close-startup-key" aria-label="Close disconnected key warning">&times;</button>
         </div>
         <div class="startup-key-body">
-          <span class="field-label">Saved key file</span>
-          <p id="startup-key-path" class="startup-key-path"></p>
-          <p id="startup-key-instructions" class="sub">Reconnect your USB drive, then open Key options and click Load. If the file moved or the drive letter changed, use Browse and load.</p>
-          <p class="sub">No key is loaded. Your files are unchanged.</p>
-          <div class="row startup-key-actions">
-            <button type="button" class="primary" id="startup-key-options">Key options</button>
-            <button type="button" id="dismiss-startup-key">Dismiss</button>
+          <div class="recovery-watch" role="status" aria-live="polite">
+            <span class="recovery-dot" aria-hidden="true"></span>
+            <div><strong id="key-recovery-status">Watching for your key</strong><p class="sub">Checks automatically every second. This dialog closes when it returns.</p></div>
+          </div>
+          <div class="recovery-location">
+            <span class="field-label">Saved key location</span>
+            <p id="startup-key-path" class="startup-key-path"></p>
+          </div>
+          <p id="startup-key-instructions" class="sub">Reconnect the drive containing this file, or choose it from a new location. Protected keys need their passphrase in Key options.</p>
+          <p id="key-recovery-files" class="sub" hidden></p>
+          <p id="key-recovery-sandbox" class="recovery-sandbox-note" hidden>Your sandbox is waiting. It will reload automatically when the same key is loaded.</p>
+          <p id="key-recovery-alert" class="alert" role="alert" hidden></p>
+          <p class="recovery-impact">Interrupted jobs stay stopped. Completed files stay saved.</p>
+        </div>
+        <div class="startup-key-footer">
+          <div class="startup-key-actions">
+            <button type="button" class="primary" id="check-key-again">Check again</button>
+            <button type="button" id="choose-recovery-key">Choose key file…</button>
+          </div>
+          <div class="startup-key-secondary">
+            <button type="button" class="text-button" id="startup-key-options">Key options</button>
+            <button type="button" class="text-button" id="dismiss-startup-key">Keep waiting</button>
           </div>
         </div>
       </dialog>
