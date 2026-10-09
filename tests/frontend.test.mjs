@@ -4,19 +4,21 @@ import fs from "node:fs";
 import vm from "node:vm";
 import { createHash } from "node:crypto";
 
-function fixture(invoke) {
+function fixture(invoke, script = "main", automaticVerification = false) {
   let created = 0;
   let nextTimer = 0;
   const timers = new Map();
   const refs = new Map();
   const events = new Map();
   function element(fragment = false) {
-    return { fragment, children: [], handlers: new Map(), attributes: new Map(), value: "", checked: false,
+    return { fragment, children: [], handlers: new Map(), attributes: new Map(), value: "", checked: false, style: {}, offsetWidth: 220, offsetHeight: 120,
       classList: { toggle() {} },
       append(...items) { for (const item of items) this.children.push(...(item.fragment ? item.children : [item])); },
       replaceChildren(...items) { this.children = []; this.append(...items); },
       setAttribute(name, value) { this.attributes.set(name, value); }, removeAttribute(name) { this.attributes.delete(name); },
-      addEventListener(name, callback) { this.handlers.set(name, callback); }, focus() {},
+      addEventListener(name, callback) { this.handlers.set(name, callback); }, focus() { document.activeElement = this; },
+      getBoundingClientRect() { return { left: 0, top: 0, right: 1100, bottom: 780 }; },
+      contains(target) { return this === target || this.children.some((child) => child.contains?.(target)); },
       showModal() { this.open = true; }, close() { this.open = false; this.handlers.get("close")?.(); },
     };
   }
@@ -25,12 +27,19 @@ function fixture(invoke) {
     createElement() { created++; return element(); }, createDocumentFragment() { return element(true); },
   };
   const context = vm.createContext({ document, atob, TextDecoder, Error, window: { addEventListener() {}, __TAURI__: {
-    core: { invoke }, event: { async listen(name, callback) { events.set(name, callback); } },
+    core: { invoke(command, args) {
+      if (command === "verify_selected_files" && !automaticVerification) {
+        return Promise.resolve(args.paths.map((input) => ({ input, state: "verified", complete: true, entryCount: 1 })));
+      }
+      return invoke?.(command, args);
+    } }, event: { async listen(name, callback) { events.set(name, callback); } },
   } },
     setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
   });
-  vm.runInContext(fs.readFileSync(new URL("../src/main.js", import.meta.url), "utf8"), context);
+  for (const file of ["explorer-icons.js", "sandbox-content.js", `${script}.js`]) {
+    vm.runInContext(fs.readFileSync(new URL(`../src/${file}`, import.meta.url), "utf8"), context);
+  }
   return { context, refs, timers, events, count: () => created, evaluate: (code) => vm.runInContext(code, context),
     fireTimer() {
       const [id, timer] = timers.entries().next().value;
@@ -39,6 +48,104 @@ function fixture(invoke) {
     },
   };
 }
+
+test("added encrypted files and folder ZIPs verify with an icon before the filename", async () => {
+  let finish;
+  const calls = [];
+  const ui = fixture((command, args) => {
+    calls.push({ command, args });
+    return new Promise((resolve) => { finish = resolve; });
+  }, "main", true);
+  ui.evaluate('state.keyLoaded=true; state.keyRevision=1; fileVerification.ready=true; renderResults([{input:"earlier.txt",ok:true,message:"Encrypted"}]); addSelectedFiles({paths:["C:/folder/one.fenc","C:/folder/bundle.zip","C:/folder/plain.txt"],roots:{"C:/folder/one.fenc":"C:/folder"}})');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, "verify_selected_files");
+  assert.equal(JSON.stringify(calls[0].args), '{"paths":["C:/folder/one.fenc","C:/folder/bundle.zip"],"keyRevision":1}');
+  const rows = ui.refs.get("file-list").children;
+  const heading = rows[0].children[0].children[0];
+  assert.match(heading.children[0].className, /is-checking/);
+  assert.equal(heading.children[1].textContent, "one.fenc");
+  assert.equal(rows[0].children[0].children.length, 1);
+  assert.equal(rows[2].children[0].children[0].children.length, 2);
+  assert.match(rows[2].children[0].children[0].children[0].className, /is-unencrypted/);
+  const before = ui.count();
+  finish(calls[0].args.paths.map((input) => ({ input, state: "verified", complete: true })));
+  await settle();
+  assert.match(heading.children[0].className, /is-verified/);
+  assert.match(heading.children[0].innerHTML, /<circle/);
+  assert.equal(ui.count(), before);
+  assert.equal(ui.refs.get("result-summary").textContent, "1 succeeded, 0 failed");
+  assert.equal(ui.refs.has("verify"), false);
+  assert.doesNotMatch(fs.readFileSync(new URL("../src/main.js", import.meta.url), "utf8"), /Expected result/);
+});
+
+test("automatic verification handles large selections in bounded batches", async () => {
+  const batches = [];
+  const ui = fixture(async (command, args) => {
+    assert.equal(command, "verify_selected_files");
+    batches.push(args.paths.length);
+    return args.paths.map((input) => ({ input, state: "verified", complete: true }));
+  }, "main", true);
+  ui.evaluate('state.keyLoaded=true; fileVerification.ready=true; addSelectedFiles(Array.from({length:70},(_,i)=>`C:/folder/${i}.fenc`))');
+  await settle();
+  assert.deepEqual(batches, [32, 32, 6]);
+  assert.equal(ui.evaluate('[...fileVerification.entries.values()].every(result=>result.state==="verified")'), true);
+  assert.equal(ui.evaluate("state.busy"), false);
+});
+
+test("key changes invalidate checkmarks and ignore verification from the previous key", async () => {
+  const requests = [];
+  const ui = fixture((command, args) => new Promise((resolve) => { requests.push({ args, resolve }); }), "main", true);
+  ui.evaluate('fileVerification.ready=true; addSelectedFiles(["C:/private.fenc"])');
+  assert.equal(requests.length, 0);
+  ui.context.loaded = { ...savedKeyStatus, keyRevision: 1 };
+  ui.evaluate('applyStatus(loaded,false)');
+  assert.equal(requests.length, 1);
+  ui.context.changed = { ...savedKeyStatus, fingerprint: "other", keyRevision: 2 };
+  ui.evaluate('applyStatus(changed,false)');
+  requests[0].resolve([{ input: "C:/private.fenc", state: "verified", complete: true }]);
+  await settle();
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].args.keyRevision, 2);
+  assert.equal(ui.evaluate('fileVerification.entries.get("C:/private.fenc").state'), "checking");
+  requests[1].resolve([{ input: "C:/private.fenc", state: "failed", message: "Authentication failed" }]);
+  await settle();
+  assert.match(ui.refs.get("file-list").children[0].children[0].children[0].children[0].title, /Authentication failed/);
+});
+
+test("removing and adding the same file ignores the previous verification result", async () => {
+  const requests = [];
+  const ui = fixture((command, args) => new Promise((resolve) => { requests.push({ args, resolve }); }), "main", true);
+  ui.evaluate('state.keyLoaded=true; fileVerification.ready=true; addSelectedFiles(["C:/private.fenc"])');
+  ui.refs.get("file-list").children[0].children[1].handlers.get("click")();
+  ui.evaluate('addSelectedFiles(["C:/private.fenc"])');
+  requests[0].resolve([{ input: "C:/private.fenc", state: "verified", complete: true }]);
+  await settle();
+  assert.equal(requests.length, 2);
+  assert.equal(ui.evaluate('fileVerification.entries.get("C:/private.fenc").state'), "checking");
+  requests[1].resolve([{ input: "C:/private.fenc", state: "verified", complete: false, message: "Older ZIP completeness cannot be authenticated." }]);
+  await settle();
+  const badge = ui.refs.get("file-list").children[0].children[0].children[0].children[0];
+  assert.match(badge.className, /is-partial/);
+  assert.match(badge.title, /completeness/);
+});
+
+test("verification pauses for foreground work without repeatedly retrying a paused batch", async () => {
+  let calls = 0;
+  const ui = fixture(async (command, args) => {
+    calls++;
+    return args.paths.map((input) => ({ input, state: calls === 1 ? "pending" : "verified", complete: true }));
+  }, "main", true);
+  ui.evaluate('state.keyLoaded=true; state.busy=true; fileVerification.ready=true; addSelectedFiles(["C:/private.fenc"])');
+  await settle();
+  assert.equal(calls, 0);
+  ui.evaluate('state.busy=false; startAutomaticVerification()');
+  await settle();
+  assert.equal(calls, 1);
+  ui.evaluate('startAutomaticVerification()');
+  await settle();
+  assert.equal(calls, 2);
+  assert.equal(ui.evaluate('fileVerification.entries.get("C:/private.fenc").state'), "verified");
+});
 
 test("large selections stay paged and unrelated actions do not recreate rows", async () => {
   const ui = fixture();
@@ -241,16 +348,17 @@ test("automatic checks back off after errors and stop on an expired receipt with
 const savedKeyStatus = { keyLoaded: true, keyPath: "C:/vault.key", fingerprint: "1234", sandboxAvailable: true };
 const textPreview = (text = "private contents") => ({ kind: "text", mime: "text/plain", data: Buffer.from(text).toString("base64") });
 
-test("encrypted selections warn until a key is loaded", () => {
+test("encrypted selections keep key-dependent actions disabled without a duplicate Files warning", () => {
   const ui = fixture();
   ui.evaluate('addSelectedFiles(["C:/notes.txt"])');
-  assert.equal(ui.refs.get("missing-key-warning").hidden, true);
   ui.evaluate('addSelectedFiles(["C:/private.FENC", "C:/bundle.zip"])');
-  assert.equal(ui.refs.get("missing-key-warning").hidden, false);
-  assert.match(ui.refs.get("missing-key-title").textContent, /No encryption key loaded/);
+  assert.equal(ui.refs.has("missing-key-warning"), false);
+  assert.equal(ui.refs.get("decrypt").disabled, true);
+  assert.equal(ui.refs.get("view-sandbox").disabled, true);
+  assert.doesNotMatch(fs.readFileSync(new URL("../src/index.html", import.meta.url), "utf8"), /id="missing-key-warning"/);
   ui.context.status = savedKeyStatus;
   ui.evaluate("applyStatus(status, false)");
-  assert.equal(ui.refs.get("missing-key-warning").hidden, true);
+  assert.equal(ui.refs.get("decrypt").disabled, false);
 });
 
 const disconnectedKeyStatus = {
@@ -258,7 +366,173 @@ const disconnectedKeyStatus = {
   sandboxAvailable: false, startupKeyUnavailable: true,
 };
 
+test("files and folders can be added without a key and show blue key badges until a key is loaded", async () => {
+  const calls = [];
+  const ui = fixture(async (command, args) => {
+    calls.push(command);
+    if (command === "get_status") return { keyLoaded: false, keyRevision: 0 };
+    if (command === "pick_input_files") return ["C:/notes.txt", "C:/private.fenc"];
+    if (command === "pick_input_folder") return { paths: ["C:/folder/bundle.zip"], roots: { "C:/folder/bundle.zip": "C:/folder" } };
+    if (command === "verify_selected_files") return args.paths.map((input) => ({ input, state: "verified", complete: true }));
+  }, "main", true);
+  await ui.evaluate("init()");
+  assert.equal(ui.refs.get("add-files").disabled, false);
+  assert.equal(ui.refs.get("add-folder").disabled, false);
+  await ui.refs.get("add-files").handlers.get("click")();
+  await ui.refs.get("add-folder").handlers.get("click")();
+  assert.equal(ui.evaluate("state.files.length"), 3);
+  assert.equal(calls.includes("verify_selected_files"), false);
+  for (const row of ui.refs.get("file-list").children) {
+    const badge = row.children[0].children[0].children[0];
+    assert.match(badge.className, /is-needsKey/);
+    assert.equal(badge.innerHTML, ui.evaluate("EXPLORER_ICONS.needsKey"));
+    assert.match(badge.title, /Load a key/);
+    assert.equal(row.children[1].disabled, false);
+  }
+  ui.context.loaded = { ...savedKeyStatus, keyRevision: 1 };
+  ui.evaluate("applyStatus(loaded,false)");
+  await settle();
+  assert.match(ui.refs.get("file-list").children[0].children[0].children[0].children[0].className, /is-unencrypted/);
+  assert.match(ui.refs.get("file-list").children[1].children[0].children[0].children[0].className, /is-verified/);
+});
+
+test("disconnected selection remains editable while a cancelled operation is winding down", async () => {
+  const ui = fixture(async (command) => {
+    if (command === "get_status") return { ...savedKeyStatus, keyRevision: 1 };
+    if (command === "pick_input_files") return ["C:/new.fenc"];
+  });
+  await ui.evaluate("init()");
+  ui.evaluate('addSelectedFiles(["C:/old.fenc"]); state.busy=true; state.jobRunning=true');
+  ui.events.get("key-status-changed")({ payload: { ...disconnectedKeyStatus, keyRevision: 2 } });
+  const remove = ui.refs.get("file-list").children[0].children[1];
+  assert.equal(remove.disabled, false);
+  assert.equal(ui.refs.get("add-files").disabled, false);
+  assert.equal(ui.refs.get("add-folder").disabled, false);
+  assert.equal(ui.refs.get("choose-recovery-key").disabled, false);
+  ui.refs.get("choose-recovery-key").handlers.get("click")();
+  assert.equal(ui.refs.get("startup-key-dialog").open, false);
+  remove.handlers.get("click")();
+  assert.equal(ui.evaluate("state.files.length"), 0);
+  await ui.refs.get("add-files").handlers.get("click")();
+  assert.equal(ui.evaluate('state.fileSet.has("C:/new.fenc")'), true);
+  assert.equal(ui.evaluate("state.busy"), true, "editing the selection must not unlock the pending operation");
+  assert.match(ui.refs.get("file-list").children[0].children[0].children[0].children[0].className, /is-disconnected/);
+});
+
 const settle = () => new Promise(setImmediate);
+
+test("startup restores remembered paths and folder roots when a saved key is loaded", async () => {
+  const selection = { paths: ["E:/encrypted/notes.fenc", "E:/encrypted/photos.zip"], roots: { "E:/encrypted/notes.fenc": "E:/encrypted" } };
+  const calls = [];
+  const ui = fixture(async (command) => {
+    calls.push(command);
+    if (command === "get_status") return { ...savedKeyStatus, keyRevision: 1 };
+    if (command === "restore_selected_files") return selection;
+  });
+  await ui.evaluate("init()");
+  assert.equal(ui.evaluate("JSON.stringify(state.files)"), JSON.stringify(selection.paths));
+  assert.equal(ui.evaluate("state.folderRoots.get('E:/encrypted/notes.fenc')"), "E:/encrypted");
+  assert.equal(ui.evaluate("state.fileSet.size"), 2);
+  assert.equal(ui.refs.get("file-list").children.length, 2);
+  assert.equal(ui.refs.get("file-count").textContent, "(2)");
+  assert.equal(ui.refs.get("view-sandbox").disabled, false);
+  assert.equal(ui.evaluate("state.pendingJob"), null);
+  assert.deepEqual(calls, ["get_status", "restore_selected_files"]);
+  ui.events.get("key-status-changed")({ payload: { ...savedKeyStatus, keyRevision: 2 } });
+  await settle();
+  assert.deepEqual(calls, ["get_status", "restore_selected_files"], "later status changes do not reload the list");
+});
+
+test("a remembered list waits for an unavailable or protected file key and restores after it is loaded", async () => {
+  for (const initial of [disconnectedKeyStatus, { ...disconnectedKeyStatus, startupKeyUnavailable: false }]) {
+    const calls = [];
+    const ui = fixture(async (command) => {
+      calls.push(command);
+      if (command === "get_status") return { ...initial, keyRevision: 1 };
+      if (command === "restore_selected_files") return { paths: ["E:/private.fenc"], roots: {} };
+    });
+    await ui.evaluate("init()");
+    assert.equal(ui.evaluate("state.files.length"), 0);
+    assert.deepEqual(calls, ["get_status"]);
+    ui.context.unlocked = { ...savedKeyStatus, keyRevision: 2 };
+    await ui.evaluate("run(async()=>unlocked,true)");
+    await settle();
+    assert.equal(ui.evaluate("JSON.stringify(state.files)"), '["E:/private.fenc"]');
+    assert.deepEqual(calls, ["get_status", "restore_selected_files"]);
+  }
+});
+
+test("additions, removals, and clearing update the selection remembered for the next launch", async () => {
+  let remembered = { paths: ["E:/private.fenc"], roots: { "E:/private.fenc": "E:/" } };
+  const saves = [];
+  const invoke = async (command, args) => {
+    if (command === "get_status") return savedKeyStatus;
+    if (command === "restore_selected_files") return remembered;
+    if (command === "remember_selected_files") {
+      const snapshot = JSON.parse(JSON.stringify(args));
+      saves.push(snapshot);
+      remembered = snapshot.selection;
+    }
+  };
+  const ui = fixture(invoke);
+  await ui.evaluate("init()");
+  ui.evaluate('addSelectedFiles({paths:["E:/folder/new.zip"],roots:{"E:/folder/new.zip":"E:/folder"}})');
+  assert.deepEqual(saves[0].selection, { paths: ["E:/private.fenc", "E:/folder/new.zip"], roots: { "E:/private.fenc": "E:/", "E:/folder/new.zip": "E:/folder" } });
+  ui.evaluate('addSelectedFiles(["E:/folder/new.zip"])');
+  assert.equal(saves.length, 1, "unchanged selections are not saved again");
+  ui.refs.get("file-list").children[0].children[1].handlers.get("click")();
+  assert.deepEqual(saves[1].selection, { paths: ["E:/folder/new.zip"], roots: { "E:/folder/new.zip": "E:/folder" } });
+  ui.refs.get("clear-files").handlers.get("click")();
+  assert.deepEqual(saves[2].selection, { paths: [], roots: {} });
+  assert.deepEqual(saves.map(({ revision }) => revision), [1, 2, 3]);
+  const reopened = fixture(invoke);
+  await reopened.evaluate("init()");
+  assert.equal(reopened.evaluate("state.files.length"), 0);
+  assert.equal(reopened.refs.get("file-empty").hidden, false);
+});
+
+test("late startup restoration cannot resurrect cleared files or overwrite a new selection", async () => {
+  for (const clear of [true, false]) {
+    let finish;
+    const saves = [];
+    const ui = fixture(async (command, args) => {
+      if (command === "get_status") return savedKeyStatus;
+      if (command === "restore_selected_files") return new Promise((resolve) => { finish = resolve; });
+      if (command === "remember_selected_files") saves.push(JSON.parse(JSON.stringify(args.selection)));
+    });
+    const initializing = ui.evaluate("init()");
+    await settle();
+    ui.evaluate('addSelectedFiles(["C:/new.fenc"])');
+    if (clear) ui.refs.get("clear-files").handlers.get("click")();
+    finish({ paths: ["E:/old.fenc"], roots: {} });
+    await initializing;
+    assert.equal(ui.evaluate("JSON.stringify(state.files)"), clear ? "[]" : '["C:/new.fenc"]');
+    assert.deepEqual(saves.at(-1), { paths: clear ? [] : ["C:/new.fenc"], roots: {} });
+  }
+});
+
+test("key loss during startup defers the list until a fresh restore after reconnection", async () => {
+  let finish;
+  let reads = 0;
+  const selection = { paths: ["E:/private.fenc"], roots: {} };
+  const ui = fixture(async (command) => {
+    if (command === "get_status") return { ...savedKeyStatus, keyRevision: 1 };
+    if (command === "restore_selected_files") {
+      if (++reads === 1) return new Promise((resolve) => { finish = resolve; });
+      return selection;
+    }
+  });
+  const initializing = ui.evaluate("init()");
+  await settle();
+  ui.events.get("key-status-changed")({ payload: { ...disconnectedKeyStatus, keyRevision: 2 } });
+  finish(selection);
+  await initializing;
+  assert.equal(ui.evaluate("state.files.length"), 0);
+  ui.events.get("key-status-changed")({ payload: { ...savedKeyStatus, keyRevision: 3 } });
+  await settle();
+  assert.equal(reads, 2);
+  assert.equal(ui.evaluate("JSON.stringify(state.files)"), JSON.stringify(selection.paths));
+});
 
 test("key reconnection keeps file selection and options without restarting work or restoring a cleared list", async () => {
   const calls = [];
@@ -272,7 +546,7 @@ test("key reconnection keeps file selection and options without restarting work 
   const roots = ui.evaluate("JSON.stringify([...state.folderRoots])");
   const changed = ui.events.get("key-status-changed");
   changed({ payload: { ...disconnectedKeyStatus, keyRevision: 2 } });
-  assert.match(ui.refs.get("key-recovery-files").textContent, /2 selected files are kept/);
+  assert.equal(ui.refs.has("key-recovery-files"), false);
   assert.equal(ui.refs.get("file-list").children.length, 2);
   changed({ payload: { ...savedKeyStatus, keyRevision: 3 } });
   await settle();
@@ -284,15 +558,15 @@ test("key reconnection keeps file selection and options without restarting work 
   assert.equal(ui.refs.get("overwrite").checked, true);
   assert.equal(ui.refs.get("remove-original").checked, true);
   assert.equal(ui.refs.get("output-dir").value, "C:/restored");
-  assert.deepEqual(calls, ["get_status"]);
+  assert.deepEqual(calls, ["get_status", "restore_selected_files", "remember_selected_files"]);
   changed({ payload: { ...disconnectedKeyStatus, keyRevision: 4 } });
   ui.refs.get("startup-key-dialog").close();
   ui.refs.get("clear-files").handlers.get("click")();
   changed({ payload: { ...savedKeyStatus, keyRevision: 5 } });
   assert.equal(ui.evaluate("state.files.length"), 0);
   assert.equal(ui.refs.get("decrypt").disabled, true);
-  assert.equal(ui.refs.get("key-recovery-files").hidden, true);
-  assert.deepEqual(calls, ["get_status"]);
+  assert.equal(ui.refs.has("key-recovery-files"), false);
+  assert.deepEqual(calls, ["get_status", "restore_selected_files", "remember_selected_files", "remember_selected_files"]);
 });
 
 test("a preview finishing after disconnect and reconnect cannot reveal stale names or start a job", async () => {
@@ -381,13 +655,28 @@ test("reconnecting the same key opens a fresh sandbox and restores the previous 
   const changed = ui.events.get("key-status-changed");
   change({ ...disconnectedKeyStatus, keyRevision: 2 });
   assert.equal(ui.refs.get("startup-key-dialog").open, true);
+  assert.equal(ui.refs.get("sandbox-dialog").open, false);
+  assert.equal(ui.refs.has("startup-key-options"), false);
+  assert.equal(ui.refs.get("file-list").children.length, 2);
+  assert.equal(ui.evaluate('JSON.stringify(state.files)'), '["C:/private.fenc","C:/bundle.zip"]');
+  for (const row of ui.refs.get("file-list").children) {
+    const badge = row.children[0].children[0].children[0];
+    assert.match(badge.className, /is-disconnected/);
+    assert.match(badge.title, /Key disconnected/);
+    assert.equal(badge.innerHTML, ui.evaluate("EXPLORER_ICONS.disconnected"));
+  }
   assert.equal(ui.refs.get("startup-key-path").textContent, "C:/vault.key");
   assert.equal(ui.refs.get("fingerprint").textContent, "Key disconnected");
-  assert.equal(ui.refs.get("missing-key-title").textContent, "Key disconnected.");
-  assert.equal(ui.refs.get("missing-key-warning").hidden, false);
+  assert.equal(ui.refs.get("current-key-icon").innerHTML, ui.evaluate("EXPLORER_ICONS.unplug"));
+  assert.match(ui.refs.get("current-key-icon").className, /is-disconnected/);
+  assert.equal(ui.refs.get("key-message").textContent, "Reconnect your key drive to continue.");
+  assert.equal(ui.refs.get("key-filename").textContent, "vault.key");
+  assert.equal(ui.refs.get("key-filename").title, "C:/vault.key");
+  assert.equal(ui.refs.get("key-filename").hidden, false);
+  assert.equal(ui.refs.has("missing-key-warning"), false);
   assert.equal(ui.refs.get("decrypt").disabled, true);
   assert.equal(ui.evaluate("sandbox.sessionId"), null);
-  assert.equal(ui.refs.get("sandbox-preview").children.length, 0);
+  assert.equal(ui.refs.has("sandbox-preview"), false);
   assert.equal(ui.refs.get("sandbox-list").children.length, 0);
   assert.equal(ui.refs.get("key-recovery-sandbox").hidden, false);
   assert.equal(ui.evaluate("sandbox.recovery.itemId"), 1);
@@ -396,19 +685,62 @@ test("reconnecting the same key opens a fresh sandbox and restores the previous 
   changed({ payload: { ...savedKeyStatus, keyRevision: 3, message: "Key reconnected and loaded." } });
   await settle();
   assert.equal(ui.refs.get("startup-key-dialog").open, false);
-  assert.equal(ui.refs.get("missing-key-warning").hidden, true);
+  assert.equal(ui.refs.get("sandbox-dialog").open, true);
+  assert.equal(ui.refs.get("file-list").children.length, 2);
+  for (const row of ui.refs.get("file-list").children) {
+    assert.match(row.children[0].children[0].children[0].className, /is-verified/);
+  }
   assert.equal(ui.refs.get("decrypt").disabled, false);
   assert.equal(ui.refs.get("view-sandbox").disabled, false);
-  assert.equal(ui.refs.get("key-message").textContent, "Key reconnected and loaded.");
+  assert.equal(ui.refs.get("key-message").textContent, "");
+  assert.equal(ui.refs.get("fingerprint").textContent, "Key loaded");
+  assert.equal(ui.refs.get("fingerprint").title, "Fingerprint: 1234");
   assert.equal(ui.refs.get("alert").textContent, "An unrelated file error");
   assert.equal(ui.evaluate("sandbox.sessionId"), "2");
-  assert.equal(ui.refs.get("sandbox-preview").children.length, 1);
-  assert.match(ui.refs.get("sandbox-preview").children[0].srcdoc, /preview 2\/1/);
-  assert.equal(ui.refs.get("sandbox-file-name").textContent, "second.txt");
+  assert.equal(ui.evaluate("sandbox.openedItemId"), 1);
+  const previewOpenings = calls.filter(({ command }) => command === "open_sandbox_preview");
+  assert.equal(previewOpenings.length, 2);
+  assert.equal(previewOpenings[1].args.sessionId, "2");
   assert.equal(ui.evaluate("sandbox.recovery"), null);
   const openings = calls.filter(({ command }) => command === "open_sandbox");
   assert.equal(openings.length, 2);
   assert.equal(JSON.stringify(openings[1].args.paths), '["C:/private.fenc","C:/bundle.zip"]');
+  ui.evaluate("resetSandbox()");
+});
+
+test("removing or clearing disconnected files prevents recovery from reopening removed sources", async () => {
+  for (const clear of [false, true]) {
+    const { ui, calls, change } = await recoveryFixture();
+    change({ ...disconnectedKeyStatus, keyRevision: 2 });
+    ui.refs.get("choose-recovery-key").handlers.get("click")();
+    if (clear) ui.refs.get("clear-files").handlers.get("click")();
+    else ui.refs.get("file-list").children[1].children[1].handlers.get("click")();
+    change({ ...savedKeyStatus, keyRevision: 3 });
+    await settle();
+    const openings = calls.filter(({ command }) => command === "open_sandbox");
+    assert.equal(openings.length, clear ? 1 : 2);
+    if (!clear) assert.equal(JSON.stringify(openings[1].args.paths), '["C:/private.fenc"]');
+    assert.equal(calls.filter(({ command }) => command === "open_sandbox_preview").length, 1);
+    ui.evaluate("resetSandbox()");
+  }
+});
+
+test("a delayed close event from hiding the sandbox cannot clear a restored viewer", async () => {
+  const { ui, change } = await recoveryFixture();
+  const dialog = ui.refs.get("sandbox-dialog");
+  const closed = dialog.handlers.get("close");
+  dialog.close = function () { this.open = false; };
+  change({ ...disconnectedKeyStatus, keyRevision: 2 });
+  assert.equal(dialog.open, false);
+  assert.equal(ui.evaluate("sandbox.hiddenClosures"), 1);
+  change({ ...savedKeyStatus, keyRevision: 3 });
+  await settle();
+  assert.equal(dialog.open, true);
+  assert.equal(ui.evaluate("sandbox.sessionId"), "2");
+  closed();
+  assert.equal(ui.evaluate("sandbox.hiddenClosures"), 0);
+  assert.equal(ui.evaluate("sandbox.sessionId"), "2");
+  assert.equal(ui.evaluate("sandbox.openedItemId"), 1);
   ui.evaluate("resetSandbox()");
 });
 
@@ -423,8 +755,47 @@ test("a quick key reconnect recovers even before the global key monitor reports 
   await ui.fireTimer();
   await settle();
   assert.equal(ui.evaluate("sandbox.sessionId"), "2");
-  assert.equal(ui.refs.get("sandbox-file-name").textContent, "second.txt");
+  assert.equal(ui.evaluate("sandbox.openedItemId"), 1);
   ui.evaluate("resetSandbox()");
+});
+
+test("key-loss preview closures restore the sandbox and last opened file in every event order", async () => {
+  for (const order of ["preview-first", "status-first", "sandbox-first"]) {
+    const { ui, calls, change, setAvailable } = await recoveryFixture();
+    // Selecting a different file must not replace the preview to recover.
+    ui.evaluate("selectSandboxEntry(sandbox.entries[0])");
+    setAvailable(false);
+    const previewClosed = () => ui.events.get("sandbox-preview-closed")({ payload: { sessionId: "1", itemId: 1, locked: true } });
+    const disconnected = () => change({ ...disconnectedKeyStatus, keyRevision: 2 });
+    if (order === "preview-first") {
+      previewClosed();
+      disconnected();
+    } else if (order === "status-first") {
+      disconnected();
+      previewClosed();
+    } else {
+      ui.events.get("sandbox-locked")({ payload: "1" });
+      previewClosed();
+      disconnected();
+    }
+    assert.equal(ui.refs.get("sandbox-dialog").open, false);
+    assert.equal(ui.evaluate("sandbox.sessionId"), null);
+    assert.equal(ui.evaluate("sandbox.recovery.itemId"), 1);
+    assert.equal(ui.refs.get("sandbox-list").children.length, 0);
+    setAvailable(true);
+    change({ ...savedKeyStatus, keyRevision: 3 });
+    await settle();
+    assert.equal(ui.refs.get("sandbox-dialog").open, true);
+    assert.equal(ui.evaluate("sandbox.sessionId"), "2");
+    assert.equal(ui.evaluate("sandbox.openedItemId"), 1);
+    const previews = calls.filter(({ command }) => command === "open_sandbox_preview");
+    assert.equal(previews.length, 2);
+    assert.equal(previews[1].args.itemId, 1);
+    assert.equal(previews[1].args.sessionId, "2");
+    previewClosed();
+    assert.equal(ui.evaluate("sandbox.sessionId"), "2", "late closure from the old session cannot lock the restored sandbox");
+    ui.evaluate("resetSandbox()");
+  }
 });
 
 test("sandbox recovery waits for a protected key to be unlocked in Key options", async () => {
@@ -435,14 +806,14 @@ test("sandbox recovery waits for a protected key to be unlocked in Key options",
   assert.equal(ui.evaluate("sandbox.sessionId"), null);
   assert.equal(ui.evaluate("sandbox.recovery.waitingForUnlock"), true);
   assert.equal(ui.timers.size, 0);
-  ui.refs.get("sandbox-key-options").handlers.get("click")();
+  ui.refs.get("open-key-options").handlers.get("click")();
   assert.equal(ui.refs.get("key-dialog").open, true);
   change({ ...savedKeyStatus, keyRevision: 4 });
   assert.equal(calls.filter(({ command }) => command === "open_sandbox").length, 1);
   ui.refs.get("key-dialog").close();
   await settle();
   assert.equal(ui.evaluate("sandbox.sessionId"), "2");
-  assert.equal(ui.refs.get("sandbox-file-name").textContent, "second.txt");
+  assert.equal(ui.evaluate("sandbox.openedItemId"), 1);
   ui.evaluate("resetSandbox()");
 });
 
@@ -453,10 +824,12 @@ test("closing, unloading, or switching keys cancels automatic sandbox recovery",
       setAvailable(false);
       await ui.fireTimer();
       change({ ...disconnectedKeyStatus, keyRevision: 2, startupKeyUnavailable: false });
+    } else if (action === "close") {
+      ui.refs.get("sandbox-dialog").close();
+      change({ ...disconnectedKeyStatus, keyRevision: 2 });
     } else {
       change({ ...disconnectedKeyStatus, keyRevision: 2 });
-      if (action === "close") ui.refs.get("sandbox-dialog").close();
-      else change({ ...savedKeyStatus, keyRevision: 3, fingerprint: "different-key" });
+      change({ ...savedKeyStatus, keyRevision: 3, fingerprint: "different-key" });
     }
     assert.equal(ui.evaluate("sandbox.recovery"), null);
     setAvailable(true);
@@ -483,28 +856,31 @@ test("reconnected sandbox waits for an in-flight action to finish", async () => 
   ui.evaluate("resetSandbox()");
 });
 
-test("popup checks the saved path and offers a direct picker with inline errors", async () => {
+test("Back to files only dismisses the popup and key picking stays in the main window", async () => {
   const calls = [];
   let selected = false;
   const ui = fixture(async (command) => {
     calls.push(command);
     if (command === "browse_key") {
+      assert.equal(ui.refs.get("startup-key-dialog").open, false);
       if (!selected) throw new Error("This key needs its passphrase. Open Key options to unlock it.");
       return { ...savedKeyStatus, keyRevision: 2 };
     }
     return { ...disconnectedKeyStatus, keyRevision: 1 };
   });
   await ui.evaluate("init()");
-  await ui.refs.get("check-key-again").handlers.get("click")();
-  assert.ok(calls.includes("recheck_key_file"));
-  assert.equal(ui.refs.get("key-recovery-status").textContent, "Still waiting for your key");
+  assert.equal(ui.refs.has("check-key-again"), false);
+  assert.equal(ui.refs.has("close-startup-key"), false);
   ui.refs.get("choose-recovery-key").handlers.get("click")();
+  assert.equal(ui.refs.get("startup-key-dialog").open, false);
+  assert.equal(calls.includes("browse_key"), false);
+  ui.refs.get("browse-load").handlers.get("click")();
   await settle();
-  assert.equal(ui.refs.get("startup-key-dialog").open, true);
-  assert.equal(ui.refs.get("key-recovery-alert").hidden, false);
-  assert.match(ui.refs.get("key-recovery-alert").textContent, /passphrase/);
+  assert.equal(ui.refs.get("startup-key-dialog").open, false);
+  assert.equal(ui.refs.get("alert").hidden, false);
+  assert.match(ui.refs.get("alert").textContent, /passphrase/);
   selected = true;
-  ui.refs.get("choose-recovery-key").handlers.get("click")();
+  ui.refs.get("browse-load").handlers.get("click")();
   await settle();
   assert.equal(ui.refs.get("startup-key-dialog").open, false);
   assert.equal(ui.evaluate("state.keyLoaded"), true);
@@ -584,19 +960,26 @@ test("sandbox control requires a saved key even when a session key is loaded", (
   ui.evaluate('applyStatus({keyLoaded:true,keyPath:null,fingerprint:"1234",sandboxAvailable:true},false)');
   assert.equal(ui.refs.get("view-sandbox").disabled, true);
   assert.equal(ui.refs.get("decrypt").disabled, false);
+  assert.equal(ui.refs.get("key-filename").hidden, true);
+  assert.equal(ui.refs.get("key-filename").textContent, "");
+  assert.equal(ui.refs.get("key-filename").title, "");
+  assert.equal(ui.refs.get("fingerprint").textContent, "Session key");
+  ui.evaluate('applyStatus({keyLoaded:true,keyPath:null,fingerprint:"1234",message:"Key loaded for this session only. It will be cleared when you close the app."},false)');
+  assert.match(ui.refs.get("key-message").textContent, /session only/);
+  ui.evaluate('applyStatus({keyLoaded:true,keyPath:null,fingerprint:"1234",message:"Key loaded. Could not save preferences."},false)');
+  assert.match(ui.refs.get("key-message").textContent, /Could not save preferences/);
 });
 
-test("sandbox uses an isolated inert preview and never invokes disk decryption", async () => {
+test("native preview uses an isolated inert frame and never invokes disk decryption", async () => {
   const calls = [];
   const content = textPreview('<script>parent.stolen=true</script><img src="https://example.com/leak">');
   const ui = fixture(async (command, args) => {
     calls.push({ command, args });
-    if (command === "open_sandbox") return { sessionId: "1", items: [{ id: 0, name: "private.html", kind: "text" }], warnings: [] };
-    if (command === "read_sandbox_file") return content;
-  });
-  readySandbox(ui);
-  await ui.evaluate("openSandbox()");
-  const frame = ui.refs.get("sandbox-preview").children[0];
+    if (command === "sandbox_preview_info") return { sessionId: "1", item: { id: 0, name: "private.html", kind: "text" } };
+    if (command === "read_sandbox_preview") return content;
+  }, "sandbox-preview");
+  await ui.evaluate("initPrivatePreview()");
+  const frame = ui.refs.get("preview-content").children[0];
   assert.equal(frame.attributes.get("sandbox"), "");
   assert.equal(frame.attributes.get("referrerpolicy"), "no-referrer");
   assert.match(frame.srcdoc, /&lt;script&gt;/);
@@ -604,12 +987,10 @@ test("sandbox uses an isolated inert preview and never invokes disk decryption",
   assert.match(frame.srcdoc, /default-src 'none'/);
   assert.match(frame.srcdoc, /img-src data:; media-src data:/);
   assert.equal(content.data, "");
-  assert.ok(calls.every(({ command }) => ["open_sandbox", "read_sandbox_file", "check_sandbox"].includes(command)));
-  ui.evaluate("resetSandbox()");
-  assert.equal(ui.refs.get("sandbox-preview").children.length, 0);
-  assert.equal(ui.refs.get("sandbox-list").children.length, 0);
-  assert.equal(ui.evaluate("sandbox.items.length"), 0);
-  assert.equal(ui.refs.get("sandbox-file-name").textContent, "");
+  assert.ok(calls.every(({ command }) => ["sandbox_preview_info", "read_sandbox_preview", "check_sandbox"].includes(command)));
+  ui.evaluate("closePrivatePreview()");
+  assert.equal(ui.refs.get("preview-content").children.length, 0);
+  assert.equal(ui.evaluate("document.title"), "Private preview - FileEncrypt");
   assert.equal(ui.timers.size, 0);
 });
 
@@ -636,35 +1017,30 @@ test("media stays inside the isolated document and active image formats are refu
 test("loss of key-file access clears already displayed plaintext despite a cached key", async () => {
   let available = true;
   const ui = fixture(async (command) => {
-    if (command === "open_sandbox") return { sessionId: "1", items: [{ id: 0, name: "private.txt" }], warnings: [] };
-    if (command === "read_sandbox_file") return textPreview();
+    if (command === "sandbox_preview_info") return { sessionId: "1", item: { id: 0, name: "private.txt" } };
+    if (command === "read_sandbox_preview") return textPreview();
     if (command === "check_sandbox" && !available) throw new Error("Key file unavailable");
-  });
-  readySandbox(ui);
-  await ui.evaluate("openSandbox()");
-  assert.equal(ui.refs.get("sandbox-preview").children.length, 1);
+  }, "sandbox-preview");
+  await ui.evaluate("initPrivatePreview()");
+  assert.equal(ui.refs.get("preview-content").children.length, 1);
   available = false;
   await ui.fireTimer();
-  assert.equal(ui.evaluate("state.keyLoaded"), true);
-  assert.equal(ui.evaluate("sandbox.sessionId"), null);
-  assert.equal(ui.refs.get("sandbox-preview").children.length, 0);
-  assert.equal(ui.refs.get("sandbox-list").children.length, 0);
-  assert.match(ui.refs.get("sandbox-status").textContent, /Key file unavailable/);
-  assert.equal(ui.timers.size, 1);
-  ui.evaluate("resetSandbox()");
+  assert.equal(ui.evaluate("previewWindow.closed"), true);
+  assert.equal(ui.refs.get("preview-content").children.length, 0);
+  assert.equal(ui.evaluate("document.title"), "Private preview - FileEncrypt");
   assert.equal(ui.timers.size, 0);
 });
 
 test("a stalled key check locks after its deadline and cannot revive the preview", async () => {
   let finish;
-  const ui = fixture((command) => command === "check_sandbox" ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve());
-  ui.evaluate('sandbox.sessionId="1"; $("sandbox-preview").append(document.createElement("iframe")); scheduleSandboxCheck()');
+  const ui = fixture((command) => command === "check_sandbox" ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve(), "sandbox-preview");
+  ui.evaluate('previewWindow.sessionId="1"; previewElement("preview-content").append(document.createElement("iframe")); schedulePrivatePreviewCheck()');
   const check = ui.fireTimer();
   assert.equal(ui.timers.values().next().value.delay, 1500);
   ui.fireTimer();
   await check;
-  assert.equal(ui.evaluate("sandbox.sessionId"), null);
-  assert.equal(ui.refs.get("sandbox-preview").children.length, 0);
+  assert.equal(ui.evaluate("previewWindow.closed"), true);
+  assert.equal(ui.refs.get("preview-content").children.length, 0);
   finish();
   await Promise.resolve();
   assert.equal(ui.timers.size, 0);
@@ -673,15 +1049,18 @@ test("a stalled key check locks after its deadline and cannot revive the preview
 test("a delayed plaintext response cannot repopulate a closed or locked sandbox", async () => {
   let finish;
   const content = textPreview();
-  const ui = fixture((command) => command === "read_sandbox_file" ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve());
-  ui.evaluate('sandbox.sessionId="1"');
-  const viewing = ui.evaluate('viewSandboxFile({id:0,name:"private.txt"})');
-  ui.evaluate("lockSandbox()");
+  const ui = fixture((command) => {
+    if (command === "sandbox_preview_info") return Promise.resolve({ sessionId: "1", item: { id: 0, name: "private.txt" } });
+    return command === "read_sandbox_preview" ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve();
+  }, "sandbox-preview");
+  const viewing = ui.evaluate('loadPrivatePreview()');
+  await settle();
+  ui.evaluate("closePrivatePreview()");
   finish(content);
   await viewing;
-  assert.equal(ui.refs.get("sandbox-preview").children.length, 0);
+  assert.equal(ui.refs.get("preview-content").children.length, 0);
   assert.equal(content.data, "");
-  assert.equal(ui.evaluate("sandbox.sessionId"), null);
+  assert.equal(ui.evaluate("previewWindow.closed"), true);
 });
 
 test("a catalogue that arrives after closing is revoked without revealing file names", async () => {
@@ -700,4 +1079,242 @@ test("a catalogue that arrives after closing is revoked without revealing file n
   assert.deepEqual(closed, ["late"]);
   assert.equal(ui.refs.get("sandbox-list").children.length, 0);
   assert.equal(ui.evaluate("state.busy"), false);
+});
+
+function explorerFixture(items) {
+  const ui = fixture(async () => {});
+  ui.context.catalogItems = items;
+  ui.evaluate('sandbox.items=catalogItems; sandbox.sessionId="explorer"; indexSandboxFiles(); renderSandboxExplorer()');
+  return ui;
+}
+
+test("explorer groups paths into folders and opens the correct file when names repeat", () => {
+  const ui = explorerFixture([
+    { id: 0, name: "Projects/April/report.txt", kind: "text" },
+    { id: 1, name: "Projects\\May\\report.txt", kind: "text" },
+    { id: 2, name: "Photos/spring.jpg", kind: "image" },
+    { id: 3, name: "readme.md", kind: "text" },
+  ]);
+  assert.equal(ui.refs.get("sandbox-list").children.length, 3);
+  assert.equal(ui.evaluate('sandbox.folders.get("Projects").count'), 2);
+  assert.equal(ui.refs.get("sandbox-total").textContent, "4");
+  ui.evaluate('navigateSandbox("Projects/May")');
+  const file = ui.refs.get("sandbox-list").children[0].children[0];
+  assert.equal(file.sandboxItemId, 1);
+  assert.equal(file.children[1].textContent, "report.txt");
+  assert.equal(ui.refs.get("sandbox-location-name").textContent, "May");
+  const crumbs = ui.refs.get("sandbox-breadcrumbs").children.filter((e) => e.handlers.has("click"));
+  assert.deepEqual(crumbs.map((e) => e.textContent), ["Sandbox", "Projects", "May"]);
+  crumbs[1].handlers.get("click")();
+  assert.equal(ui.evaluate("sandbox.folder"), "Projects");
+  assert.equal(ui.refs.get("sandbox-list").children.length, 2);
+});
+
+test("explorer history supports back, forward, and branching from an earlier folder", () => {
+  const ui = explorerFixture([
+    { id: 0, name: "A/file.txt", kind: "text" },
+    { id: 1, name: "B/photo.png", kind: "image" },
+  ]);
+  ui.evaluate('navigateSandbox("A"); navigateSandbox("B"); stepSandboxHistory(-1)');
+  assert.equal(ui.evaluate("sandbox.folder"), "A");
+  assert.equal(ui.refs.get("sandbox-forward").disabled, false);
+  ui.evaluate("stepSandboxHistory(1)");
+  assert.equal(ui.evaluate("sandbox.folder"), "B");
+  ui.evaluate('stepSandboxHistory(-1); navigateSandbox("", "image")');
+  assert.equal(ui.refs.get("sandbox-forward").disabled, true);
+  assert.equal(ui.evaluate("sandbox.category"), "image");
+  ui.evaluate("stepSandboxHistory(-1)");
+  assert.equal(ui.evaluate("sandbox.folder"), "A");
+});
+
+test("explorer search spans nested folders and respects the selected file type", () => {
+  const ui = explorerFixture([
+    { id: 0, name: "Photos/Holidays/sunset.png", kind: "image" },
+    { id: 1, name: "Photos/Holidays/sunset-notes.md", kind: "text" },
+    { id: 2, name: "Projects/report.txt", kind: "text" },
+  ]);
+  ui.evaluate('navigateSandbox("Projects"); sandbox.query="SUNSET"; renderSandboxExplorer()');
+  assert.equal(ui.refs.get("sandbox-list").children.length, 2);
+  assert.equal(ui.refs.get("sandbox-list").children[0].children[0].children[2].textContent, "Photos/Holidays");
+  ui.evaluate('navigateSandbox("", "image"); sandbox.query="sunset"; renderSandboxExplorer()');
+  assert.equal(ui.refs.get("sandbox-list").children.length, 1);
+  assert.equal(ui.refs.get("sandbox-list").children[0].children[0].sandboxItemId, 0);
+  ui.evaluate('sandbox.query="no match"; renderSandboxExplorer()');
+  assert.equal(ui.refs.get("sandbox-list").children.length, 0);
+  assert.equal(ui.refs.get("sandbox-browser-empty").hidden, false);
+  assert.equal(ui.refs.get("sandbox-clear-search").hidden, false);
+});
+
+test("explorer sorts naturally with folders first and retains selection across views", () => {
+  const ui = explorerFixture([
+    { id: 0, name: "file10.txt", kind: "text" },
+    { id: 1, name: "file2.txt", kind: "text" },
+    { id: 2, name: "Folder/file.txt", kind: "text" },
+    { id: 3, name: "photo.png", kind: "image" },
+  ]);
+  const labels = () => ui.refs.get("sandbox-list").children.map((row) => row.children[0].children[1].textContent);
+  assert.deepEqual(labels(), ["Folder", "file2.txt", "file10.txt", "photo.png"]);
+  ui.evaluate('sandbox.sort="name-desc"; renderSandboxExplorer()');
+  assert.deepEqual(labels(), ["Folder", "photo.png", "file10.txt", "file2.txt"]);
+  ui.evaluate('selectSandboxEntry(sandbox.entries[1]); sandbox.view="details"; sandbox.sort="type"; renderSandboxExplorer()');
+  assert.equal(ui.refs.get("sandbox-list").className, "explorer-details");
+  assert.equal(ui.refs.get("sandbox-list-heading").hidden, false);
+  const selected = ui.refs.get("sandbox-list").children.map((row) => row.children[0]).find((b) => b.sandboxItemId === 1);
+  assert.equal(selected.attributes.get("aria-pressed"), "true");
+  assert.equal(ui.refs.get("sandbox-details").attributes.get("aria-pressed"), "true");
+  assert.deepEqual(labels(), ["Folder", "photo.png", "file2.txt", "file10.txt"]);
+});
+
+test("explorer bounds large catalogues and resets pagination when changing folders", () => {
+  const ui = explorerFixture(Array.from({ length: 10000 }, (_, id) => ({ id, name: `Folder/file${id}.txt`, kind: "text" })));
+  assert.equal(ui.refs.get("sandbox-list").children.length, 1);
+  ui.evaluate('navigateSandbox("Folder")');
+  assert.equal(ui.refs.get("sandbox-list").children.length, 48);
+  ui.refs.get("sandbox-pages").children[2].handlers.get("click")();
+  assert.equal(ui.refs.get("sandbox-list").children[0].children[0].sandboxItemId, 48);
+  ui.evaluate('navigateSandbox(); navigateSandbox("Folder")');
+  assert.equal(ui.refs.get("sandbox-list").children[0].children[0].sandboxItemId, 0);
+  assert.ok(ui.refs.get("sandbox-folders").children.length <= 9);
+});
+
+test("locking clears explorer names, paths, search, history, properties, and context menu", () => {
+  const ui = explorerFixture([{ id: 0, name: "Private/Secret/report.txt", kind: "text" }]);
+  ui.evaluate('sandbox.paths=["C:/encrypted.fenc"]; sandbox.fingerprint="1234"; navigateSandbox("Private/Secret"); sandbox.query="Secret"; selectSandboxEntry(sandbox.entries[0]); showSandboxProperties(sandbox.entries[0]); renderSandboxExplorer(); lockSandbox()');
+  assert.equal(ui.evaluate("sandbox.folders.size"), 0);
+  assert.equal(ui.evaluate("sandbox.entries.length"), 0);
+  assert.equal(ui.evaluate("sandbox.query"), "");
+  assert.equal(ui.evaluate("sandbox.history.length"), 1);
+  assert.equal(ui.evaluate("sandbox.selectedKey"), null);
+  assert.equal(ui.refs.get("sandbox-property-name").textContent, "");
+  assert.equal(ui.refs.get("sandbox-property-location").textContent, "");
+  assert.equal(ui.refs.get("sandbox-property-icon").children.length, 0);
+  assert.equal(ui.refs.get("sandbox-properties").open, false);
+  assert.equal(ui.refs.get("sandbox-context-menu").hidden, true);
+  assert.equal(ui.refs.get("sandbox-folders").children.length, 0);
+  assert.equal(ui.refs.get("sandbox-search").value, "");
+  assert.equal(ui.refs.get("sandbox-key-state").textContent, "Viewer locked");
+  assert.doesNotMatch(ui.evaluate("JSON.stringify(sandbox.recovery)"), /Private|Secret|report/);
+  ui.evaluate("resetSandbox()");
+});
+
+test("closing the explorer cannot revive a late preview-window response", async () => {
+  let finish;
+  const ui = fixture((command) => command === "open_sandbox_preview" ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve());
+  ui.evaluate('sandbox.sessionId="explorer"; sandbox.items=[{id:0,name:"A/notes.txt",kind:"text"},{id:1,name:"B/notes.txt",kind:"text"}]; indexSandboxFiles(); navigateSandbox("A")');
+  const viewing = ui.evaluate("viewSandboxFile(sandbox.entries[0])");
+  ui.evaluate('resetSandbox()');
+  assert.equal(ui.evaluate("sandbox.currentItemId"), null);
+  finish();
+  await viewing;
+  assert.equal(ui.evaluate("sandbox.openedItemId"), null);
+  assert.equal(ui.refs.has("sandbox-preview"), false);
+  assert.equal(ui.evaluate("sandbox.loading"), false);
+  ui.evaluate("resetSandbox()");
+});
+
+test("single click selects without reading plaintext and double click opens a native window", async () => {
+  const calls = [];
+  const ui = fixture(async (command, args) => { calls.push({ command, args }); });
+  ui.evaluate('sandbox.sessionId="explorer"; sandbox.items=[{id:7,name:"notes.txt",kind:"text"}]; indexSandboxFiles(); renderSandboxExplorer()');
+  const file = ui.refs.get("sandbox-list").children[0].children[0];
+  file.handlers.get("click")();
+  assert.equal(file.attributes.get("aria-pressed"), "true");
+  assert.equal(ui.evaluate("sandbox.selectedKey"), "file:7");
+  assert.equal(calls.length, 0);
+  await file.handlers.get("dblclick")();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, "open_sandbox_preview");
+  assert.equal(calls[0].args.itemId, 7);
+  assert.equal(ui.refs.has("sandbox-preview"), false);
+});
+
+test("folder cards require double click while navigation shortcuts remain single click", () => {
+  const ui = explorerFixture([{ id: 0, name: "Documents/notes.txt", kind: "text" }]);
+  const folder = ui.refs.get("sandbox-list").children[0].children[0];
+  folder.handlers.get("click")();
+  assert.equal(ui.evaluate("sandbox.folder"), "");
+  assert.equal(folder.attributes.get("aria-pressed"), "true");
+  folder.handlers.get("dblclick")();
+  assert.equal(ui.evaluate("sandbox.folder"), "Documents");
+  ui.refs.get("sandbox-categories").children[0].handlers.get("click")();
+  assert.equal(ui.evaluate("sandbox.category"), "text");
+});
+
+test("rebuilt file and navigation icons contain inline Lucide paths without external references", () => {
+  const ui = explorerFixture([{ id: 0, name: "notes.txt", kind: "text" }]);
+  for (let index = 0; index < 3; index++) {
+    ui.evaluate('navigateSandbox("", "text"); renderSandboxExplorer()');
+    const icon = ui.refs.get("sandbox-categories").children[0].children[0].innerHTML;
+    assert.match(icon, /<svg[^>]*>[\s\S]*<path/);
+    assert.doesNotMatch(icon, /<use|href=/);
+    assert.equal(ui.refs.get("sandbox-list").children[0].children[0].children[0].innerHTML, icon);
+  }
+});
+
+test("right click selects a file and offers working open, containing-folder, and properties options", () => {
+  const ui = explorerFixture([{ id: 0, name: "Documents/notes.txt", kind: "text" }]);
+  ui.evaluate('navigateSandbox("", "text")');
+  const file = ui.refs.get("sandbox-list").children[0].children[0];
+  let prevented = false;
+  file.handlers.get("contextmenu")({ preventDefault() { prevented = true; }, clientX: 1090, clientY: 770 });
+  assert.equal(prevented, true);
+  assert.equal(file.attributes.get("aria-pressed"), "true");
+  const menu = ui.refs.get("sandbox-context-menu");
+  assert.equal(menu.hidden, false);
+  assert.deepEqual(menu.children.map((b) => b.children[1].textContent), ["Open preview", "Show containing folder", "Properties"]);
+  assert.equal(menu.style.left, "872px");
+  assert.equal(menu.style.top, "652px");
+  menu.children[2].handlers.get("click")();
+  assert.equal(menu.hidden, true);
+  assert.equal(ui.refs.get("sandbox-properties").open, true);
+  assert.equal(ui.refs.get("sandbox-property-name").textContent, "notes.txt");
+  ui.refs.get("sandbox-properties").close();
+  file.handlers.get("contextmenu")({ preventDefault() {}, clientX: 50, clientY: 50 });
+  menu.children[1].handlers.get("click")();
+  assert.equal(ui.evaluate("sandbox.folder"), "Documents");
+  assert.equal(ui.evaluate("sandbox.selectedKey"), "file:0");
+});
+
+test("closing a native preview prevents it from reopening during later key recovery", async () => {
+  const { ui, change, calls } = await recoveryFixture();
+  ui.events.get("sandbox-preview-closed")({ payload: { sessionId: "1", itemId: 1 } });
+  assert.equal(ui.evaluate("sandbox.openedItemId"), null);
+  change({ ...disconnectedKeyStatus, keyRevision: 2 });
+  change({ ...savedKeyStatus, keyRevision: 3 });
+  await settle();
+  assert.equal(calls.filter(({ command }) => command === "open_sandbox_preview").length, 1);
+  ui.evaluate("resetSandbox()");
+});
+
+test("key loss events clear a native preview immediately instead of waiting for polling", async () => {
+  const calls = [];
+  const ui = fixture(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "sandbox_preview_info") return { sessionId: "1", item: { id: 0, name: "Secret/report.txt", kind: "text" } };
+    if (command === "read_sandbox_preview") return textPreview();
+  }, "sandbox-preview");
+  await ui.evaluate("initPrivatePreview()");
+  assert.equal(ui.refs.get("preview-content").children.length, 1);
+  ui.events.get("key-status-changed")({ payload: { sandboxAvailable: false } });
+  assert.equal(ui.refs.get("preview-content").children.length, 0);
+  assert.equal(ui.evaluate("document.title"), "Private preview - FileEncrypt");
+  assert.equal(ui.evaluate("previewWindow.closed"), true);
+  assert.equal(ui.timers.size, 0);
+  const closed = calls.find(({ command }) => command === "close_sandbox_preview");
+  assert.equal(closed.args.locked, true);
+});
+
+test("manually closing a preview does not request key recovery", async () => {
+  const calls = [];
+  const ui = fixture(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "sandbox_preview_info") return { sessionId: "1", item: { id: 0, name: "report.txt", kind: "text" } };
+    if (command === "read_sandbox_preview") return textPreview();
+  }, "sandbox-preview");
+  await ui.evaluate("initPrivatePreview()");
+  await ui.evaluate("closePrivatePreview()");
+  const closed = calls.find(({ command }) => command === "close_sandbox_preview");
+  assert.equal(closed.args.locked, false);
+  assert.equal(ui.refs.get("preview-content").children.length, 0);
+  assert.equal(ui.timers.size, 0);
 });

@@ -23,8 +23,8 @@ use crate::{
 };
 
 pub struct AppState {
-    key_change: Mutex<()>,
-    key_revision: AtomicU64,
+    pub(crate) key_change: Mutex<()>,
+    pub(crate) key_revision: AtomicU64,
     pub(crate) key: Mutex<Option<Zeroizing<[u8; 32]>>>,
     pub(crate) key_path: Mutex<Option<PathBuf>>,
     pub(crate) key_file_hash: Mutex<Option<[u8; 32]>>,
@@ -32,7 +32,7 @@ pub struct AppState {
     output_dir: Mutex<Option<PathBuf>>,
     message: Mutex<String>,
     startup_key_unavailable: AtomicBool,
-    running: AtomicBool,
+    pub(crate) running: AtomicBool,
     cancelled: AtomicBool,
     deletions: Mutex<DeletionRegistry>,
 }
@@ -345,6 +345,8 @@ pub async fn retry_deletion(
         }
         let _running = Running(&state);
         state.cancelled.store(false, Ordering::Release);
+        let verifier = app.state::<crate::verification::VerificationState>();
+        let _verification = lock(&verifier.work);
         let ticket = {
             let mut registry = lock(&state.deletions);
             if let Some(info) = registry.confirmed.get(&retry_id).cloned() {
@@ -1087,6 +1089,8 @@ pub async fn run_job(
         }
         let _guard = Running(&state);
         state.cancelled.store(false, Ordering::Release);
+        let verifier = app.state::<crate::verification::VerificationState>();
+        let _verification = lock(&verifier.work);
         let preview = plan_job(&state, &request)?;
         if !preview.can_run {
             return Err("Resolve the issues shown in the preview before starting.".into());
@@ -1135,6 +1139,8 @@ pub async fn rotate_key(
         }
         let _running = Running(&state);
         state.cancelled.store(false, Ordering::Release);
+        let verifier = app.state::<crate::verification::VerificationState>();
+        let _verification = lock(&verifier.work);
         let old_key = lock(&state.key).clone().ok_or("Load the current key first.")?;
         let old_path = lock(&state.key_path).clone();
         if new_path.exists() || old_path.as_ref().is_some_and(|path| comparison_path(&new_path) == comparison_path(path))

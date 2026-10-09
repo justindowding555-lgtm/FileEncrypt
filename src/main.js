@@ -5,6 +5,7 @@ const state = {
   fileSet: new Set(),
   folderRoots: new Map(),
   busy: false,
+  selectionBusy: false,
   keyLoaded: false,
   keyDisconnected: false,
   keyRevision: 0,
@@ -20,7 +21,18 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
-const KEY_DISCONNECTED_GUIDANCE = "Reconnect the drive containing your saved key. FileEncrypt checks for it automatically. If the file moved or the drive letter changed, use Browse and load.";
+const savedSelection = { revision: 0, ready: false, pending: true, restoring: false };
+const fileVerification = { ready: false, generation: 0, running: false, entries: new Map(), badges: new Map() };
+const KEY_DISCONNECTED_GUIDANCE = "Reconnect your key drive to continue.";
+const ROUTINE_KEY_MESSAGES = new Set([
+  "Key loaded.",
+  "Key loaded from the saved location.",
+  "Key reconnected and loaded.",
+  "Key reconnected and loaded from the saved location.",
+  "New key generated and saved.",
+  "Key written to the file.",
+  "Ready to encrypt or decrypt your files.",
+]);
 
 function invoke(command, args) {
   const call = window.__TAURI__?.core?.invoke;
@@ -84,7 +96,7 @@ function invalidatePreview() {
   $("preview-panel").hidden = true;
 }
 
-function addSelectedFiles(selected) {
+function addSelectedFiles(selected, remember = true) {
   const paths = Array.isArray(selected) ? selected : selected.paths;
   const roots = Array.isArray(selected) ? {} : selected.roots;
   let changed = false;
@@ -99,8 +111,118 @@ function addSelectedFiles(selected) {
       changed = true;
     }
   }
-  if (changed) invalidatePreview();
+  if (changed) {
+    invalidatePreview();
+    if (remember) rememberSelectedFiles();
+  }
   renderFiles();
+  queueFileVerification(paths);
+}
+
+function updateFileVerification(path) {
+  const badge = fileVerification.badges.get(path);
+  if (!badge) return;
+  const result = fileVerification.entries.get(path);
+  const encrypted = /\.(fenc|zip)$/i.test(path);
+  const status = state.keyDisconnected ? "disconnected" : !state.keyLoaded ? "needsKey"
+    : encrypted ? result?.state || "pending" : "unencrypted";
+  const label = status === "verified" ? "Verified" : status === "checking" ? "Verifying"
+    : status === "failed" ? "Verification failed" : status === "disconnected" ? "Key disconnected"
+      : status === "unencrypted" ? "Ready to encrypt" : status === "needsKey"
+        ? encrypted ? "Load a key to verify" : "Load a key to encrypt" : "Waiting to verify";
+  badge.className = `file-verification is-${status}${result?.complete === false && status === "verified" ? " is-partial" : ""}`;
+  badge.innerHTML = EXPLORER_ICONS[status];
+  badge.title = status === "disconnected" ? "Key disconnected. Reconnect the key to use this file."
+    : status === "needsKey" || status === "unencrypted" ? label
+    : result?.message ? `${label}: ${result.message}` : label;
+  badge.setAttribute("aria-label", badge.title);
+}
+
+function queueFileVerification(paths) {
+  for (const path of paths) {
+    if (!state.fileSet.has(path) || !/\.(fenc|zip)$/i.test(path)) continue;
+    fileVerification.entries.set(path, { state: "pending" });
+    updateFileVerification(path);
+  }
+  startAutomaticVerification();
+}
+
+function resetFileVerification() {
+  fileVerification.generation++;
+  fileVerification.entries.clear();
+  for (const path of state.files) {
+    if (/\.(fenc|zip)$/i.test(path)) fileVerification.entries.set(path, { state: "pending" });
+    updateFileVerification(path);
+  }
+}
+
+async function startAutomaticVerification() {
+  if (!fileVerification.ready || fileVerification.running || state.busy || state.selectionBusy || !state.keyLoaded) return;
+  const batch = [...fileVerification.entries].filter(([path, result]) => state.fileSet.has(path) && result.state === "pending").slice(0, 32);
+  if (!batch.length) return;
+  const generation = fileVerification.generation;
+  const keyRevision = state.keyRevision;
+  fileVerification.running = true;
+  for (const [path, result] of batch) {
+    result.state = "checking";
+    updateFileVerification(path);
+  }
+  let paused = false;
+  try {
+    const results = await invoke("verify_selected_files", { paths: batch.map(([path]) => path), keyRevision });
+    if (generation !== fileVerification.generation || keyRevision !== state.keyRevision || !state.keyLoaded) return;
+    for (const [path, token] of batch) {
+      if (!state.fileSet.has(path) || fileVerification.entries.get(path) !== token) continue;
+      const result = results.find((result) => result.input === path);
+      Object.assign(token, result || { state: "failed", message: "No verification result was returned." });
+      paused ||= token.state === "pending";
+      updateFileVerification(path);
+    }
+  } catch (error) {
+    if (generation !== fileVerification.generation) return;
+    for (const [path, token] of batch) {
+      if (!state.fileSet.has(path) || fileVerification.entries.get(path) !== token) continue;
+      Object.assign(token, { state: "failed", message: normalizeError(error) });
+      updateFileVerification(path);
+    }
+  } finally {
+    fileVerification.running = false;
+    if (generation !== fileVerification.generation || !paused) startAutomaticVerification();
+  }
+}
+
+function rememberSelectedFiles() {
+  savedSelection.revision++;
+  savedSelection.pending = false;
+  if (!savedSelection.ready) return;
+  invoke("remember_selected_files", {
+    revision: savedSelection.revision,
+    selection: { paths: [...state.files], roots: Object.fromEntries(state.folderRoots) },
+  }).catch((error) => showAlert(`Could not remember the file selection: ${normalizeError(error)}`));
+}
+
+async function maybeRestoreSelectedFiles() {
+  if (!savedSelection.ready || !savedSelection.pending || savedSelection.restoring
+      || state.busy || state.selectionBusy || !state.keyHasFile) return;
+  savedSelection.restoring = true;
+  const revision = savedSelection.revision;
+  const keyRevision = state.keyRevision;
+  try {
+    const selection = await invoke("restore_selected_files");
+    if (revision !== savedSelection.revision || keyRevision !== state.keyRevision || !state.keyHasFile) return;
+    if (Array.isArray(selection?.paths)) {
+      savedSelection.pending = false;
+      addSelectedFiles(selection, false);
+    }
+  } catch (error) {
+    if (revision === savedSelection.revision && keyRevision === state.keyRevision) {
+      savedSelection.pending = false;
+      showAlert(`Could not restore the file selection: ${normalizeError(error)}`);
+    }
+  } finally {
+    savedSelection.restoring = false;
+    if (savedSelection.pending && keyRevision !== state.keyRevision) maybeRestoreSelectedFiles();
+  }
 }
 
 function applyStatus(status, updatePath) {
@@ -112,6 +234,7 @@ function applyStatus(status, updatePath) {
   const wasDisconnected = state.keyDisconnected;
   if (keyRevisionChanged || (state.keyFingerprint !== null && state.keyFingerprint !== status.fingerprint)) {
     invalidatePreview();
+    resetFileVerification();
   }
   state.keyFingerprint = status.fingerprint;
   state.keyPath = status.keyPath || null;
@@ -119,6 +242,7 @@ function applyStatus(status, updatePath) {
   state.keyDisconnected = !state.keyLoaded && Boolean(status.startupKeyUnavailable);
   state.keyHasFile = state.keyLoaded && Boolean(status.keyPath);
   state.sandboxAvailable = state.keyHasFile && Boolean(status.sandboxAvailable);
+  for (const path of fileVerification.badges.keys()) updateFileVerification(path);
   if (sandbox.paths.length && (!state.sandboxAvailable || state.keyFingerprint !== sandbox.fingerprint)) {
     lockSandbox(state.keyDisconnected
       ? "Sandbox locked because the key disconnected."
@@ -145,6 +269,13 @@ function applyStatus(status, updatePath) {
   if (!state.updatesConfigured) $("update-status").textContent = "Signed updates are not configured in this build.";
   $("fingerprint").classList.toggle("is-loaded", state.keyLoaded);
   $("fingerprint").classList.toggle("is-disconnected", state.keyDisconnected);
+  const keyIcon = $("current-key-icon");
+  keyIcon.className = `key-status-icon${state.keyDisconnected ? " is-disconnected" : state.keyLoaded ? " is-loaded" : ""}`;
+  keyIcon.innerHTML = EXPLORER_ICONS[state.keyDisconnected ? "unplug" : state.keyLoaded ? "shield" : "needsKey"];
+  const filename = $("key-filename");
+  filename.hidden = !state.keyPath;
+  filename.textContent = state.keyPath ? baseName(state.keyPath) : "";
+  filename.title = state.keyPath || "";
   if (updatePath) {
     $("key-path").value = status.keyPath || "";
   }
@@ -152,27 +283,33 @@ function applyStatus(status, updatePath) {
     $("output-dir").value = status.outputDir;
   }
   $("fingerprint").textContent = status.keyLoaded
-    ? `${state.keyHasFile ? "Key loaded" : "Session key"} · ${status.fingerprint}`
+    ? state.keyHasFile ? "Key loaded" : "Session key"
     : state.keyDisconnected
       ? "Key disconnected"
       : "No key loaded";
+  const fingerprintDetails = state.keyLoaded && status.fingerprint ? `Fingerprint: ${status.fingerprint}` : "";
+  $("fingerprint").title = fingerprintDetails;
+  $("fingerprint").setAttribute("aria-label", fingerprintDetails
+    ? `${$("fingerprint").textContent}. ${fingerprintDetails}` : $("fingerprint").textContent);
+  const message = status.message || "";
   $("key-message").textContent = state.keyDisconnected
     ? KEY_DISCONNECTED_GUIDANCE
-    : status.message || (state.keyLoaded
-      ? "Ready to encrypt or decrypt your files."
-      : "Choose a key to get started.");
+    : state.keyLoaded
+      ? ROUTINE_KEY_MESSAGES.has(message) ? "" : message
+      : message || "Choose a key to get started.";
   if (state.keyDisconnected && !wasDisconnected && !$("startup-key-dialog").open) {
     $("key-recovery-alert").hidden = true;
-    $("key-recovery-status").textContent = "Watching for your key";
     $("startup-key-path").textContent = status.keyPath || "Unknown location";
     $("startup-key-dialog").showModal();
-    $("check-key-again").focus();
+    $("choose-recovery-key").focus();
   } else if (!state.keyDisconnected && $("startup-key-dialog").open) {
     $("startup-key-dialog").close();
   }
   renderControls();
   updateSandboxRecoveryUI();
   maybeResumeSandbox();
+  maybeRestoreSelectedFiles();
+  startAutomaticVerification();
 }
 
 let fileRemoveButtons = [];
@@ -184,7 +321,7 @@ let pendingDeletionDelay = 1000;
 const PENDING_DELETION_BATCH_SIZE = 100;
 const pagedLists = new Map();
 const PAGE_SIZE = 100;
-function renderPaged(listId, pagerId, items, renderRow) {
+function renderPaged(listId, pagerId, items, renderRow, pageSize = PAGE_SIZE) {
   let view = pagedLists.get(listId);
   if (!view) {
     const previous = document.createElement("button");
@@ -195,17 +332,21 @@ function renderPaged(listId, pagerId, items, renderRow) {
     next.textContent = "Next";
     view = { page: 0, previous, next, label, items: [], renderRow: null };
     view.draw = () => {
-      const count = Math.max(1, Math.ceil(view.items.length / PAGE_SIZE));
+      const count = Math.max(1, Math.ceil(view.items.length / view.pageSize));
       view.page = Math.max(0, Math.min(view.page, count - 1));
-      const start = view.page * PAGE_SIZE;
-      if (listId === "file-list") fileRemoveButtons = [];
+      const start = view.page * view.pageSize;
+      if (listId === "file-list") {
+        fileRemoveButtons = [];
+        fileVerification.badges.clear();
+      }
       if (listId === "results") deletionButtons = [];
       if (listId === "sandbox-list") sandbox.buttons = [];
       const fragment = document.createDocumentFragment();
-      for (let index = start; index < Math.min(start + PAGE_SIZE, view.items.length); index++) {
+      for (let index = start; index < Math.min(start + view.pageSize, view.items.length); index++) {
         fragment.append(view.renderRow(view.items[index], index));
       }
       $(listId).replaceChildren(fragment);
+      if (listId === "sandbox-list") $("sandbox-file-scroll").scrollTop = 0;
       $(pagerId).hidden = count <= 1;
       previous.disabled = view.page === 0;
       next.disabled = view.page >= count - 1;
@@ -217,24 +358,21 @@ function renderPaged(listId, pagerId, items, renderRow) {
     pagedLists.set(listId, view);
   }
   view.items = items;
+  view.pageSize = pageSize;
   view.renderRow = renderRow;
   view.draw();
 }
 
+function selectionBlocked() {
+  return state.selectionBusy || (state.busy && state.keyLoaded);
+}
+
 function renderControls() {
-  for (const button of [...fileRemoveButtons, ...deletionButtons]) button.disabled = state.busy;
+  const busy = state.busy || state.selectionBusy;
+  for (const button of fileRemoveButtons) button.disabled = selectionBlocked();
+  for (const button of deletionButtons) button.disabled = busy;
   const noFiles = state.files.length === 0;
-  const blocked = state.busy || !state.keyLoaded || noFiles;
-  $("key-recovery-files").hidden = noFiles;
-  $("key-recovery-files").textContent = `${state.files.length} selected ${state.files.length === 1 ? "file is" : "files are"} kept for this app session. They will be ready when your key is loaded again.`;
-  $("missing-key-warning").hidden = state.keyLoaded
-    || !state.files.some((path) => /\.(fenc|zip)$/i.test(path));
-  $("missing-key-title").textContent = state.keyDisconnected
-    ? "Key disconnected."
-    : "No encryption key loaded.";
-  $("missing-key-guidance").textContent = state.keyDisconnected
-    ? KEY_DISCONNECTED_GUIDANCE
-    : "Use Browse and load to load the key used to encrypt these files before viewing, decrypting, or verifying them.";
+  const blocked = busy || !state.keyLoaded || noFiles;
   $("generate").classList.toggle("primary", !state.keyLoaded && !state.keyDisconnected);
   $("browse-load").classList.toggle("primary", state.keyDisconnected);
   $("encrypt").disabled = blocked;
@@ -245,45 +383,41 @@ function renderControls() {
     : state.keyDisconnected
       ? "Reconnect your key drive; the sandbox is available once the key is loaded."
       : "Load a saved key file to use the sandbox. Session-only keys cannot keep it active.";
-  $("verify").disabled = blocked;
-  $("add-files").disabled = state.busy;
-  $("add-folder").disabled = state.busy;
-  $("clear-files").disabled = state.busy || noFiles;
-  $("generate").disabled = state.busy;
-  $("load").disabled = state.busy;
-  $("unload").disabled = state.busy || !state.keyLoaded;
-  $("check-key-again").disabled = state.busy;
-  $("choose-recovery-key").disabled = state.busy;
-  $("startup-key-options").disabled = state.busy;
-  $("sandbox-key-options").disabled = state.busy;
-  $("check-key-again").textContent = state.busy ? "Please wait…" : "Check again";
-  $("set-path").disabled = state.busy;
-  $("browse-load").disabled = state.busy;
-  $("backup-key").disabled = state.busy || !state.keyHasFile;
+  $("add-files").disabled = selectionBlocked();
+  $("add-folder").disabled = selectionBlocked();
+  $("clear-files").disabled = selectionBlocked() || noFiles;
+  $("generate").disabled = busy;
+  $("load").disabled = busy;
+  $("unload").disabled = busy || !state.keyLoaded;
+  $("choose-recovery-key").disabled = false;
+  $("sandbox-key-options").disabled = busy;
+  $("set-path").disabled = busy;
+  $("browse-load").disabled = busy;
+  $("backup-key").disabled = busy || !state.keyHasFile;
   $("backup-key").title = state.keyLoaded && !state.keyHasFile
     ? "Session keys have no file to back up."
     : "";
-  $("check-backup").disabled = state.busy || !state.keyLoaded;
+  $("check-backup").disabled = busy || !state.keyLoaded;
   $("rotate-key").disabled = blocked;
-  $("save-typed").disabled = state.busy;
-  $("use-typed").disabled = state.busy;
-  $("open-key-options").disabled = state.busy;
-  $("open-specific-key").disabled = state.busy;
-  $("choose-output").disabled = state.busy;
-  $("clear-output").disabled = state.busy || $("output-dir").value.trim() === "";
-  $("zip").disabled = state.busy;
-  $("compress").disabled = state.busy || !$("zip").checked;
-  $("review-first").disabled = state.busy;
-  $("overwrite").disabled = state.busy;
-  $("remove-original").disabled = state.busy;
-  $("output-dir").disabled = state.busy;
-  $("start-job").disabled = state.busy || !state.keyLoaded || !state.pendingJob?.preview?.canRun
+  $("save-typed").disabled = busy;
+  $("use-typed").disabled = busy;
+  $("open-key-options").disabled = busy;
+  $("open-specific-key").disabled = busy;
+  $("choose-output").disabled = busy;
+  $("clear-output").disabled = busy || $("output-dir").value.trim() === "";
+  $("zip").disabled = busy;
+  $("compress").disabled = busy || !$("zip").checked;
+  $("review-first").disabled = busy;
+  $("overwrite").disabled = busy;
+  $("remove-original").disabled = busy;
+  $("output-dir").disabled = busy;
+  $("start-job").disabled = busy || !state.keyLoaded || !state.pendingJob?.preview?.canRun
     || state.pendingJob.revision !== state.planRevision;
   $("cancel-job").disabled = !state.jobRunning;
-  $("check-update").disabled = state.busy || !state.updatesConfigured;
-  $("install-update").disabled = state.busy || !state.updateAvailable;
+  $("check-update").disabled = busy || !state.updatesConfigured;
+  $("install-update").disabled = busy || !state.updateAvailable;
   $("file-count").textContent = noFiles ? "" : `(${state.files.length})`;
-  $("action-hint").textContent = state.busy
+  $("action-hint").textContent = busy
     ? "Working. Please wait…"
     : state.keyDisconnected
       ? "Reconnect your key drive; FileEncrypt will check for it automatically."
@@ -293,18 +427,8 @@ function renderControls() {
           ? "Load a key to continue."
           : noFiles
             ? "Add files to continue."
-            : `${state.files.length} ${state.files.length === 1 ? "file" : "files"} ready to encrypt, view, decrypt, or verify.`;
+            : `${state.files.length} ${state.files.length === 1 ? "file" : "files"} ready to encrypt, view, or decrypt. Encrypted files are verified automatically.`;
   renderOutputHint();
-}
-
-function plannedName(path) {
-  const name = baseName(path);
-  if (name.toLowerCase().endsWith(".zip")) return "files restored from inside the ZIP";
-  if (name.length > 5 && name.toLowerCase().endsWith(".fenc")) {
-    return "original name from inside the file";
-  }
-  if ($("zip").checked) return "an encrypted file inside the ZIP";
-  return "a random .fenc name";
 }
 
 function renderOutputHint() {
@@ -331,27 +455,39 @@ function renderFiles() {
     const name = document.createElement("div");
     name.className = "file-name";
     name.textContent = baseName(path);
-    const full = document.createElement("div");
-    full.className = "file-path";
-    full.textContent = `Expected result: ${plannedName(path)}`;
-    full.title = path;
-    text.append(name, full);
+    name.title = path;
+    const heading = document.createElement("div");
+    heading.className = "file-name-row";
+    const badge = document.createElement("span");
+    badge.setAttribute("role", "img");
+    fileVerification.badges.set(path, badge);
+    updateFileVerification(path);
+    heading.append(badge);
+    heading.append(name);
+    text.append(heading);
 
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "text-button";
     remove.textContent = "Remove";
-    remove.disabled = state.busy;
+    remove.disabled = selectionBlocked();
     remove.setAttribute("aria-label", `Remove ${baseName(path)}`);
     fileRemoveButtons.push(remove);
     remove.addEventListener("click", () => {
-      if (state.busy) return;
+      if (selectionBlocked()) return;
       const index = state.files.indexOf(path);
       if (index < 0) return;
       state.files.splice(index, 1);
       state.fileSet.delete(path);
       state.folderRoots.delete(path);
+      fileVerification.entries.delete(path);
+      if (sandbox.recovery?.paths.includes(path)) {
+        sandbox.recovery.paths = sandbox.recovery.paths.filter((source) => source !== path);
+        sandbox.recovery.itemId = null;
+        if (!sandbox.recovery.paths.length) cancelSandboxRecovery();
+      }
       invalidatePreview();
+      rememberSelectedFiles();
       renderFiles();
       renderControls();
     });
@@ -511,8 +647,26 @@ async function retryOriginalDeletion(retryId) {
   }
 }
 
+async function selectFiles(work) {
+  if (selectionBlocked()) return;
+  state.selectionBusy = true;
+  renderControls();
+  clearAlert();
+  try {
+    addSelectedFiles(await work());
+  } catch (error) {
+    showAlert(normalizeError(error));
+  } finally {
+    state.selectionBusy = false;
+    renderControls();
+    maybeResumeSandbox();
+    maybeRestoreSelectedFiles();
+    startAutomaticVerification();
+  }
+}
+
 async function run(work, updatePathOnSuccess) {
-  if (state.busy) return;
+  if (state.busy || state.selectionBusy) return;
   state.busy = true;
   renderControls();
   clearAlert();
@@ -534,6 +688,8 @@ async function run(work, updatePathOnSuccess) {
     state.busy = false;
     renderControls();
     maybeResumeSandbox();
+    maybeRestoreSelectedFiles();
+    startAutomaticVerification();
   }
 }
 
@@ -554,13 +710,6 @@ function openKeyOptions() {
   else $("close-key-options").focus();
 }
 
-async function recheckKeyFile() {
-  if (state.busy) return;
-  $("key-recovery-status").textContent = "Checking the saved key…";
-  const result = await run(recheckKeyFileStatus, false);
-  if (result && state.keyDisconnected) $("key-recovery-status").textContent = "Still waiting for your key";
-}
-
 let keyFileCheck = null;
 function recheckKeyFileStatus() {
   // A timeout must not spawn more blocked reads against the same slow drive.
@@ -577,15 +726,356 @@ const sandbox = {
   generation: 0, sessionId: null, fingerprint: null,
   selection: 0, items: [], buttons: [], loading: false, timer: null,
   paths: [], currentItemId: null, recovery: null, recoveryTimer: null,
+  entries: [], folders: new Map(), categoryCounts: {},
+  folder: "", category: "", query: "", view: "grid", sort: "name",
+  history: [{ folder: "", category: "" }], historyIndex: 0,
+  selectedKey: null, openedItemId: null, contextEntry: null, hiddenClosures: 0,
 };
-// Keep this exact stylesheet's SHA-256 in tauri.conf.json and the preview CSP.
-const SANDBOX_STYLE = "html{color-scheme:light dark}body{margin:16px;font:14px system-ui,sans-serif}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace,monospace}img,video{display:block;max-width:100%;max-height:85vh;margin:auto}audio{width:100%}";
-const SANDBOX_STYLE_HASH = "sha256-+d/I4iYM/9I6DotUkT3YfqOsiHrpFkzcIQG8DqehNDo=";
+const SANDBOX_TYPES = {
+  text: { label: "Text files", singular: "Text document", icon: "text" },
+  image: { label: "Images", singular: "Image", icon: "image" },
+  audio: { label: "Audio", singular: "Audio file", icon: "audio" },
+  video: { label: "Video", singular: "Video file", icon: "video" },
+  unsupported: { label: "Other files", singular: "File", icon: "file" },
+};
 
-function clearSandboxPreview() {
-  // Removing the frame stops playback and destroys the document containing text.
-  $("sandbox-preview").replaceChildren();
-  $("sandbox-file-name").textContent = "";
+function sandboxIcon(kind) {
+  const icon = document.createElement("span");
+  const name = kind === "folder" ? "folder" : SANDBOX_TYPES[kind]?.icon || "file";
+  icon.className = `explorer-type-icon explorer-type-${name}`;
+  icon.setAttribute("aria-hidden", "true");
+  // Only fixed Lucide symbol names enter markup; file names use textContent.
+  icon.innerHTML = EXPLORER_ICONS[name];
+  return icon;
+}
+
+function sandboxFileType(item) {
+  if (item.kind === "folder") return "Folder";
+  const extension = item.name.split(/[\\/]/).pop().match(/\.([^.]+)$/)?.[1].toUpperCase();
+  return extension ? `${extension} ${item.kind === "image" ? "image" : "file"}` : SANDBOX_TYPES[item.kind]?.singular || "File";
+}
+
+function indexSandboxFiles() {
+  sandbox.folders = new Map([["", { path: "", label: "All files", folders: [], files: [], count: 0 }]]);
+  sandbox.categoryCounts = {};
+  sandbox.entries = sandbox.items.map((item) => {
+    const parts = item.name.split(/[\\/]/).filter(Boolean);
+    const label = parts.pop() || item.name;
+    let parent = "";
+    const ancestors = [sandbox.folders.get("")];
+    for (const part of parts) {
+      const path = parent ? `${parent}/${part}` : part;
+      if (!sandbox.folders.has(path)) {
+        const folder = { path, parent, label: part, folders: [], files: [], count: 0, kind: "folder" };
+        sandbox.folders.set(path, folder);
+        sandbox.folders.get(parent).folders.push(folder);
+      }
+      parent = path;
+      ancestors.push(sandbox.folders.get(path));
+    }
+    const kind = SANDBOX_TYPES[item.kind] ? item.kind : "unsupported";
+    const entry = { ...item, kind, label, parent, path: [...parts, label].join("/") };
+    sandbox.folders.get(parent).files.push(entry);
+    for (const folder of ancestors) folder.count++;
+    sandbox.categoryCounts[kind] = (sandbox.categoryCounts[kind] || 0) + 1;
+    return entry;
+  });
+}
+
+function sandboxVisibleEntries() {
+  const query = sandbox.query.trim().toLocaleLowerCase();
+  const folder = sandbox.folders.get(sandbox.folder);
+  let entries = query || sandbox.category
+    ? sandbox.entries.filter((item) => (!sandbox.category || item.kind === sandbox.category)
+      && (!query || item.path.toLocaleLowerCase().includes(query)))
+    : [...(folder?.folders || []), ...(folder?.files || [])];
+  return entries.sort((a, b) => {
+    if (a.kind === "folder" && b.kind !== "folder") return -1;
+    if (b.kind === "folder" && a.kind !== "folder") return 1;
+    if (sandbox.sort === "type") {
+      const typeOrder = sandboxFileType(a).localeCompare(sandboxFileType(b));
+      if (typeOrder) return typeOrder;
+    }
+    const order = a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: "base" });
+    return sandbox.sort === "name-desc" ? -order : order;
+  });
+}
+
+function navigateSandbox(folder = "", category = "", record = true) {
+  if (folder && !sandbox.folders.has(folder)) return;
+  const changed = sandbox.folder !== folder || sandbox.category !== category;
+  if (changed || sandbox.query) {
+    sandbox.selection++;
+    sandbox.currentItemId = null;
+    sandbox.selectedKey = null;
+    hideSandboxContextMenu();
+    if (sandbox.sessionId) $("sandbox-status").textContent = "Double-click a file to open a private preview window.";
+  }
+  sandbox.folder = folder;
+  sandbox.category = category;
+  sandbox.query = "";
+  $("sandbox-search").value = "";
+  if (record && changed) {
+    sandbox.history = sandbox.history.slice(0, sandbox.historyIndex + 1);
+    sandbox.history.push({ folder, category });
+    sandbox.historyIndex = sandbox.history.length - 1;
+  }
+  if (pagedLists.has("sandbox-list")) pagedLists.get("sandbox-list").page = 0;
+  renderSandboxExplorer();
+}
+
+function stepSandboxHistory(delta) {
+  const index = sandbox.historyIndex + delta;
+  if (index < 0 || index >= sandbox.history.length) return;
+  sandbox.historyIndex = index;
+  const location = sandbox.history[index];
+  navigateSandbox(location.folder, location.category, false);
+}
+
+function sandboxNavButton(label, kind, count, active, action) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "explorer-sidebar-button";
+  button.classList.toggle("is-active", active);
+  if (active) button.setAttribute("aria-current", "page");
+  const name = document.createElement("span");
+  name.textContent = label;
+  const badge = document.createElement("span");
+  badge.className = "explorer-count";
+  badge.textContent = String(count);
+  button.append(sandboxIcon(kind), name, badge);
+  button.addEventListener("click", action);
+  return button;
+}
+
+function renderSandboxNavigation() {
+  const home = !sandbox.folder && !sandbox.category && !sandbox.query;
+  $("sandbox-home").classList.toggle("is-active", home);
+  if (home) $("sandbox-home").setAttribute("aria-current", "page");
+  else $("sandbox-home").removeAttribute("aria-current");
+  $("sandbox-total").textContent = String(sandbox.items.length);
+  const categories = document.createDocumentFragment();
+  for (const [kind, type] of Object.entries(SANDBOX_TYPES)) {
+    categories.append(sandboxNavButton(type.label, kind, sandbox.categoryCounts[kind] || 0,
+      sandbox.category === kind, () => navigateSandbox("", kind)));
+  }
+  $("sandbox-categories").replaceChildren(categories);
+  const roots = sandbox.folders.get("")?.folders || [];
+  const folderLinks = document.createDocumentFragment();
+  // The complete folder collection is browsable in the main pane. Keep the
+  // sidebar bounded, including the current root even in very large catalogues.
+  const sorted = [...roots].sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
+  const currentRoot = roots.find((folder) => sandbox.folder === folder.path || sandbox.folder.startsWith(folder.path + "/"));
+  const visible = sorted.slice(0, 7);
+  if (currentRoot && !visible.includes(currentRoot)) visible.push(currentRoot);
+  for (const folder of visible) {
+    const button = sandboxNavButton(folder.label, "folder", folder.count,
+      !sandbox.category && !sandbox.query && sandbox.folder === folder.path, () => navigateSandbox(folder.path));
+    button.title = folder.path;
+    folderLinks.append(button);
+  }
+  if (roots.length > visible.length) {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "explorer-more-folders";
+    more.textContent = `View all ${roots.length} folders`;
+    more.addEventListener("click", () => navigateSandbox());
+    folderLinks.append(more);
+  }
+  $("sandbox-folders").replaceChildren(folderLinks);
+  $("sandbox-folder-section").hidden = roots.length === 0;
+  const crumbs = document.createDocumentFragment();
+  const addCrumb = (label, folder, category = "", last = false) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "explorer-crumb";
+    button.textContent = label;
+    button.title = label;
+    if (last) button.setAttribute("aria-current", "location");
+    button.addEventListener("click", () => navigateSandbox(folder, category));
+    crumbs.append(button);
+    if (!last) {
+      const separator = document.createElement("span");
+      separator.className = "explorer-crumb-separator";
+      separator.setAttribute("aria-hidden", "true");
+      separator.innerHTML = EXPLORER_ICONS.chevron;
+      crumbs.append(separator);
+    }
+  };
+  addCrumb("Sandbox", "", "", home || (!sandbox.folder && !sandbox.category && !sandbox.query));
+  if (sandbox.query) addCrumb("Search results", sandbox.folder, sandbox.category, true);
+  else if (sandbox.category) addCrumb(SANDBOX_TYPES[sandbox.category].label, "", sandbox.category, true);
+  else if (sandbox.folder) {
+    const parts = sandbox.folder.split("/");
+    parts.forEach((part, index) => addCrumb(part, parts.slice(0, index + 1).join("/"), "", index === parts.length - 1));
+  }
+  $("sandbox-breadcrumbs").replaceChildren(crumbs);
+  $("sandbox-back").disabled = sandbox.historyIndex === 0;
+  $("sandbox-forward").disabled = sandbox.historyIndex >= sandbox.history.length - 1;
+  $("sandbox-up").disabled = !sandbox.folder && !sandbox.category && !sandbox.query;
+  $("sandbox-clear-search").hidden = !sandbox.query;
+}
+
+function renderSandboxExplorer() {
+  renderSandboxNavigation();
+  const entries = sandboxVisibleEntries();
+  const folderCount = entries.filter((entry) => entry.kind === "folder").length;
+  const fileCount = entries.length - folderCount;
+  $("sandbox-location-name").textContent = sandbox.query ? "Search results"
+    : sandbox.category ? SANDBOX_TYPES[sandbox.category].label
+    : sandbox.folders.get(sandbox.folder)?.label || "All files";
+  $("sandbox-location-summary").textContent = sandbox.query ? `Matches for “${sandbox.query}” across the sandbox`
+    : sandbox.category ? "Across your encrypted workspace"
+    : sandbox.folder ? "Browse this encrypted folder" : "Your encrypted workspace, in one place";
+  $("sandbox-item-count").textContent = [folderCount ? `${folderCount} ${folderCount === 1 ? "folder" : "folders"}` : "",
+    `${fileCount} ${fileCount === 1 ? "file" : "files"}`].filter(Boolean).join(" · ");
+  $("sandbox-list").className = sandbox.view === "grid" ? "explorer-grid" : "explorer-details";
+  $("sandbox-list-heading").hidden = sandbox.view !== "details";
+  for (const view of ["grid", "details"]) {
+    $("sandbox-" + view).classList.toggle("is-active", sandbox.view === view);
+    $("sandbox-" + view).setAttribute("aria-pressed", String(sandbox.view === view));
+  }
+  renderPaged("sandbox-list", "sandbox-pages", entries, (entry) => {
+    const row = document.createElement("li");
+    const button = document.createElement("button");
+    const isFolder = entry.kind === "folder";
+    button.type = "button";
+    button.className = "sandbox-file";
+    button.title = `Double-click to ${isFolder ? "open folder" : "preview"}: ${entry.path}`;
+    button.sandboxItemId = isFolder ? null : entry.id;
+    button.sandboxEntryKey = sandboxEntryKey(entry);
+    const active = button.sandboxEntryKey === sandbox.selectedKey;
+    button.setAttribute("aria-pressed", String(active));
+    button.classList.toggle("is-selected", active);
+    const label = document.createElement("span");
+    label.className = "explorer-file-label";
+    label.textContent = entry.label;
+    const detail = document.createElement("span");
+    detail.className = "explorer-file-detail";
+    detail.textContent = isFolder ? `${entry.count} ${entry.count === 1 ? "file" : "files"}`
+      : sandbox.query || sandbox.category ? entry.parent || "Sandbox" : sandboxFileType(entry);
+    const type = document.createElement("span");
+    type.className = "explorer-file-type";
+    type.textContent = isFolder ? "Folder" : sandboxFileType(entry);
+    button.append(sandboxIcon(entry.kind), label, detail, type);
+    button.addEventListener("click", () => selectSandboxEntry(entry));
+    button.addEventListener("dblclick", () => openSandboxEntry(entry));
+    button.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") { event.preventDefault(); openSandboxEntry(entry); }
+    });
+    button.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      selectSandboxEntry(entry);
+      showSandboxContextMenu(entry, event.clientX, event.clientY, button);
+    });
+    sandbox.buttons.push(button);
+    row.append(button);
+    return row;
+  }, 48);
+  $("sandbox-browser-empty").hidden = entries.length > 0;
+  $("sandbox-empty-title").textContent = sandbox.query ? "No matching files" : sandbox.category ? "No files of this type" : "No files to show";
+  $("sandbox-empty-message").textContent = sandbox.query ? "Try a different name or file extension."
+    : sandbox.sessionId ? "Choose another folder or file type to keep exploring." : "Your files appear here once the sandbox is unlocked.";
+  $("sandbox-reset-filter").hidden = !sandbox.query && !sandbox.category && !sandbox.folder;
+  $("sandbox-key-state").textContent = sandbox.sessionId ? "Key connected" : "Viewer locked";
+  $("sandbox-key-indicator").classList.toggle("is-connected", Boolean(sandbox.sessionId));
+  $("sandbox-status-dot").classList.toggle("is-connected", Boolean(sandbox.sessionId));
+}
+
+function sandboxEntryKey(entry) {
+  return entry.kind === "folder" ? `folder:${entry.path}` : `file:${entry.id}`;
+}
+
+function selectSandboxEntry(entry) {
+  sandbox.selectedKey = sandboxEntryKey(entry);
+  sandbox.currentItemId = entry.kind === "folder" ? null : entry.id;
+  updateSandboxSelection();
+  $("sandbox-status").textContent = `${entry.label || entry.name} · ${sandboxFileType(entry)} · Double-click to open`;
+}
+
+function updateSandboxSelection() {
+  for (const button of sandbox.buttons) {
+    const active = button.sandboxEntryKey === sandbox.selectedKey;
+    button.classList.toggle("is-selected", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+}
+
+function openSandboxEntry(entry) {
+  hideSandboxContextMenu();
+  if (entry.kind === "folder") navigateSandbox(entry.path);
+  else return viewSandboxFile(entry);
+}
+
+function hideSandboxContextMenu() {
+  $("sandbox-context-menu").hidden = true;
+  $("sandbox-context-menu").replaceChildren();
+  sandbox.contextEntry = null;
+}
+
+function showSandboxContextMenu(entry, x, y, anchor) {
+  const menu = $("sandbox-context-menu");
+  hideSandboxContextMenu();
+  sandbox.contextEntry = entry;
+  sandbox.contextAnchor = anchor;
+  const addAction = (label, icon, action) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("role", "menuitem");
+    const symbol = document.createElement("span");
+    symbol.setAttribute("aria-hidden", "true");
+    symbol.innerHTML = EXPLORER_ICONS[icon];
+    const text = document.createElement("span");
+    text.textContent = label;
+    button.append(symbol, text);
+    button.addEventListener("click", () => { hideSandboxContextMenu(); action(); });
+    menu.append(button);
+  };
+  addAction(entry.kind === "folder" ? "Open folder" : "Open preview", entry.kind === "folder" ? "folder" : "eye", () => openSandboxEntry(entry));
+  if (entry.kind !== "folder") addAction("Show containing folder", "folder", () => {
+    navigateSandbox(entry.parent || "");
+    selectSandboxEntry(entry);
+  });
+  addAction("Properties", "info", () => showSandboxProperties(entry));
+  menu.hidden = false;
+  const bounds = $("sandbox-dialog").getBoundingClientRect();
+  const origin = anchor.getBoundingClientRect();
+  const left = x || origin.left + 12;
+  const top = y || origin.bottom;
+  menu.style.left = `${Math.max(bounds.left + 8, Math.min(left, bounds.right - menu.offsetWidth - 8))}px`;
+  menu.style.top = `${Math.max(bounds.top + 8, Math.min(top, bounds.bottom - menu.offsetHeight - 8))}px`;
+  menu.children[0]?.focus();
+}
+
+function showSandboxProperties(entry) {
+  $("sandbox-property-name").textContent = entry.label || entry.name;
+  $("sandbox-property-type").textContent = entry.kind === "folder" ? `Folder · ${entry.count} files` : sandboxFileType(entry);
+  $("sandbox-property-location").textContent = entry.parent || "Sandbox";
+  $("sandbox-property-icon").replaceChildren(sandboxIcon(entry.kind));
+  $("sandbox-properties").showModal();
+  $("close-sandbox-properties").focus();
+}
+
+async function viewSandboxFile(item) {
+  const sessionId = sandbox.sessionId;
+  if (!sessionId || sandbox.loading) return;
+  const generation = sandbox.generation;
+  selectSandboxEntry(item);
+  sandbox.loading = true;
+  $("sandbox-status").textContent = "Opening private preview window…";
+  try {
+    await invoke("open_sandbox_preview", { sessionId, itemId: item.id });
+    if (generation !== sandbox.generation) return;
+    sandbox.openedItemId = item.id;
+    $("sandbox-status").textContent = "Preview opened in a separate read-only window.";
+  } catch (error) {
+    if (generation !== sandbox.generation) return;
+    const message = normalizeError(error);
+    if (message.startsWith("Sandbox locked")) lockSandbox(message);
+    else $("sandbox-status").textContent = message;
+  } finally {
+    if (generation === sandbox.generation) sandbox.loading = false;
+  }
 }
 
 function resetSandbox() {
@@ -599,11 +1089,24 @@ function resetSandbox() {
   sandbox.loading = false;
   sandbox.paths = [];
   sandbox.currentItemId = null;
+  sandbox.selectedKey = null;
+  sandbox.openedItemId = null;
+  sandbox.entries = [];
+  sandbox.folders.clear();
+  sandbox.categoryCounts = {};
+  sandbox.folder = sandbox.category = sandbox.query = "";
+  sandbox.history = [{ folder: "", category: "" }];
+  sandbox.historyIndex = 0;
+  $("sandbox-search").value = "";
+  hideSandboxContextMenu();
+  sandbox.contextAnchor = null;
+  if ($("sandbox-properties").open) $("sandbox-properties").close();
+  for (const id of ["sandbox-property-name", "sandbox-property-type", "sandbox-property-location"]) $(id).textContent = "";
+  $("sandbox-property-icon").replaceChildren();
   cancelSandboxRecovery();
   clearTimeout(sandbox.timer);
   sandbox.timer = null;
-  clearSandboxPreview();
-  renderPaged("sandbox-list", "sandbox-pages", [], () => document.createElement("li"));
+  renderSandboxExplorer();
   $("sandbox-warnings").textContent = "";
   $("sandbox-status").textContent = "";
   if (sessionId) invoke("close_sandbox", { sessionId }).catch(() => {});
@@ -614,10 +1117,17 @@ function lockSandbox(message = "Sandbox locked because key-file access was lost 
   // Plaintext, decrypted names, and the revoked session are always discarded.
   const recovery = canResume ? sandbox.recovery || (sandbox.paths.length && sandbox.fingerprint ? {
     paths: [...sandbox.paths], fingerprint: sandbox.fingerprint,
-    itemId: sandbox.currentItemId, ready: false, waitingForUnlock: false,
+    itemId: sandbox.openedItemId, ready: false, waitingForUnlock: false,
   } : null) : null;
   resetSandbox();
   sandbox.recovery = recovery;
+  const dialog = $("sandbox-dialog");
+  if (dialog.open && (recovery || state.keyDisconnected)) {
+    // Closing removes the modal backdrop. Its close event can arrive after
+    // recovery has reopened the explorer, so consume only this automatic close.
+    sandbox.hiddenClosures++;
+    dialog.close();
+  }
   $("sandbox-status").textContent = message + (recovery ? " This viewer will reload when the same key is available." : "");
   updateSandboxRecoveryUI();
   scheduleSandboxRecoveryCheck();
@@ -638,14 +1148,14 @@ function updateSandboxRecoveryUI() {
 function scheduleSandboxRecoveryCheck() {
   clearTimeout(sandbox.recoveryTimer);
   sandbox.recoveryTimer = null;
-  if (!sandbox.recovery || sandbox.recovery.waitingForUnlock || !$("sandbox-dialog").open) return;
+  if (!sandbox.recovery || sandbox.recovery.waitingForUnlock) return;
   sandbox.recoveryTimer = setTimeout(checkSandboxRecovery, 1000);
 }
 
 async function checkSandboxRecovery() {
   sandbox.recoveryTimer = null;
   const recovery = sandbox.recovery;
-  if (!recovery || !$("sandbox-dialog").open) return;
+  if (!recovery) return;
   if (!state.busy) {
     try {
       const status = await recheckKeyFileStatus();
@@ -659,8 +1169,8 @@ async function checkSandboxRecovery() {
 
 function maybeResumeSandbox() {
   const recovery = sandbox.recovery;
-  if (!recovery?.ready || state.busy || !state.sandboxAvailable
-      || !$("sandbox-dialog").open || $("key-dialog").open || $("startup-key-dialog").open) return;
+  if (!recovery?.ready || state.busy || state.selectionBusy || !state.sandboxAvailable
+      || $("key-dialog").open || $("startup-key-dialog").open) return;
   if (state.keyFingerprint !== recovery.fingerprint) {
     cancelSandboxRecovery();
     return;
@@ -698,7 +1208,7 @@ async function checkSandboxKey() {
 
 async function openSandbox(options = {}) {
   const paths = options.paths || [...state.files];
-  if (state.busy || !state.sandboxAvailable || !paths.length) return;
+  if (state.busy || state.selectionBusy || !state.sandboxAvailable || !paths.length) return;
   resetSandbox();
   sandbox.paths = [...paths];
   sandbox.fingerprint = state.keyFingerprint;
@@ -720,22 +1230,16 @@ async function openSandbox(options = {}) {
     if (generation !== sandbox.generation) return;
     sandbox.items = catalog.items;
     $("sandbox-warnings").textContent = catalog.warnings.join("\n");
-    renderPaged("sandbox-list", "sandbox-pages", sandbox.items, (item) => {
-      const row = document.createElement("li");
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "sandbox-file";
-      button.textContent = item.name;
-      button.disabled = sandbox.loading;
-      sandbox.buttons.push(button);
-      button.addEventListener("click", () => viewSandboxFile(item));
-      row.append(button);
-      return row;
-    });
-    $("sandbox-status").textContent = "Choose a file to preview. Keep the key file connected and readable.";
+    indexSandboxFiles();
+    renderSandboxExplorer();
+    $("sandbox-status").textContent = "Double-click a file to open a private preview window.";
     scheduleSandboxCheck();
     const previous = sandbox.items.find((item) => item.id === options.itemId);
-    if (previous || sandbox.items.length === 1) await viewSandboxFile(previous || sandbox.items[0]);
+    if (previous) {
+      const entry = sandbox.entries.find((item) => item.id === previous.id);
+      navigateSandbox(entry.parent);
+      await viewSandboxFile(entry);
+    }
   } catch (error) {
     if (generation === sandbox.generation) {
       const message = normalizeError(error);
@@ -745,94 +1249,24 @@ async function openSandbox(options = {}) {
     state.busy = false;
     renderControls();
     maybeResumeSandbox();
-  }
-}
-
-function escapeSandboxText(text) {
-  return text.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
-}
-
-function sandboxDocument(content) {
-  const encoded = content.data;
-  content.data = "";
-  let body;
-  if (content.kind === "text") {
-    const bytes = Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0));
-    try {
-      body = `<pre>${escapeSandboxText(new TextDecoder("utf-8", { fatal: true }).decode(bytes))}</pre>`;
-    } finally {
-      bytes.fill(0);
-    }
-  } else {
-    const allowed = {
-      image: ["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/x-icon"],
-      audio: ["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/flac"],
-      video: ["video/mp4", "video/webm", "video/ogg"],
-    };
-    if (!allowed[content.kind]?.includes(content.mime)) throw new Error("Unsupported preview format.");
-    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error("Invalid preview data.");
-    // Data URLs work in an opaque-origin frame without granting same-origin
-    // access or exposing a reusable object URL outside that frame.
-    const url = `data:${content.mime};base64,${encoded}`;
-    body = content.kind === "image"
-      ? `<img src="${url}" alt="File preview">`
-      : `<${content.kind} src="${url}" controls controlslist="nodownload noremoteplayback" disablepictureinpicture disableremoteplayback></${content.kind}>`;
-  }
-  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; media-src data:; style-src '${SANDBOX_STYLE_HASH}'; base-uri 'none'; form-action 'none'"><style>${SANDBOX_STYLE}</style></head><body>${body}</body></html>`;
-}
-
-async function viewSandboxFile(item) {
-  const sessionId = sandbox.sessionId;
-  if (!sessionId || sandbox.loading) return;
-  const generation = sandbox.generation;
-  const selection = ++sandbox.selection;
-  sandbox.currentItemId = item.id;
-  sandbox.loading = true;
-  for (const button of sandbox.buttons) button.disabled = true;
-  clearSandboxPreview();
-  $("sandbox-status").textContent = "Authenticating file in memory…";
-  let content;
-  try {
-    content = await invoke("read_sandbox_file", { sessionId, itemId: item.id });
-    if (generation !== sandbox.generation || selection !== sandbox.selection) return;
-    try {
-      await withSandboxDeadline(invoke("check_sandbox", { sessionId }));
-    } catch (error) {
-      if (generation === sandbox.generation) lockSandbox(normalizeError(error));
-      return;
-    }
-    if (generation !== sandbox.generation || selection !== sandbox.selection) return;
-    const frame = document.createElement("iframe");
-    // No scripts, same-origin access, downloads, popups, forms, or navigation.
-    frame.setAttribute("sandbox", "");
-    frame.setAttribute("referrerpolicy", "no-referrer");
-    frame.setAttribute("allow", "camera 'none'; microphone 'none'; geolocation 'none'; clipboard-write 'none'");
-    frame.title = `Read-only preview: ${item.name}`;
-    frame.srcdoc = sandboxDocument(content);
-    $("sandbox-preview").replaceChildren(frame);
-    $("sandbox-file-name").textContent = item.name;
-    $("sandbox-status").textContent = "Read-only preview • Key file access is checked continuously.";
-  } catch (error) {
-    if (generation === sandbox.generation && selection === sandbox.selection) {
-      clearSandboxPreview();
-      $("sandbox-status").textContent = normalizeError(error);
-    }
-  } finally {
-    if (content) content.data = "";
-    if (generation === sandbox.generation && selection === sandbox.selection) {
-      sandbox.loading = false;
-      for (const button of sandbox.buttons) button.disabled = false;
-    }
+    startAutomaticVerification();
   }
 }
 
 async function init() {
+  $("current-key-icon").innerHTML = EXPLORER_ICONS.needsKey;
+  $("key-disconnected-icon").innerHTML = EXPLORER_ICONS.unplug;
   try {
     await window.__TAURI__?.event?.listen("key-status-changed", ({ payload }) => {
       applyStatus(payload, false);
     });
     await window.__TAURI__?.event?.listen("sandbox-locked", ({ payload }) => {
       if (payload === sandbox.sessionId) lockSandbox();
+    });
+    await window.__TAURI__?.event?.listen("sandbox-preview-closed", ({ payload }) => {
+      if (payload.sessionId !== sandbox.sessionId) return;
+      if (payload.locked) lockSandbox();
+      else if (payload.itemId === sandbox.openedItemId) sandbox.openedItemId = null;
     });
     await window.__TAURI__?.event?.listen("job-progress", ({ payload }) => {
       const { processedBytes, totalBytes, currentFile, fileIndex, fileCount, stage } = payload;
@@ -841,11 +1275,8 @@ async function init() {
       $("progress-label").textContent = `${stage}: ${baseName(currentFile)} (${fileIndex}/${fileCount}) · ${percentage}%`;
     });
     await window.__TAURI__?.webview?.getCurrentWebview()?.onDragDropEvent((event) => {
-      if (event.payload.type === "drop" && !state.busy) {
-        run(async () => {
-          addSelectedFiles(await invoke("expand_dropped_paths", { paths: event.payload.paths }));
-          return null;
-        }, false);
+      if (event.payload.type === "drop" && !selectionBlocked()) {
+        selectFiles(() => invoke("expand_dropped_paths", { paths: event.payload.paths }));
       }
       document.body.classList.toggle("drag-over", event.payload.type === "enter" || event.payload.type === "over");
     });
@@ -855,9 +1286,7 @@ async function init() {
   $("open-key-options").addEventListener("click", openKeyOptions);
   $("sandbox-key-options").addEventListener("click", openKeyOptions);
   $("close-key-options").addEventListener("click", () => $("key-dialog").close());
-  for (const id of ["close-startup-key", "dismiss-startup-key"]) {
-    $(id).addEventListener("click", () => $("startup-key-dialog").close());
-  }
+  $("startup-key-dialog").addEventListener("cancel", (event) => event.preventDefault());
   $("startup-key-dialog").addEventListener("close", () => {
     if (!$("key-dialog").open) {
       if ($("sandbox-dialog").open) $("close-sandbox").focus();
@@ -865,14 +1294,8 @@ async function init() {
     }
     maybeResumeSandbox();
   });
-  $("startup-key-options").addEventListener("click", () => {
-    $("startup-key-dialog").close();
-    $("key-path").value = state.keyPath || $("key-path").value;
-    openKeyOptions();
-  });
-  $("check-key-again").addEventListener("click", recheckKeyFile);
   $("choose-recovery-key").addEventListener("click", () => {
-    run(() => invokeWithPassphrase("browse_key"), true);
+    $("startup-key-dialog").close();
   });
   $("key-dialog").addEventListener("close", () => {
     $("key-text").value = "";
@@ -997,13 +1420,7 @@ async function init() {
     run(() => invoke("set_output_dir", { path: "" }), true);
   });
 
-  $("add-files").addEventListener("click", () => {
-    run(async () => {
-      const picked = await invoke("pick_input_files");
-      addSelectedFiles(picked);
-      return null;
-    }, false);
-  });
+  $("add-files").addEventListener("click", () => selectFiles(() => invoke("pick_input_files")));
 
   $("file-empty").addEventListener("click", () => $("add-files").click());
   $("file-empty").addEventListener("keydown", (event) => {
@@ -1013,31 +1430,111 @@ async function init() {
     }
   });
 
-  $("add-folder").addEventListener("click", () => {
-    run(async () => {
-      addSelectedFiles(await invoke("pick_input_folder"));
-      return null;
-    }, false);
-  });
+  $("add-folder").addEventListener("click", () => selectFiles(() => invoke("pick_input_folder")));
 
   $("clear-files").addEventListener("click", () => {
+    if (selectionBlocked()) return;
     state.files = [];
     state.fileSet.clear();
     state.folderRoots.clear();
+    resetFileVerification();
+    cancelSandboxRecovery();
     invalidatePreview();
+    rememberSelectedFiles();
     renderFiles();
   });
 
   $("encrypt").addEventListener("click", () => prepareJob("encrypt"));
   $("decrypt").addEventListener("click", () => prepareJob("decrypt"));
   $("view-sandbox").addEventListener("click", openSandbox);
+  $("sandbox-home").addEventListener("click", () => navigateSandbox());
+  $("sandbox-reset-filter").addEventListener("click", () => navigateSandbox());
+  $("sandbox-back").addEventListener("click", () => stepSandboxHistory(-1));
+  $("sandbox-forward").addEventListener("click", () => stepSandboxHistory(1));
+  $("sandbox-up").addEventListener("click", () => navigateSandbox(sandbox.query || sandbox.category ? "" : sandbox.folders.get(sandbox.folder)?.parent || ""));
+  const searchSandbox = () => {
+    sandbox.query = $("sandbox-search").value;
+    if (pagedLists.has("sandbox-list")) pagedLists.get("sandbox-list").page = 0;
+    renderSandboxExplorer();
+  };
+  $("sandbox-search").addEventListener("input", searchSandbox);
+  $("sandbox-clear-search").addEventListener("click", () => {
+    $("sandbox-search").value = "";
+    searchSandbox();
+    $("sandbox-search").focus();
+  });
+  $("sandbox-sort").addEventListener("change", () => {
+    sandbox.sort = $("sandbox-sort").value;
+    if (pagedLists.has("sandbox-list")) pagedLists.get("sandbox-list").page = 0;
+    renderSandboxExplorer();
+  });
+  for (const view of ["grid", "details"]) {
+    $("sandbox-" + view).addEventListener("click", () => {
+      sandbox.view = view;
+      renderSandboxExplorer();
+    });
+  }
+  $("close-sandbox-properties").addEventListener("click", () => $("sandbox-properties").close());
+  $("sandbox-context-menu").addEventListener("keydown", (event) => {
+    const menu = $("sandbox-context-menu");
+    const buttons = Array.from(menu.children);
+    const index = buttons.indexOf(document.activeElement);
+    if (["ArrowDown", "ArrowUp", "Home", "End", "Escape", "Tab"].includes(event.key)) {
+      if (event.key !== "Tab") event.preventDefault();
+      event.stopPropagation();
+      if (event.key === "Escape" || event.key === "Tab") {
+        const anchor = sandbox.contextAnchor;
+        hideSandboxContextMenu();
+        if (event.key === "Escape") anchor?.focus();
+      } else {
+        const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1
+          : (index + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length;
+        buttons[next]?.focus();
+      }
+    }
+  });
+  $("sandbox-dialog").addEventListener("pointerdown", (event) => {
+    if (!$("sandbox-context-menu").contains(event.target)) hideSandboxContextMenu();
+    if (event.target === $("sandbox-list") || event.target === $("sandbox-file-scroll")) {
+      sandbox.selectedKey = null;
+      sandbox.currentItemId = null;
+      updateSandboxSelection();
+    }
+  });
+  $("sandbox-file-scroll").addEventListener("scroll", hideSandboxContextMenu);
+  $("sandbox-dialog").addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      $("sandbox-search").focus();
+    } else if (event.altKey && ["ArrowLeft", "ArrowRight", "ArrowUp"].includes(event.key)) {
+      event.preventDefault();
+      if (event.key === "ArrowUp") $("sandbox-up").click();
+      else stepSandboxHistory(event.key === "ArrowLeft" ? -1 : 1);
+    } else if (event.key === "Escape" && !$("sandbox-context-menu").hidden) {
+      event.preventDefault();
+      hideSandboxContextMenu();
+    }
+  });
+  $("sandbox-list").addEventListener("keydown", (event) => {
+    const index = sandbox.buttons.indexOf(document.activeElement);
+    if (index < 0 || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const columns = sandbox.view === "grid" ? window.getComputedStyle($("sandbox-list")).gridTemplateColumns.split(" ").length : 1;
+    const delta = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -columns, ArrowDown: columns }[event.key] || 0;
+    const next = event.key === "Home" ? 0 : event.key === "End" ? sandbox.buttons.length - 1
+      : Math.max(0, Math.min(sandbox.buttons.length - 1, index + delta));
+    sandbox.buttons[next]?.focus();
+  });
   $("close-sandbox").addEventListener("click", () => $("sandbox-dialog").close());
   $("sandbox-dialog").addEventListener("close", () => {
+    if (sandbox.hiddenClosures) {
+      sandbox.hiddenClosures--;
+      return;
+    }
     resetSandbox();
     $("view-sandbox").focus();
   });
   window.addEventListener("pagehide", () => resetSandbox());
-  $("verify").addEventListener("click", () => prepareJob("verify"));
   $("start-job").addEventListener("click", startJob);
   $("dismiss-preview").addEventListener("click", invalidatePreview);
   $("cancel-job").addEventListener("click", async () => {
@@ -1068,7 +1565,12 @@ async function init() {
     showAlert(normalizeError(error));
     renderControls();
   }
+  savedSelection.ready = true;
+  if (!savedSelection.pending && savedSelection.revision) rememberSelectedFiles();
+  else await maybeRestoreSelectedFiles();
   renderFiles();
+  fileVerification.ready = true;
+  startAutomaticVerification();
 }
 
 async function prepareJob(operation) {
@@ -1126,6 +1628,7 @@ async function startJob() {
   if (state.busy || !state.keyLoaded || !job?.preview?.canRun || job.revision !== state.planRevision) return;
   invalidatePreview();
   state.jobRunning = true;
+  resetFileVerification();
   $("progress-panel").hidden = false;
   $("job-progress").value = 0;
   $("progress-label").textContent = "Preparing...";

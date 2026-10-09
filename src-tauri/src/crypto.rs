@@ -673,7 +673,7 @@ pub fn verify_file(
     }
 }
 
-fn verify_reader(
+pub(crate) fn verify_reader(
     key: &[u8; 32],
     input: &Path,
     reader: &mut dyn Read,

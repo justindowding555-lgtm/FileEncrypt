@@ -1,10 +1,10 @@
 //! Read-only previews. Plaintext is bounded, authenticated in memory, and never
 //! passed to a filesystem writer or an external application.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
@@ -27,6 +27,29 @@ const LOCKED: &str =
 pub(crate) struct Registry {
     revision: u64,
     current: Option<Arc<Session>>,
+    previews: HashMap<String, PreviewTarget>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewTarget {
+    session_id: String,
+    item_id: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClosedPreview {
+    session_id: String,
+    item_id: usize,
+    locked: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewInfo {
+    session_id: String,
+    item: CatalogItem,
 }
 
 struct Session {
@@ -36,6 +59,7 @@ struct Session {
     file_hash: [u8; 32],
     revoked: AtomicBool,
     reading: AtomicBool,
+    preview_read: Mutex<()>,
     items: Vec<Item>,
 }
 
@@ -171,6 +195,7 @@ fn open(state: &AppState, paths: Vec<String>) -> Result<Catalog, String> {
         file_hash,
         revoked: AtomicBool::new(false),
         reading: AtomicBool::new(false),
+        preview_read: Mutex::new(()),
         items: Vec::new(),
     };
     session.validate(state)?;
@@ -374,7 +399,11 @@ pub async fn check_sandbox(app: tauri::AppHandle, session_id: String) -> Result<
 }
 
 #[tauri::command]
-pub fn close_sandbox(state: tauri::State<'_, AppState>, session_id: Option<String>) {
+pub fn close_sandbox(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    session_id: Option<String>,
+) {
     if let Some(id) = session_id {
         let session = lock(&state.sandbox).current.clone();
         if let Some(session) = session.filter(|session| session.id == id) {
@@ -383,12 +412,208 @@ pub fn close_sandbox(state: tauri::State<'_, AppState>, session_id: Option<Strin
     } else {
         revoke(&state);
     }
+    close_invalid_previews(&app);
+}
+
+fn preview_target(state: &AppState, label: &str) -> Result<PreviewTarget, String> {
+    lock(&state.sandbox)
+        .previews
+        .get(label)
+        .cloned()
+        .ok_or_else(|| LOCKED.into())
+}
+
+pub(crate) fn forget_preview(state: &AppState, label: &str) {
+    lock(&state.sandbox).previews.remove(label);
+}
+
+pub(crate) fn preview_closed(app: &tauri::AppHandle, label: &str) {
+    notify_preview_closed(app, label, false);
+}
+
+fn take_closed_preview(state: &AppState, label: &str, locked: bool) -> Option<ClosedPreview> {
+    let mut registry = lock(&state.sandbox);
+    let target = registry.previews.remove(label)?;
+    // A native close may race the key monitor. Losing the session must not be
+    // mistaken for a manual dismissal of the file we need to restore.
+    let locked = locked
+        || !registry.current.as_ref().is_some_and(|session| {
+            session.id == target.session_id && !session.revoked.load(Ordering::Acquire)
+        });
+    Some(ClosedPreview {
+        session_id: target.session_id,
+        item_id: target.item_id,
+        locked,
+    })
+}
+
+fn notify_preview_closed(app: &tauri::AppHandle, label: &str, locked: bool) {
+    if let Some(closed) = take_closed_preview(&app.state::<AppState>(), label, locked) {
+        let _ = app.emit_to("main", "sandbox-preview-closed", closed);
+    }
+}
+
+fn close_invalid_previews(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let labels = {
+        let mut registry = lock(&state.sandbox);
+        let active = registry
+            .current
+            .as_ref()
+            .filter(|session| !session.revoked.load(Ordering::Acquire))
+            .map(|session| session.id.clone());
+        let labels: Vec<_> = registry
+            .previews
+            .iter()
+            .filter(|(_, target)| active.as_deref() != Some(&target.session_id))
+            .map(|(label, _)| label.clone())
+            .collect();
+        for label in &labels {
+            registry.previews.remove(label);
+        }
+        labels
+    };
+    for label in labels {
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.set_title("Private preview - FileEncrypt");
+            let _ = window.close();
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn open_sandbox_preview(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    session_id: String,
+    item_id: usize,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("Open previews from the sandbox explorer.".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let session = current(&state, &session_id)?;
+        let item = session.items.get(item_id).ok_or("Unknown sandbox file.")?;
+        let name = item.name.rsplit(['/', '\\']).next().unwrap_or(&item.name);
+        let label = format!("sandbox-preview-{}-{}", session.id, item_id);
+        if let Some(existing) = app.get_webview_window(&label) {
+            let _ = existing.unminimize();
+            return existing.set_focus().map_err(|error| error.to_string());
+        }
+        lock(&state.sandbox).previews.insert(
+            label.clone(),
+            PreviewTarget {
+                session_id: session_id.clone(),
+                item_id,
+            },
+        );
+        let builder = tauri::WebviewWindowBuilder::new(
+            &app,
+            &label,
+            tauri::WebviewUrl::App("sandbox-preview.html".into()),
+        )
+        .title(format!("{name} - FileEncrypt"))
+        .theme(window.theme().ok())
+        .inner_size(900.0, 680.0)
+        .min_inner_size(460.0, 360.0)
+        .center()
+        .on_navigation(|url| {
+            url.path() == "/sandbox-preview.html"
+                || matches!(url.as_str(), "about:blank" | "about:srcdoc")
+        });
+        // Owned windows on Windows have no taskbar entry and minimize to a
+        // small floating title bar. Keep previews as regular top-level windows;
+        // the sandbox monitor still closes them when the main window exits.
+        #[cfg(windows)]
+        let result = builder.build();
+        #[cfg(not(windows))]
+        let result = builder.parent(&window).and_then(|builder| builder.build());
+        let preview = match result {
+            Ok(preview) => preview,
+            Err(error) => {
+                forget_preview(&state, &label);
+                return Err(error.to_string());
+            }
+        };
+        // Creation can race a disconnect or a closed explorer. Never retain a
+        // preview for a session that was revoked while the webview was starting.
+        if let Err(error) = current(&state, &session_id) {
+            forget_preview(&state, &label);
+            let _ = preview.set_title("Private preview - FileEncrypt");
+            let _ = preview.close();
+            return Err(error);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn sandbox_preview_info(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<PreviewInfo, String> {
+    let label = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let target = preview_target(&state, &label)?;
+        let session = current(&state, &target.session_id)?;
+        let item = session
+            .items
+            .get(target.item_id)
+            .ok_or("Unknown sandbox file.")?;
+        Ok(PreviewInfo {
+            session_id: target.session_id,
+            item: CatalogItem {
+                id: target.item_id,
+                name: item.name.clone(),
+                kind: format(&item.name).0,
+            },
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn read_sandbox_preview(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Content, String> {
+    let label = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let target = preview_target(&state, &label)?;
+        let session = current(&state, &target.session_id)?;
+        // Native windows may open together. Serialize their bounded reads so a
+        // second preview waits instead of showing a spurious "already loading".
+        let _turn = lock(&session.preview_read);
+        read(&state, &target.session_id, target.item_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub fn close_sandbox_preview(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    locked: Option<bool>,
+) -> Result<(), String> {
+    preview_target(&app.state::<AppState>(), window.label())?;
+    notify_preview_closed(&app, window.label(), locked.unwrap_or(false));
+    let _ = window.set_title("Private preview - FileEncrypt");
+    window.close().map_err(|error| error.to_string())
 }
 
 pub(crate) fn start_monitor(app: tauri::AppHandle) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(500));
         if app.get_webview_window("main").is_none() {
+            revoke(&app.state::<AppState>());
+            close_invalid_previews(&app);
             break;
         }
         let state = app.state::<AppState>();
@@ -399,6 +624,7 @@ pub(crate) fn start_monitor(app: tauri::AppHandle) {
                 let _ = app.emit("sandbox-locked", &session.id);
             }
         }
+        close_invalid_previews(&app);
     });
 }
 
@@ -407,6 +633,25 @@ mod tests {
     use super::*;
     use crate::{archive, crypto::JobOptions, test_support::TestDir};
     use std::fs;
+
+    #[test]
+    fn preview_targets_are_bound_to_registered_windows() {
+        let state = AppState::default();
+        lock(&state.sandbox).previews.insert(
+            "sandbox-preview-1-4".into(),
+            PreviewTarget {
+                session_id: "1".into(),
+                item_id: 4,
+            },
+        );
+        let target = preview_target(&state, "sandbox-preview-1-4").unwrap();
+        assert_eq!(target.session_id, "1");
+        assert_eq!(target.item_id, 4);
+        assert!(preview_target(&state, "main").is_err());
+        assert!(preview_target(&state, "sandbox-preview-1-5").is_err());
+        forget_preview(&state, "sandbox-preview-1-4");
+        assert!(preview_target(&state, "sandbox-preview-1-4").is_err());
+    }
 
     fn fixture() -> (TestDir, AppState, PathBuf, [u8; 32]) {
         let dir = TestDir::new();
@@ -436,6 +681,32 @@ mod tests {
         let encrypted = crypto::encrypt_file(key, &path, &options()).unwrap();
         fs::remove_file(path).unwrap();
         encrypted.display().to_string()
+    }
+
+    #[test]
+    fn preview_closure_distinguishes_manual_dismissal_from_key_loss() {
+        for (frontend_locked, revoke_before_close) in [(false, false), (true, false), (false, true)]
+        {
+            let (dir, state, _, key) = fixture();
+            let path = encrypted(&dir, "private.txt", b"private contents", &key);
+            let catalog = open(&state, vec![path]).unwrap();
+            let label = format!("sandbox-preview-{}-0", catalog.session_id);
+            lock(&state.sandbox).previews.insert(
+                label.clone(),
+                PreviewTarget {
+                    session_id: catalog.session_id.clone(),
+                    item_id: 0,
+                },
+            );
+            if revoke_before_close {
+                revoke(&state);
+            }
+            let closed = take_closed_preview(&state, &label, frontend_locked).unwrap();
+            assert_eq!(closed.session_id, catalog.session_id);
+            assert_eq!(closed.item_id, 0);
+            assert_eq!(closed.locked, frontend_locked || revoke_before_close);
+            assert!(take_closed_preview(&state, &label, frontend_locked).is_none());
+        }
     }
 
     fn files(dir: &TestDir) -> Vec<PathBuf> {

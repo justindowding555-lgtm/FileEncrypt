@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Private preview - FileEncrypt</title>
+    <link rel="icon" type="image/svg+xml" href="icon.svg" />
+    <script src="theme.js"></script>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="explorer-icons.js"></script>
+    <script src="sandbox-content.js"></script>
+    <script type="module" src="sandbox-preview.js"></script>
+  </head>
+  <body class="private-preview">
+    <main class="private-preview-content">
+      <div id="preview-content" hidden></div>
+      <div id="preview-message" class="private-preview-message" role="status">
+        <span id="preview-message-icon" aria-hidden="true"></span>
+        <h2 id="preview-message-title">Preparing your preview</h2>
+        <p id="preview-message-detail">Authenticating and opening this file in memory.</p>
+        <button type="button" id="retry-private-preview" hidden>Try preview again</button>
+      </div>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "sandbox-preview",
+  "description": "Key revocation events and native theme updates for isolated preview windows",
+  "windows": ["sandbox-preview-*"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "core:window:allow-set-theme"]
+}

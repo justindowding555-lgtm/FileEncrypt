@@ -4,12 +4,14 @@ mod commands;
 mod crypto;
 mod deletion;
 mod file_guard;
+mod file_selection;
 mod key_file;
 mod publication;
 mod sandbox;
 mod source;
 #[cfg(test)]
 mod test_support;
+mod verification;
 
 /// Parse an in-memory archive with the same checks used for files selected in the app.
 /// This entry point also lets the fuzz target exercise the parser without disk I/O.
@@ -29,7 +31,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(commands::AppState::default())
+        .manage(file_selection::SelectionStore::default())
+        .manage(verification::VerificationState::default())
         .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                sandbox::preview_closed(window.app_handle(), window.label());
+            }
             if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
                 commands::clear_key_on_close(window.state::<commands::AppState>().inner());
             }
@@ -46,6 +53,9 @@ pub fn run() {
             commands::pick_input_files,
             commands::pick_input_folder,
             commands::expand_dropped_paths,
+            file_selection::remember_selected_files,
+            file_selection::restore_selected_files,
+            verification::verify_selected_files,
             commands::pick_save_path,
             commands::pick_output_dir,
             commands::set_output_dir,
@@ -69,6 +79,10 @@ pub fn run() {
             sandbox::read_sandbox_file,
             sandbox::check_sandbox,
             sandbox::close_sandbox,
+            sandbox::open_sandbox_preview,
+            sandbox::sandbox_preview_info,
+            sandbox::read_sandbox_preview,
+            sandbox::close_sandbox_preview,
         ])
         .build(tauri::generate_context!())
         .expect("error while building FileEncrypt")
