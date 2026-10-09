@@ -218,7 +218,7 @@ pub(crate) fn encrypt_bundle_reader(
     validate_relative_name(name)?;
     let count = Cell::new(0);
     let reader = CountingReader {
-        inner: BufReader::new(source.file.try_clone()?),
+        inner: BufReader::new(source.reader()?),
         count: &count,
     };
     let mut reader: Box<dyn Read + '_> = if let Some(callback) = callback {
@@ -358,10 +358,16 @@ pub(crate) fn decrypt_named_reader(
         .ok_or(CryptoError::BadEncryptedName)?;
     ensure_no_linked_parent(root, &output)?;
     ensure_distinct(input, &output, options.key_file.as_deref())?;
-    publication::write(&output, options.overwrite, callback, |writer| {
-        decrypt_named_body(reader, writer, &opened)?;
-        check_progress(callback)
-    })
+    publication::write_with_receipt(
+        &output,
+        options.overwrite,
+        callback,
+        options.remove_original,
+        |writer| {
+            decrypt_named_body(reader, writer, &opened)?;
+            check_progress(callback)
+        },
+    )
 }
 
 enum PipeMessage {
@@ -465,7 +471,7 @@ pub fn rotate_file_with_deletion(
     let version = legacy_version(input)?.ok_or(CryptoError::NotEncrypted)?;
     let output = opaque_output_path(input, options.output_dir.as_deref(), false)?;
     finish_job(input, output, options, callback, |destination, source| {
-        let reader = BufReader::new(source.file.try_clone()?);
+        let reader = BufReader::new(source.reader()?);
         let mut source: Box<dyn Read + Send + '_> = if let Some(callback) = callback {
             Box::new(ProgressReader {
                 inner: reader,
@@ -501,68 +507,59 @@ pub fn rotate_file_with_deletion(
         } else {
             return Err(CryptoError::UnsupportedVersion(version));
         };
-        let result = publication::write(destination, false, callback, |writer| {
-            std::thread::scope(|scope| {
-                let (sender, receiver) = sync_channel(2);
-                let (recycled, pool) = sync_channel(4);
-                let reader = PipeReader {
-                    receiver,
-                    recycled,
-                    pending: SecretBytes(Vec::new()),
-                    offset: 0,
-                    done: false,
-                };
-                let worker = scope.spawn(move || {
-                    let result = {
-                        let mut sink = PipeWriter(sender.clone(), pool);
-                        match opened {
-                            Some(opened) => decrypt_named_body(&mut source, &mut sink, &opened),
-                            None if version == AEGIS_VERSION => {
-                                decrypt_aegis(old_key, &mut source, &mut sink)
-                            }
-                            None => decrypt_stream(old_key, &mut source, &mut sink),
-                        }
+        let result = publication::write_with_receipt(
+            destination,
+            false,
+            callback,
+            options.remove_original,
+            |writer| {
+                std::thread::scope(|scope| {
+                    let (sender, receiver) = sync_channel(2);
+                    let (recycled, pool) = sync_channel(4);
+                    let reader = PipeReader {
+                        receiver,
+                        recycled,
+                        pending: SecretBytes(Vec::new()),
+                        offset: 0,
+                        done: false,
                     };
-                    let _ = sender.send(match &result {
-                        Ok(()) => PipeMessage::Done,
-                        Err(err) => PipeMessage::Failed(err.to_string()),
+                    let worker = scope.spawn(move || {
+                        let result = {
+                            let mut sink = PipeWriter(sender.clone(), pool);
+                            match opened {
+                                Some(opened) => {
+                                    decrypt_rotation_body(&mut source, &mut sink, &opened)
+                                }
+                                None if version == AEGIS_VERSION => {
+                                    decrypt_aegis(old_key, &mut source, &mut sink)
+                                }
+                                None => decrypt_stream(old_key, &mut source, &mut sink),
+                            }
+                        };
+                        let _ = sender.send(match &result {
+                            Ok(()) => PipeMessage::Done,
+                            Err(err) => PipeMessage::Failed(err.to_string()),
+                        });
+                        result
                     });
-                    result
-                });
-                let mut reader = reader;
-                let encrypted = if matches!(
-                    target_version,
-                    COMPRESSED_BUNDLE_VERSION | AUTH_COMPRESSED_BUNDLE_VERSION
-                ) {
-                    let mut compressed =
-                        flate2::read::ZlibEncoder::new(&mut reader, flate2::Compression::default());
-                    encrypt_aegis_bound(
-                        new_key,
-                        &name,
-                        &mut compressed,
-                        writer,
-                        target_version,
-                        size,
-                        binding,
-                    )
-                } else {
-                    encrypt_aegis_bound(
+                    let mut reader = reader;
+                    let encrypted = encrypt_aegis_bound(
                         new_key,
                         &name,
                         &mut reader,
                         writer,
                         target_version,
-                        None,
+                        size,
                         binding,
-                    )
-                };
-                drop(reader);
-                let decrypted = worker.join().map_err(|_| CryptoError::EncryptFailed)?;
-                decrypted?;
-                encrypted?;
-                check_progress(callback)
-            })
-        });
+                    );
+                    drop(reader);
+                    let decrypted = worker.join().map_err(|_| CryptoError::EncryptFailed)?;
+                    decrypted?;
+                    encrypted?;
+                    check_progress(callback)
+                })
+            },
+        );
         result
     })
 }
@@ -604,20 +601,15 @@ pub(crate) fn rotate_named_reader(
         };
         let worker = scope.spawn(move || {
             let mut sink = PipeWriter(sender.clone(), pool);
-            let result = decrypt_named_body(source, &mut sink, &opened);
+            let result = decrypt_rotation_body(source, &mut sink, &opened);
             let _ = sender.send(match &result {
                 Ok(()) => PipeMessage::Done,
                 Err(err) => PipeMessage::Failed(err.to_string()),
             });
             result
         });
-        let encrypted = if compressed {
-            let mut encoder =
-                flate2::read::ZlibEncoder::new(&mut reader, flate2::Compression::default());
-            encrypt_aegis_bound(new_key, &name, &mut encoder, writer, version, size, binding)
-        } else {
-            encrypt_aegis_bound(new_key, &name, &mut reader, writer, version, None, binding)
-        };
+        let encrypted =
+            encrypt_aegis_bound(new_key, &name, &mut reader, writer, version, size, binding);
         drop(reader);
         worker.join().map_err(|_| CryptoError::EncryptFailed)??;
         encrypted?;
@@ -741,76 +733,94 @@ fn transform(
                 opaque_output_path(input, options.output_dir.as_deref(), options.overwrite)?;
             let original_name = file_name_utf8(input)?;
             finish_job(input, output, options, callback, |destination, source| {
-                let input_file = source.file.try_clone()?;
+                let input_file = source.reader()?;
                 let mut reader = BufReader::new(input_file);
-                publication::write(destination, options.overwrite, callback, |writer| {
-                    let result = if let Some(callback) = callback {
-                        let mut reader = ProgressReader {
-                            inner: reader,
-                            callback,
+                publication::write_with_receipt(
+                    destination,
+                    options.overwrite,
+                    callback,
+                    options.remove_original,
+                    |writer| {
+                        let result = if let Some(callback) = callback {
+                            let mut reader = ProgressReader {
+                                inner: reader,
+                                callback,
+                            };
+                            encrypt_aegis(
+                                key,
+                                &original_name,
+                                &mut reader,
+                                writer,
+                                NAMED_VERSION,
+                                None,
+                            )
+                        } else {
+                            encrypt_aegis(
+                                key,
+                                &original_name,
+                                &mut reader,
+                                writer,
+                                NAMED_VERSION,
+                                None,
+                            )
                         };
-                        encrypt_aegis(
-                            key,
-                            &original_name,
-                            &mut reader,
-                            writer,
-                            NAMED_VERSION,
-                            None,
-                        )
-                    } else {
-                        encrypt_aegis(
-                            key,
-                            &original_name,
-                            &mut reader,
-                            writer,
-                            NAMED_VERSION,
-                            None,
-                        )
-                    };
-                    result?;
-                    check_progress(callback)
-                })
+                        result?;
+                        check_progress(callback)
+                    },
+                )
             })
         }
         Direction::Decrypt => match legacy_version(input)? {
             Some(LEGACY_VERSION) => {
                 let output = output_path(input, options.output_dir.as_deref(), Direction::Decrypt)?;
                 finish_job(input, output, options, callback, |destination, source| {
-                    let input_file = source.file.try_clone()?;
+                    let input_file = source.reader()?;
                     let mut reader = BufReader::new(input_file);
-                    publication::write(destination, options.overwrite, callback, |writer| {
-                        let result = if let Some(callback) = callback {
-                            let mut reader = ProgressReader {
-                                inner: reader,
-                                callback,
+                    publication::write_with_receipt(
+                        destination,
+                        options.overwrite,
+                        callback,
+                        options.remove_original,
+                        |writer| {
+                            let result = if let Some(callback) = callback {
+                                let mut reader = ProgressReader {
+                                    inner: reader,
+                                    callback,
+                                };
+                                decrypt_stream(key, &mut reader, writer)
+                            } else {
+                                decrypt_stream(key, &mut reader, writer)
                             };
-                            decrypt_stream(key, &mut reader, writer)
-                        } else {
-                            decrypt_stream(key, &mut reader, writer)
-                        };
-                        result?;
-                        check_progress(callback)
-                    })
+                            result?;
+                            check_progress(callback)
+                        },
+                    )
                 })
             }
             Some(AEGIS_VERSION) => {
                 let output = output_path(input, options.output_dir.as_deref(), Direction::Decrypt)?;
                 finish_job(input, output, options, callback, |destination, source| {
-                    let input_file = source.file.try_clone()?;
+                    let input_file = source.reader()?;
                     let mut reader = BufReader::new(input_file);
-                    publication::write(destination, options.overwrite, callback, |writer| {
-                        let result = if let Some(callback) = callback {
-                            let mut reader = ProgressReader {
-                                inner: reader,
-                                callback,
+                    publication::write_with_receipt(
+                        destination,
+                        options.overwrite,
+                        callback,
+                        options.remove_original,
+                        |writer| {
+                            let result = if let Some(callback) = callback {
+                                let mut reader = ProgressReader {
+                                    inner: reader,
+                                    callback,
+                                };
+                                decrypt_aegis(key, &mut reader, writer)
+                            } else {
+                                decrypt_aegis(key, &mut reader, writer)
                             };
-                            decrypt_aegis(key, &mut reader, writer)
-                        } else {
-                            decrypt_aegis(key, &mut reader, writer)
-                        };
-                        result?;
-                        check_progress(callback)
-                    })
+                            result?;
+                            check_progress(callback)
+                        },
+                    )
                 })
             }
             Some(
@@ -886,7 +896,7 @@ fn decrypt_named(
     callback: Option<&ProgressCallback<'_>>,
 ) -> Result<TransformOutcome, CryptoError> {
     let source = Source::open(input, options.remove_original)?;
-    let reader = BufReader::new(source.file.try_clone()?);
+    let reader = BufReader::new(source.reader()?);
     let mut reader: Box<dyn Read + '_> = if let Some(callback) = callback {
         Box::new(ProgressReader {
             inner: reader,
@@ -916,10 +926,16 @@ fn decrypt_named(
         source,
         callback,
         move |destination, _| {
-            publication::write(destination, options.overwrite, callback, |writer| {
-                decrypt_named_body(&mut reader, writer, &opened)?;
-                check_progress(callback)
-            })
+            publication::write_with_receipt(
+                destination,
+                options.overwrite,
+                callback,
+                options.remove_original,
+                |writer| {
+                    decrypt_named_body(&mut reader, writer, &opened)?;
+                    check_progress(callback)
+                },
+            )
         },
     )
 }
@@ -1350,6 +1366,60 @@ fn decrypt_named_body(
     }
 }
 
+fn decrypt_rotation_body(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    opened: &OpenedNamed,
+) -> Result<(), CryptoError> {
+    if !matches!(
+        opened.version,
+        COMPRESSED_BUNDLE_VERSION | AUTH_COMPRESSED_BUNDLE_VERSION
+    ) {
+        return decrypt_named_body(reader, writer, opened);
+    }
+    // Preserve the compressed stream exactly. Validate its decoded length and
+    // zlib checksum while forwarding authenticated compressed bytes to encryption.
+    // Neither output is published until the final AEAD tag and decoder finish pass.
+    let mut sink = io::sink();
+    let mut bounded = BoundedWriter {
+        inner: &mut sink,
+        remaining: opened
+            .original_size
+            .ok_or(CryptoError::AuthenticationFailed)?,
+    };
+    let mut decoder = flate2::write::ZlibDecoder::new(&mut bounded);
+    struct ValidatingWriter<'a, W> {
+        output: &'a mut dyn Write,
+        decoder: &'a mut W,
+    }
+    impl<W: Write> Write for ValidatingWriter<'_, W> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.decoder.write_all(bytes)?;
+            self.output.write_all(bytes)?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.output.flush()
+        }
+    }
+    decrypt_chunks(
+        reader,
+        &mut ValidatingWriter {
+            output: writer,
+            decoder: &mut decoder,
+        },
+        &opened.file_key,
+        &opened.prefix,
+        opened.chunk_size,
+        &opened.body_aad,
+    )?;
+    decoder.finish()?;
+    if bounded.remaining != 0 {
+        return Err(CryptoError::Truncated);
+    }
+    Ok(())
+}
+
 fn validate_file_name(name: &str) -> Result<(), CryptoError> {
     if name.is_empty()
         || name == "."
@@ -1741,6 +1811,77 @@ mod tests {
     use super::*;
     use std::assert_matches;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn compressed_rotation_preserves_encoded_bytes_and_rejects_invalid_streams() {
+        let data = b"compressible private contents".repeat(12_000);
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&data).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let old_key = [11; 32];
+        let new_key = [12; 32];
+        for invalid in [false, true] {
+            let mut payload = compressed.clone();
+            if invalid {
+                *payload.last_mut().unwrap() ^= 1;
+            }
+            let mut encrypted = Vec::new();
+            encrypt_aegis_bound(
+                &old_key,
+                "private.txt",
+                &mut payload.as_slice(),
+                &mut encrypted,
+                AUTH_COMPRESSED_BUNDLE_VERSION,
+                Some(data.len() as u64),
+                Some(BundleBinding {
+                    id: [3; 16],
+                    count: 1,
+                }),
+            )
+            .unwrap();
+            let mut rotated = Vec::new();
+            let result = rotate_named_reader(
+                &old_key,
+                &new_key,
+                &mut encrypted.as_slice(),
+                &mut rotated,
+                Some(BundleBinding {
+                    id: [4; 16],
+                    count: 1,
+                }),
+                None,
+            );
+            if invalid {
+                assert!(
+                    result.is_err(),
+                    "authentication alone must not bypass zlib validation"
+                );
+                continue;
+            }
+            result.unwrap();
+            let mut reader = rotated.as_slice();
+            let opened = open_named(&mut reader, &new_key).unwrap();
+            let mut encoded = Zeroizing::new(Vec::new());
+            decrypt_chunks(
+                &mut reader,
+                &mut *encoded,
+                &opened.file_key,
+                &opened.prefix,
+                opened.chunk_size,
+                &opened.body_aad,
+            )
+            .unwrap();
+            assert_eq!(
+                *encoded, compressed,
+                "rotation must preserve the original compression choices"
+            );
+            let mut reader = rotated.as_slice();
+            let opened = open_named(&mut reader, &new_key).unwrap();
+            let mut decoded = Zeroizing::new(Vec::new());
+            decrypt_named_body(&mut reader, &mut *decoded, &opened).unwrap();
+            assert_eq!(*decoded, data);
+        }
+    }
 
     struct TempDir {
         path: PathBuf,

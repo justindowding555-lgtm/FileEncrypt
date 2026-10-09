@@ -546,18 +546,82 @@ test("additions, removals, and clearing update the selection remembered for the 
   const ui = fixture(invoke);
   await ui.evaluate("init()");
   ui.evaluate('addSelectedFiles({paths:["E:/folder/new.zip"],roots:{"E:/folder/new.zip":"E:/folder"}})');
+  await ui.evaluate("flushSelectedFiles()");
   assert.deepEqual(saves[0].selection, { paths: ["E:/private.fenc", "E:/folder/new.zip"], roots: { "E:/private.fenc": "E:/", "E:/folder/new.zip": "E:/folder" } });
   ui.evaluate('addSelectedFiles(["E:/folder/new.zip"])');
   assert.equal(saves.length, 1, "unchanged selections are not saved again");
   ui.refs.get("file-list").children[0].children[1].handlers.get("click")();
+  await ui.evaluate("flushSelectedFiles()");
   assert.deepEqual(saves[1].selection, { paths: ["E:/folder/new.zip"], roots: { "E:/folder/new.zip": "E:/folder" } });
   ui.refs.get("clear-files").handlers.get("click")();
+  await ui.evaluate("flushSelectedFiles()");
   assert.deepEqual(saves[2].selection, { paths: [], roots: {} });
   assert.deepEqual(saves.map(({ revision }) => revision), [1, 2, 3]);
   const reopened = fixture(invoke);
   await reopened.evaluate("init()");
   assert.equal(reopened.evaluate("state.files.length"), 0);
   assert.equal(reopened.refs.get("file-empty").hidden, false);
+});
+
+test("selection saves coalesce bursts and window close waits for the latest in-flight change", async () => {
+  const saves = [];
+  let finishFirst, closing, destroyed = false, prevented = false;
+  const ui = fixture(async (command, args) => {
+    if (command === "get_status") return savedKeyStatus;
+    if (command === "remember_selected_files") {
+      saves.push(JSON.parse(JSON.stringify(args)));
+      if (saves.length === 1) return new Promise((resolve) => { finishFirst = resolve; });
+    }
+  });
+  ui.context.testCurrentWindow = {
+    async onCloseRequested(callback) { closing = callback; },
+    async destroy() { destroyed = true; },
+  };
+  ui.evaluate('window.__TAURI__.window={getCurrentWindow:()=>testCurrentWindow}');
+  await ui.evaluate("init()");
+  ui.evaluate('addSelectedFiles(["C:/one.txt"]); addSelectedFiles(["C:/two.txt"])');
+  assert.equal(saves.length, 0);
+  assert.equal([...ui.timers.values()].filter((timer) => timer.delay === 150).length, 1);
+  const flushing = ui.fireTimer();
+  await settle();
+  assert.deepEqual(saves[0].selection.paths, ["C:/one.txt", "C:/two.txt"]);
+  ui.refs.get("clear-files").handlers.get("click")();
+  const closed = closing({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(destroyed, false);
+  finishFirst();
+  await flushing;
+  await closed;
+  assert.equal(saves.length, 2);
+  assert.deepEqual(saves[1].selection, { paths: [], roots: {} });
+  assert.ok(saves[1].revision > saves[0].revision);
+  assert.equal(destroyed, true);
+  assert.equal(ui.timers.size, 0);
+  const permissions = JSON.parse(fs.readFileSync(new URL("../src-tauri/capabilities/default.json", import.meta.url))).permissions;
+  assert.ok(permissions.includes("core:window:allow-destroy"));
+
+  // A slow initial status read must not prevent saving an early user edit on close.
+  const earlySaves = [];
+  let finishStatus, earlyClosing, earlyDestroyed = false;
+  const early = fixture(async (command, args) => {
+    if (command === "get_status") return new Promise((resolve) => { finishStatus = resolve; });
+    if (command === "remember_selected_files") earlySaves.push(JSON.parse(JSON.stringify(args)));
+  });
+  early.context.testCurrentWindow = {
+    async onCloseRequested(callback) { earlyClosing = callback; },
+    async destroy() { earlyDestroyed = true; },
+  };
+  early.evaluate('window.__TAURI__.window={getCurrentWindow:()=>testCurrentWindow}');
+  const initializing = early.evaluate("init()");
+  await settle();
+  early.evaluate('addSelectedFiles(["C:/early.txt"])');
+  assert.equal(early.evaluate("savedSelection.ready"), false);
+  await earlyClosing({ preventDefault() {} });
+  assert.deepEqual(earlySaves[0].selection.paths, ["C:/early.txt"]);
+  assert.equal(earlyDestroyed, true);
+  finishStatus(savedKeyStatus);
+  await initializing;
+  early.evaluate("clearTimeout(savedSelection.timer)");
 });
 
 test("late startup restoration cannot resurrect cleared files or overwrite a new selection", async () => {
@@ -576,6 +640,7 @@ test("late startup restoration cannot resurrect cleared files or overwrite a new
     finish({ paths: ["E:/old.fenc"], roots: {} });
     await initializing;
     assert.equal(ui.evaluate("JSON.stringify(state.files)"), clear ? "[]" : '["C:/new.fenc"]');
+    await ui.evaluate("flushSelectedFiles()");
     assert.deepEqual(saves.at(-1), { paths: clear ? [] : ["C:/new.fenc"], roots: {} });
   }
 });
@@ -613,6 +678,7 @@ test("key reconnection keeps file selection and options without restarting work 
   ui.evaluate('addSelectedFiles({paths:["F:/encrypted/one.fenc","F:/encrypted/two.fenc"],roots:{"F:/encrypted/one.fenc":"F:/encrypted","F:/encrypted/two.fenc":"F:/encrypted"}}); $("overwrite").checked=true; $("remove-original").checked=true; $("output-dir").value="C:/restored"');
   const files = ui.evaluate("JSON.stringify(state.files)");
   const roots = ui.evaluate("JSON.stringify([...state.folderRoots])");
+  await ui.evaluate("flushSelectedFiles()");
   const changed = ui.events.get("key-status-changed");
   changed({ payload: { ...disconnectedKeyStatus, keyRevision: 2 } });
   assert.equal(ui.refs.has("key-recovery-files"), false);
@@ -632,6 +698,7 @@ test("key reconnection keeps file selection and options without restarting work 
   ui.refs.get("startup-key-dialog").close();
   ui.refs.get("clear-files").handlers.get("click")();
   changed({ payload: { ...savedKeyStatus, keyRevision: 5 } });
+  await ui.evaluate("flushSelectedFiles()");
   assert.equal(ui.evaluate("state.files.length"), 0);
   assert.equal(ui.refs.get("decrypt").disabled, true);
   assert.equal(ui.refs.has("key-recovery-files"), false);
@@ -707,6 +774,7 @@ async function recoveryFixture() {
   });
   await ui.evaluate('init()');
   ui.evaluate('addSelectedFiles(["C:/private.fenc", "C:/bundle.zip"])');
+  await ui.evaluate('flushSelectedFiles()');
   await ui.evaluate('openSandbox()');
   await ui.evaluate('viewSandboxFile(sandbox.items[1])');
   return {
@@ -1582,6 +1650,42 @@ test("explorer sorts naturally with folders first and retains selection across v
   assert.equal(selected.attributes.get("aria-pressed"), "true");
   assert.equal(ui.refs.get("sandbox-details").attributes.get("aria-pressed"), "true");
   assert.deepEqual(labels(), ["Folder", "photo.png", "file2.txt", "file10.txt"]);
+});
+
+test("explorer caches sorts across searches and discards cached names when locked", () => {
+  const ui = explorerFixture([{id:0,name:"Folder/file10.txt",kind:"text"},{id:1,name:"Folder/file2.txt",kind:"text"}]);
+  ui.evaluate('sandbox.query="file"; renderSandboxExplorer()');
+  const first = ui.evaluate("sandbox.sortedEntries.items");
+  ui.evaluate('sandbox.query="2"; renderSandboxExplorer()');
+  assert.equal(ui.evaluate("sandbox.sortedEntries.items"), first);
+  assert.equal(ui.refs.get("sandbox-list").children[0].children[0].sandboxItemId, 1);
+  ui.evaluate("resetSandbox()");
+  assert.equal(ui.evaluate("sandbox.sortedEntries"), null);
+  assert.equal(ui.evaluate("sandbox.visibleEntries.items.length"), 0);
+  assert.equal(ui.evaluate("sandbox.rootLinks.length"), 0);
+  ui.evaluate('sandbox.items=[{id:9,name:"public.txt",kind:"text"}]; indexSandboxFiles(); sandbox.query="file"; renderSandboxExplorer()');
+  assert.equal(ui.refs.get("sandbox-list").children.length, 0);
+});
+
+test("search input is debounced and closing the sandbox cancels pending search rendering", async () => {
+  const ui = fixture(async (command) => command === "get_status" ? savedKeyStatus : undefined);
+  await ui.evaluate("init()");
+  ui.evaluate('sandbox.items=[{id:0,name:"private.txt",kind:"text"}]; sandbox.sessionId="1"; indexSandboxFiles(); renderSandboxExplorer()');
+  const search = ui.refs.get("sandbox-search");
+  search.value = "private";
+  search.handlers.get("input")();
+  search.value = "other";
+  search.handlers.get("input")();
+  assert.equal([...ui.timers.values()].filter((timer) => timer.delay === 120).length, 1);
+  assert.equal(ui.evaluate("sandbox.query"), "");
+  await ui.fireTimer();
+  assert.equal(ui.evaluate("sandbox.query"), "other");
+  assert.equal(ui.refs.get("sandbox-list").children.length, 0);
+  search.value = "private";
+  search.handlers.get("input")();
+  ui.evaluate("resetSandbox()");
+  assert.equal(ui.timers.size, 0);
+  assert.equal(ui.refs.get("sandbox-list").children.length, 0);
 });
 
 test("explorer bounds large catalogues and resets pagination when changing folders", () => {

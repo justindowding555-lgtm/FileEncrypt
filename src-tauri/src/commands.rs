@@ -28,6 +28,7 @@ pub struct AppState {
     pub(crate) key: Mutex<Option<Zeroizing<[u8; 32]>>>,
     pub(crate) key_path: Mutex<Option<PathBuf>>,
     pub(crate) key_file_hash: Mutex<Option<[u8; 32]>>,
+    pub(crate) key_file_observation: Mutex<Option<KeyFileObservation>>,
     pub(crate) emergency_locked: AtomicBool,
     pub(crate) emergency_delete_held: AtomicBool,
     pub(crate) emergency: Mutex<crate::emergency::Controls>,
@@ -49,6 +50,7 @@ impl Default for AppState {
             key: Mutex::new(None),
             key_path: Mutex::new(None),
             key_file_hash: Mutex::new(None),
+            key_file_observation: Mutex::new(None),
             emergency_locked: AtomicBool::new(false),
             emergency_delete_held: AtomicBool::new(false),
             emergency: Mutex::new(crate::emergency::Controls::default()),
@@ -61,6 +63,25 @@ impl Default for AppState {
             cancelled: AtomicBool::new(false),
             deletions: Mutex::new(DeletionRegistry::default()),
         }
+    }
+}
+
+pub(crate) struct KeyFileObservation {
+    pub path: PathBuf,
+    pub revision: u64,
+    pub hash: [u8; 32],
+    pub checked_at: Instant,
+}
+
+pub(crate) fn observe_key_file(state: &AppState, path: &Path, revision: u64, hash: [u8; 32]) {
+    let mut observation = lock(&state.key_file_observation);
+    if state.key_revision.load(Ordering::Acquire) == revision {
+        *observation = Some(KeyFileObservation {
+            path: path.to_path_buf(),
+            revision,
+            hash,
+            checked_at: Instant::now(),
+        });
     }
 }
 
@@ -511,7 +532,9 @@ pub(crate) fn restore_saved_key_from_path(state: &AppState, path: &Path) {
                 );
                 return;
             }
-            if crate::key_protection::setup_required(state) && crate::key_protection::needs_current_reference(state) {
+            if crate::key_protection::setup_required(state)
+                && crate::key_protection::needs_current_reference(state)
+            {
                 set_message(state, "Update emergency access setup with your existing password to restore automatic key loading.");
             } else {
                 set_message(state, format!("Could not load the saved key: {err}"));
@@ -602,6 +625,7 @@ fn finish_key_file_check(
         return true;
     }
     if check.loaded {
+        observe_key_file(state, &check.path, check.revision, hash);
         return false;
     }
     state
@@ -652,8 +676,11 @@ pub(crate) fn start_key_monitor(app: tauri::AppHandle) {
         let armed = lock(&app.state::<AppState>().emergency)
             .armed_path()
             .is_some();
+        let sandbox_active = crate::sandbox::active(&app.state::<AppState>());
         std::thread::sleep(if armed {
             Duration::from_millis(250)
+        } else if sandbox_active {
+            Duration::from_millis(500)
         } else {
             Duration::from_secs(1)
         });
@@ -730,12 +757,18 @@ pub async fn pick_input_folder(app: tauri::AppHandle) -> Result<SelectedPaths, S
         });
     };
     let folder = picked.into_path().map_err(|err| err.to_string())?;
-    expand_paths_with_roots(vec![folder.display().to_string()])
+    tauri::async_runtime::spawn_blocking(move || {
+        expand_paths_with_roots(vec![folder.display().to_string()])
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-pub fn expand_dropped_paths(paths: Vec<String>) -> Result<SelectedPaths, String> {
-    expand_paths_with_roots(paths)
+pub async fn expand_dropped_paths(paths: Vec<String>) -> Result<SelectedPaths, String> {
+    tauri::async_runtime::spawn_blocking(move || expand_paths_with_roots(paths))
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 fn expand_paths_with_roots(paths: Vec<String>) -> Result<SelectedPaths, String> {
@@ -743,18 +776,41 @@ fn expand_paths_with_roots(paths: Vec<String>) -> Result<SelectedPaths, String> 
         paths: Vec::new(),
         roots: HashMap::new(),
     };
+    let mut roots = Vec::new();
     for path in paths {
-        let root = PathBuf::from(&path);
-        let folder = fs::symlink_metadata(&root)
-            .map_err(|err| err.to_string())?
-            .is_dir();
-        let expanded = expand_paths(vec![path.clone()])?;
+        let metadata = fs::symlink_metadata(&path).map_err(|err| err.to_string())?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        roots.push((comparison_path(Path::new(&path)), path, metadata.is_dir()));
+    }
+    // Visit the broadest roots first so overlapping drops do not walk a tree twice.
+    roots.sort_by_key(|(normalized, _, _)| normalized.components().count());
+    let mut seen = HashSet::new();
+    let mut folders = HashSet::new();
+    let mut visited = 0;
+    let mut path_bytes = 0;
+    for (normalized, path, folder) in roots {
+        if normalized
+            .ancestors()
+            .any(|ancestor| folders.contains(ancestor))
+            || !seen.insert(normalized.clone())
+        {
+            continue;
+        }
+        let start = selection.paths.len();
+        walk_paths(
+            Path::new(&path),
+            &mut selection.paths,
+            &mut visited,
+            &mut path_bytes,
+        )?;
         if folder {
-            for child in &expanded {
+            folders.insert(normalized);
+            for child in &selection.paths[start..] {
                 selection.roots.insert(child.clone(), path.clone());
             }
         }
-        selection.paths.extend(expanded);
     }
     selection.paths.sort();
     selection.paths.dedup();
@@ -764,10 +820,48 @@ fn expand_paths_with_roots(paths: Vec<String>) -> Result<SelectedPaths, String> 
     Ok(selection)
 }
 
+#[cfg(test)]
 fn expand_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
     let mut found = Vec::new();
-    let mut pending = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
-    while let Some(path) = pending.pop() {
+    let mut visited = 0;
+    let mut path_bytes = 0;
+    for path in paths {
+        walk_paths(Path::new(&path), &mut found, &mut visited, &mut path_bytes)?;
+    }
+    found.sort();
+    found.dedup();
+    Ok(found)
+}
+
+fn walk_paths(
+    root: &Path,
+    found: &mut Vec<String>,
+    visited: &mut usize,
+    path_bytes: &mut usize,
+) -> Result<(), String> {
+    let mut directories: Vec<fs::ReadDir> = Vec::new();
+    let mut next = Some(root.to_path_buf());
+    loop {
+        let path = if let Some(path) = next.take() {
+            path
+        } else if let Some(directory) = directories.last_mut() {
+            match directory.next() {
+                Some(entry) => entry.map_err(|err| err.to_string())?.path(),
+                None => {
+                    directories.pop();
+                    continue;
+                }
+            }
+        } else {
+            break;
+        };
+        *visited += 1;
+        if *visited > 100_000 {
+            return Err(
+                "Folder selection exceeds 100,000 filesystem entries. Choose a smaller folder."
+                    .into(),
+            );
+        }
         let metadata =
             fs::symlink_metadata(&path).map_err(|err| format!("{}: {err}", path.display()))?;
         if metadata.file_type().is_symlink() {
@@ -777,19 +871,21 @@ fn expand_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
             if found.len() >= 10_000 {
                 return Err("Select fewer than 10,000 files at once.".into());
             }
-            found.push(path.display().to_string());
+            let text = path.display().to_string();
+            *path_bytes += text.len();
+            if *path_bytes > 16 * 1024 * 1024 {
+                return Err("The selected file paths exceed the selection memory limit.".into());
+            }
+            found.push(text);
         } else if metadata.is_dir() {
-            let mut children = fs::read_dir(&path)
-                .map_err(|err| format!("{}: {err}", path.display()))?
-                .map(|entry| entry.map(|item| item.path()).map_err(|err| err.to_string()))
-                .collect::<Result<Vec<_>, _>>()?;
-            children.sort();
-            pending.extend(children.into_iter().rev());
+            if directories.len() >= 1024 {
+                return Err("The selected folder tree is too deep.".into());
+            }
+            directories
+                .push(fs::read_dir(&path).map_err(|err| format!("{}: {err}", path.display()))?);
         }
     }
-    found.sort();
-    found.dedup();
-    Ok(found)
+    Ok(())
 }
 
 #[tauri::command]
@@ -1473,12 +1569,12 @@ fn plan_job(state: &AppState, request: &JobRequest) -> Result<JobPreview, String
     let key_path = lock(&state.key_path).clone();
     let mut items = Vec::new();
     let mut seen_inputs = HashSet::new();
+    let mut seen_outputs = PlannedOutputs::default();
     let all_inputs = request
         .paths
         .iter()
-        .map(|path| comparison_path(Path::new(path)))
+        .map(|path| seen_outputs.comparison(Path::new(path)))
         .collect::<HashSet<_>>();
-    let mut seen_outputs = PlannedOutputs::default();
     let mut total_bytes = 0u64;
     let mut warnings = Vec::new();
     if request.remove_original && request.operation != "verify" {
@@ -1496,7 +1592,7 @@ fn plan_job(state: &AppState, request: &JobRequest) -> Result<JobPreview, String
         let meta =
             fs::symlink_metadata(&input).map_err(|err| format!("{}: {err}", input.display()))?;
         file_guard::regular(&meta).map_err(|err| format!("{}: {err}", input.display()))?;
-        let duplicate = !seen_inputs.insert(comparison_path(&input));
+        let duplicate = !seen_inputs.insert(seen_outputs.comparison(&input));
         let is_zip = input
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
@@ -1599,9 +1695,18 @@ fn plan_job(state: &AppState, request: &JobRequest) -> Result<JobPreview, String
 struct PlannedOutputs {
     files: HashSet<PathBuf>,
     directories: HashSet<PathBuf>,
+    normalized: HashMap<PathBuf, PathBuf>,
+    parent_issues: HashMap<PathBuf, Option<String>>,
 }
 
 impl PlannedOutputs {
+    fn comparison(&mut self, path: &Path) -> PathBuf {
+        self.normalized
+            .entry(path.to_path_buf())
+            .or_insert_with(|| comparison_path(path))
+            .clone()
+    }
+
     fn insert(&mut self, path: &Path) -> Option<&'static str> {
         let issue = if self.files.contains(path) {
             Some("Another selected file has the same output path.")
@@ -1634,16 +1739,22 @@ fn preview_issue(
     if duplicate {
         return Some("This input was selected more than once.".into());
     }
-    if key_path.is_some_and(|key| comparison_path(key) == comparison_path(input)) {
+    let key_normalized = key_path.map(|key| seen_outputs.comparison(key));
+    if key_normalized
+        .as_ref()
+        .is_some_and(|key| *key == seen_outputs.comparison(input))
+    {
         return Some("This is the key file.".into());
     }
     let output = output?;
-    let normalized = comparison_path(output);
+    let normalized = seen_outputs.comparison(output);
     if let Some(issue) = seen_outputs.insert(&normalized) {
         return Some(issue.into());
     }
     if normalized.ancestors().any(|path| all_inputs.contains(path))
-        || key_path.is_some_and(|key| normalized.starts_with(comparison_path(key)))
+        || key_normalized
+            .as_ref()
+            .is_some_and(|key| normalized.starts_with(key))
     {
         return Some("Output conflicts with an input or key file.".into());
     }
@@ -1652,14 +1763,20 @@ fn preview_issue(
         .skip(1)
         .filter(|path| !path.as_os_str().is_empty())
     {
-        match fs::metadata(parent) {
-            Ok(metadata) if !metadata.is_dir() => {
-                return Some("An output parent path is not a folder.".into())
-            }
-            Err(err) if err.kind() != io::ErrorKind::NotFound => {
-                return Some(format!("Cannot inspect output folder: {err}"))
-            }
-            _ => {}
+        let issue = seen_outputs
+            .parent_issues
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| match fs::metadata(parent) {
+                Ok(metadata) if !metadata.is_dir() => {
+                    Some("An output parent path is not a folder.".into())
+                }
+                Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                    Some(format!("Cannot inspect output folder: {err}"))
+                }
+                _ => None,
+            });
+        if issue.is_some() {
+            return issue.clone();
         }
     }
     match fs::symlink_metadata(output) {
@@ -1691,6 +1808,8 @@ fn zip_outcomes(
         let mut file = source.file.try_clone()?;
         let entries = archive_read::entries_from_reader(&mut file)?;
         let authenticated = archive_read::inspect_names_from_reader(&mut file, key, &entries)?.1;
+        drop(file);
+        let file = std::io::BufReader::new(source.reader()?);
         Ok((source, file, entries, authenticated))
     })();
     let (source, mut file, entries, authenticated) = match setup {
@@ -1720,7 +1839,6 @@ fn zip_outcomes(
         } else {
             on_entry(index, entry);
             let mut entry_options = options.clone();
-            entry_options.remove_original = false;
             if entry_options.output_dir.is_none() {
                 entry_options.output_dir = input.parent().map(Path::to_path_buf);
             }
@@ -2033,8 +2151,12 @@ pub(crate) fn status(state: &AppState) -> AppStatus {
     AppStatus {
         access_setup_required: crate::key_protection::setup_required(state),
         access_setup_is_upgrade: crate::key_protection::setup_is_upgrade(state),
-        access_setup_requires_current_reference: crate::key_protection::needs_current_reference(state),
-        access_setup_key_path: key_path.clone().or_else(|| crate::key_protection::default_key_path(state).map(|path| path.display().to_string())),
+        access_setup_requires_current_reference: crate::key_protection::needs_current_reference(
+            state,
+        ),
+        access_setup_key_path: key_path.clone().or_else(|| {
+            crate::key_protection::default_key_path(state).map(|path| path.display().to_string())
+        }),
         emergency_locked,
         emergency_deletion_armed: emergency_deletion_path.is_some(),
         emergency_deletion_path,
@@ -2223,6 +2345,70 @@ fn read_settings(app: &tauri::AppHandle) -> Option<Settings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlapping_folder_drops_are_walked_once_and_keep_the_broadest_root() {
+        let dir = crate::test_support::TestDir::new();
+        let nested = dir.0.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let file = nested.join("file.txt");
+        fs::write(&file, b"contents").unwrap();
+        let selection = expand_paths_with_roots(vec![
+            file.display().to_string(),
+            nested.display().to_string(),
+            dir.0.display().to_string(),
+        ])
+        .unwrap();
+        assert_eq!(selection.paths, vec![file.display().to_string()]);
+        assert_eq!(
+            selection.roots[&file.display().to_string()],
+            dir.0.display().to_string()
+        );
+    }
+
+    #[test]
+    fn directory_walk_enforces_its_budget_even_for_empty_directories() {
+        let dir = crate::test_support::TestDir::new();
+        let mut visited = 100_000;
+        assert!(walk_paths(&dir.0, &mut Vec::new(), &mut visited, &mut 0)
+            .unwrap_err()
+            .contains("100,000"));
+    }
+
+    #[test]
+    fn preflight_caches_are_discarded_before_a_new_plan() {
+        let dir = crate::test_support::TestDir::new();
+        let folder = dir.0.join("output");
+        fs::create_dir(&folder).unwrap();
+        let input = dir.0.join("input.fenc");
+        fs::write(&input, b"input").unwrap();
+        let output = folder.join("file.txt");
+        let mut checks = PlannedOutputs::default();
+        assert!(preview_issue(
+            &input,
+            Some(&output),
+            None,
+            false,
+            false,
+            &HashSet::new(),
+            &mut checks
+        )
+        .is_none());
+        assert!(checks.parent_issues.contains_key(&folder));
+        fs::remove_dir(&folder).unwrap();
+        fs::write(&folder, b"now a file").unwrap();
+        assert!(preview_issue(
+            &input,
+            Some(&output),
+            None,
+            false,
+            false,
+            &HashSet::new(),
+            &mut PlannedOutputs::default()
+        )
+        .unwrap()
+        .contains("not a folder"));
+    }
 
     #[test]
     fn completed_rotation_survives_emergency_lock_during_activation() {

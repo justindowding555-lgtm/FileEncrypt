@@ -31,7 +31,7 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 const keyProtection = { token: null, generation: 0, firstRun: false, firstRunVisible: false, operation: null };
-const savedSelection = { revision: 0, ready: false, pending: true, restoring: false };
+const savedSelection = { revision: 0, ready: false, pending: true, restoring: false, timer: null, writing: false, dirty: false, inFlight: null };
 const fileVerification = { ready: false, generation: 0, running: false, entries: new Map(), badges: new Map() };
 const KEY_DISCONNECTED_GUIDANCE = "Reconnect your key drive to continue.";
 const KEY_READ_ERROR = "Unable to read the saved key.";
@@ -236,11 +236,33 @@ async function startAutomaticVerification() {
 function rememberSelectedFiles() {
   savedSelection.revision++;
   savedSelection.pending = false;
+  savedSelection.dirty = true;
   if (!savedSelection.ready) return;
-  invoke("remember_selected_files", {
-    revision: savedSelection.revision,
-    selection: { paths: [...state.files], roots: Object.fromEntries(state.folderRoots) },
-  }).catch((error) => showAlert(`Could not remember the file selection: ${normalizeError(error)}`));
+  clearTimeout(savedSelection.timer);
+  savedSelection.timer = setTimeout(flushSelectedFiles, 150);
+}
+
+function flushSelectedFiles() {
+  clearTimeout(savedSelection.timer);
+  savedSelection.timer = null;
+  if (savedSelection.writing) return savedSelection.inFlight;
+  // Closing may flush a user edit while the initial status call is pending.
+  if (!savedSelection.dirty) return;
+  savedSelection.writing = true;
+  savedSelection.dirty = false;
+  const revision = savedSelection.revision;
+  const selection = { paths: [...state.files], roots: Object.fromEntries(state.folderRoots) };
+  savedSelection.inFlight = Promise.resolve().then(() => invoke("remember_selected_files", {
+      revision,
+      selection,
+    })).catch((error) => {
+    if (revision === savedSelection.revision) showAlert(`Could not remember the file selection: ${normalizeError(error)}`);
+  }).finally(() => {
+    savedSelection.writing = false;
+    savedSelection.inFlight = null;
+    if (savedSelection.dirty) return flushSelectedFiles();
+  });
+  return savedSelection.inFlight;
 }
 
 async function maybeRestoreSelectedFiles() {
@@ -1010,7 +1032,11 @@ const sandbox = {
   folder: "", category: "", query: "", view: "grid", sort: "name",
   history: [{ folder: "", category: "" }], historyIndex: 0,
   selectedKey: null, openedItemId: null, contextEntry: null, hiddenClosures: 0,
+  searchTimer: null, sortedEntries: null, visibleEntries: null, rootLinks: [],
 };
+const sandboxNameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+const sandboxRootCollator = new Intl.Collator(undefined, { numeric: true });
+const sandboxTypeCollator = new Intl.Collator();
 const SANDBOX_TYPES = {
   text: { label: "Text files", singular: "Text document", icon: "text" },
   image: { label: "Images", singular: "Image", icon: "image" },
@@ -1055,34 +1081,54 @@ function indexSandboxFiles() {
     }
     const kind = SANDBOX_TYPES[item.kind] ? item.kind : "unsupported";
     const entry = { ...item, kind, label, parent, path: [...parts, label].join("/") };
+    entry.searchPath = entry.path.toLocaleLowerCase();
+    entry.fileType = sandboxFileType(entry);
     sandbox.folders.get(parent).files.push(entry);
     for (const folder of ancestors) folder.count++;
     sandbox.categoryCounts[kind] = (sandbox.categoryCounts[kind] || 0) + 1;
     return entry;
   });
+  sandbox.sortedEntries = null;
+  sandbox.visibleEntries = null;
+  sandbox.rootLinks = [...sandbox.folders.get("").folders].sort((a, b) => sandboxRootCollator.compare(a.label, b.label));
 }
 
 function sandboxVisibleEntries() {
   const query = sandbox.query.trim().toLocaleLowerCase();
   const folder = sandbox.folders.get(sandbox.folder);
-  let entries = query || sandbox.category
-    ? sandbox.entries.filter((item) => (!sandbox.category || item.kind === sandbox.category)
-      && (!query || item.path.toLocaleLowerCase().includes(query)))
-    : [...(folder?.folders || []), ...(folder?.files || [])];
-  return entries.sort((a, b) => {
+  const scope = query || sandbox.category ? "all" : sandbox.folder;
+  if (sandbox.visibleEntries?.scope === scope && sandbox.visibleEntries.query === query
+      && sandbox.visibleEntries.category === sandbox.category && sandbox.visibleEntries.sort === sandbox.sort) {
+    return sandbox.visibleEntries.items;
+  }
+  const compare = (a, b) => {
     if (a.kind === "folder" && b.kind !== "folder") return -1;
     if (b.kind === "folder" && a.kind !== "folder") return 1;
     if (sandbox.sort === "type") {
-      const typeOrder = sandboxFileType(a).localeCompare(sandboxFileType(b));
+      const typeOrder = sandboxTypeCollator.compare(a.fileType || sandboxFileType(a), b.fileType || sandboxFileType(b));
       if (typeOrder) return typeOrder;
     }
-    const order = a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: "base" });
+    const order = sandboxNameCollator.compare(a.label, b.label);
     return sandbox.sort === "name-desc" ? -order : order;
-  });
+  };
+  let entries;
+  if (query || sandbox.category) {
+    if (sandbox.sortedEntries?.sort !== sandbox.sort) {
+      sandbox.sortedEntries = { sort: sandbox.sort, items: [...sandbox.entries].sort(compare) };
+    }
+    entries = sandbox.sortedEntries.items.filter((item) => (!sandbox.category || item.kind === sandbox.category)
+      && (!query || item.searchPath.includes(query)));
+  } else {
+    entries = [...(folder?.folders || []), ...(folder?.files || [])].sort(compare);
+  }
+  sandbox.visibleEntries = { scope, query, category: sandbox.category, sort: sandbox.sort, items: entries };
+  return entries;
 }
 
 function navigateSandbox(folder = "", category = "", record = true) {
   if (folder && !sandbox.folders.has(folder)) return;
+  clearTimeout(sandbox.searchTimer);
+  sandbox.searchTimer = null;
   const changed = sandbox.folder !== folder || sandbox.category !== category;
   if (changed || sandbox.query) {
     sandbox.selection++;
@@ -1144,7 +1190,7 @@ function renderSandboxNavigation() {
   const folderLinks = document.createDocumentFragment();
   // The complete folder collection is browsable in the main pane. Keep the
   // sidebar bounded, including the current root even in very large catalogues.
-  const sorted = [...roots].sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
+  const sorted = sandbox.rootLinks;
   const currentRoot = roots.find((folder) => sandbox.folder === folder.path || sandbox.folder.startsWith(folder.path + "/"));
   const visible = sorted.slice(0, 7);
   if (currentRoot && !visible.includes(currentRoot)) visible.push(currentRoot);
@@ -1374,6 +1420,10 @@ function resetSandbox() {
   sandbox.entries = [];
   sandbox.folders.clear();
   sandbox.categoryCounts = {};
+  clearTimeout(sandbox.searchTimer);
+  sandbox.searchTimer = null;
+  sandbox.sortedEntries = sandbox.visibleEntries = null;
+  sandbox.rootLinks = [];
   sandbox.folder = sandbox.category = sandbox.query = "";
   sandbox.history = [{ folder: "", category: "" }];
   sandbox.historyIndex = 0;
@@ -1535,6 +1585,15 @@ async function openSandbox(options = {}) {
 }
 
 async function init() {
+  const currentWindow = window.__TAURI__?.window?.getCurrentWindow?.();
+  if (currentWindow?.onCloseRequested) {
+    await currentWindow.onCloseRequested(async (event) => {
+      if (!savedSelection.dirty && !savedSelection.writing) return;
+      event.preventDefault();
+      await flushSelectedFiles();
+      await currentWindow.destroy();
+    });
+  }
   document.addEventListener("keydown", handleEmergencyShortcut, true);
   $("current-key-icon").innerHTML = EXPLORER_ICONS.needsKey;
   $("key-disconnected-icon").innerHTML = EXPLORER_ICONS.unplug;
@@ -1779,8 +1838,13 @@ async function init() {
     if (pagedLists.has("sandbox-list")) pagedLists.get("sandbox-list").page = 0;
     renderSandboxExplorer();
   };
-  $("sandbox-search").addEventListener("input", searchSandbox);
+  $("sandbox-search").addEventListener("input", () => {
+    clearTimeout(sandbox.searchTimer);
+    sandbox.searchTimer = setTimeout(() => { sandbox.searchTimer = null; searchSandbox(); }, 120);
+  });
   $("sandbox-clear-search").addEventListener("click", () => {
+    clearTimeout(sandbox.searchTimer);
+    sandbox.searchTimer = null;
     $("sandbox-search").value = "";
     searchSandbox();
     $("sandbox-search").focus();
@@ -1856,7 +1920,7 @@ async function init() {
     resetSandbox();
     $("view-sandbox").focus();
   });
-  window.addEventListener("pagehide", () => resetSandbox());
+  window.addEventListener("pagehide", () => { void flushSelectedFiles(); resetSandbox(); });
   $("start-job").addEventListener("click", startJob);
   $("dismiss-preview").addEventListener("click", invalidatePreview);
   $("cancel-job").addEventListener("click", async () => {

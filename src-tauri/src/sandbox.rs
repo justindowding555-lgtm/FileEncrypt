@@ -100,6 +100,16 @@ struct Session {
     reading: AtomicBool,
     preview_read: Mutex<()>,
     items: Vec<Item>,
+    #[cfg(windows)]
+    archives: HashMap<PathBuf, Mutex<CachedZip>>,
+}
+
+#[cfg(windows)]
+struct CachedZip {
+    // Windows sharing protection keeps the authenticated directory and names
+    // valid for this exact source. The selected body is authenticated on every read.
+    source: Source,
+    entries: Vec<archive_read::Entry>,
 }
 
 struct Item {
@@ -173,6 +183,10 @@ pub(crate) fn revoke(state: &AppState) {
     }
 }
 
+pub(crate) fn active(state: &AppState) -> bool {
+    lock(&state.sandbox).current.is_some()
+}
+
 fn revoke_session(state: &AppState, session: &Session) {
     session.revoked.store(true, Ordering::Release);
     let mut registry = lock(&state.sandbox);
@@ -194,7 +208,7 @@ fn revoke_session(state: &AppState, session: &Session) {
 }
 
 impl Session {
-    fn validate(&self, state: &AppState) -> Result<(), String> {
+    fn validate_state(&self, state: &AppState) -> Result<(), String> {
         if state.emergency_locked.load(Ordering::Acquire)
             || self.revoked.load(Ordering::Acquire)
             || lock(&state.key).as_deref() != Some(&*self.key)
@@ -203,6 +217,27 @@ impl Session {
         {
             return Err(LOCKED.into());
         }
+        Ok(())
+    }
+
+    fn validate_monitored(&self, state: &AppState) -> Result<(), String> {
+        self.validate_state(state)?;
+        let revision = state.key_revision.load(Ordering::Acquire);
+        let observation = lock(&state.key_file_observation);
+        if !observation.as_ref().is_some_and(|sample| {
+            sample.path == self.key_path
+                && sample.revision == revision
+                && sample.hash == self.file_hash
+                && sample.checked_at.elapsed() <= Duration::from_millis(1000)
+        }) {
+            return Err(LOCKED.into());
+        }
+        Ok(())
+    }
+
+    fn validate(&self, state: &AppState) -> Result<(), String> {
+        self.validate_state(state)?;
+        let revision = state.key_revision.load(Ordering::Acquire);
         // Open the path anew on every check: a cached handle can outlive removal
         // or a disconnected drive. Hash all bytes, not just metadata/existence.
         let bytes = key_file::read_key_snapshot(&self.key_path).map_err(|_| LOCKED.to_string())?;
@@ -210,6 +245,8 @@ impl Session {
         if actual != self.file_hash || self.revoked.load(Ordering::Acquire) {
             return Err(LOCKED.into());
         }
+        self.validate_state(state)?;
+        crate::commands::observe_key_file(state, &self.key_path, revision, actual);
         Ok(())
     }
 }
@@ -247,6 +284,8 @@ fn open(state: &AppState, paths: Vec<String>) -> Result<Catalog, String> {
         reading: AtomicBool::new(false),
         preview_read: Mutex::new(()),
         items: Vec::new(),
+        #[cfg(windows)]
+        archives: HashMap::new(),
     };
     session.validate(state)?;
     let mut warnings = Vec::new();
@@ -256,13 +295,14 @@ fn open(state: &AppState, paths: Vec<String>) -> Result<Catalog, String> {
         if !seen.insert(path.clone()) {
             continue;
         }
-        session.validate(state)?;
+        session.validate_state(state)?;
         let mut source = Source::open(&path, false).map_err(|error| error.to_string())?;
         if path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
         {
-            let entries = archive_read::entries_from_reader(&mut source.file)
+            let mut reader = BufReader::new(&mut source.file);
+            let entries = archive_read::entries_from_reader(&mut reader)
                 .map_err(|error| error.to_string())?;
             if session.items.len() + entries.len() > MAX_ITEMS {
                 return Err(
@@ -270,7 +310,7 @@ fn open(state: &AppState, paths: Vec<String>) -> Result<Catalog, String> {
                 );
             }
             let (names, authenticated) =
-                archive_read::inspect_names_from_reader(&mut source.file, &session.key, &entries)
+                archive_read::inspect_names_from_reader(&mut reader, &session.key, &entries)
                     .map_err(|error| error.to_string())?;
             if !authenticated {
                 warnings.push(format!("{}: older ZIP; each opened file is authenticated, but bundle completeness cannot be checked.", path.display()));
@@ -282,6 +322,13 @@ fn open(state: &AppState, paths: Vec<String>) -> Result<Catalog, String> {
                     name,
                 });
             }
+            drop(reader);
+            source.check().map_err(|error| error.to_string())?;
+            #[cfg(windows)]
+            session
+                .archives
+                .insert(path, Mutex::new(CachedZip { source, entries }));
+            continue;
         } else {
             if session.items.len() == MAX_ITEMS {
                 return Err("The sandbox supports at most 10,000 files.".into());
@@ -346,11 +393,30 @@ impl Write for MemoryWriter<'_> {
                 ),
             ));
         }
+        let needed = self.bytes.len() + bytes.len();
+        if needed > self.bytes.capacity() {
+            // Never let Vec reallocate plaintext into an unwiped old allocation.
+            // Compressed entries can outgrow their ciphertext-size reservation.
+            let capacity = needed
+                .max(self.bytes.capacity().saturating_mul(2))
+                .min(self.limit);
+            let mut replacement = Zeroizing::new(Vec::with_capacity(capacity));
+            replacement.extend_from_slice(&self.bytes);
+            self.bytes.zeroize();
+            self.bytes = replacement;
+        }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+impl MemoryWriter<'_> {
+    fn reserve_ciphertext(&mut self, size: u64) {
+        let capacity = size.min(self.limit as u64) as usize;
+        self.bytes = Zeroizing::new(Vec::with_capacity(capacity));
     }
 }
 
@@ -393,39 +459,77 @@ fn read_controlled(
         MAX_PREVIEW_BYTES
     };
     let mut writer = MemoryWriter {
-        // Reserve once so Vec growth cannot leave unwiped old allocations.
-        bytes: Zeroizing::new(Vec::with_capacity(limit)),
+        bytes: Zeroizing::new(Vec::new()),
         limit,
         revoked: &session.revoked,
         cancelled: preview.map(|(_, target)| target.cancelled.as_ref()),
     };
-    let mut source = Source::open(&item.source, false).map_err(|error| error.to_string())?;
-    if let Some(index) = item.zip_index {
-        let entries = archive_read::entries_from_reader(&mut source.file)
-            .map_err(|error| error.to_string())?;
-        let (names, _) =
-            archive_read::inspect_names_from_reader(&mut source.file, &session.key, &entries)
-                .map_err(|error| error.to_string())?;
-        if names.get(index) != Some(&item.name) {
-            return Err("The encrypted ZIP changed. Close and reopen the sandbox.".into());
-        }
-        let entry = entries.get(index).ok_or("The encrypted ZIP changed.")?;
-        let mut reader = archive_read::entry_reader(&mut source.file, entry, None)
-            .map_err(|error| error.to_string())?;
-        crypto::sandbox_decrypt_entry(&session.key, &mut reader, &mut writer)
-            .map_err(|error| error.to_string())?;
-    } else {
-        let mut reader = BufReader::new(&mut source.file);
-        if crypto::sandbox_name(&session.key, &item.source, &mut reader)
-            .map_err(|error| error.to_string())?
-            != item.name
+    #[cfg(windows)]
+    let cached = item
+        .zip_index
+        .and_then(|_| session.archives.get(&item.source));
+    #[cfg(not(windows))]
+    let cached: Option<&Mutex<()>> = None;
+    if let Some(cached) = cached {
+        #[cfg(windows)]
         {
-            return Err("The encrypted file changed. Close and reopen the sandbox.".into());
+            let mut cached = lock(cached);
+            cached.source.check().map_err(|error| error.to_string())?;
+            let index = item.zip_index.ok_or("Unknown ZIP entry.")?;
+            let entry = cached
+                .entries
+                .get(index)
+                .ok_or("The encrypted ZIP changed.")?
+                .clone();
+            writer.reserve_ciphertext(entry.size);
+            let mut source_reader = BufReader::new(&mut cached.source.file);
+            {
+                let mut reader = archive_read::entry_reader(&mut source_reader, &entry, None)
+                    .map_err(|error| error.to_string())?;
+                crypto::sandbox_decrypt_entry(&session.key, &mut reader, &mut writer)
+                    .map_err(|error| error.to_string())?;
+            }
+            drop(source_reader);
+            cached.source.check().map_err(|error| error.to_string())?;
         }
-        crypto::sandbox_decrypt(&session.key, &mut reader, &mut writer)
-            .map_err(|error| error.to_string())?;
+        #[cfg(not(windows))]
+        let _ = cached;
+    } else {
+        let mut source = Source::open(&item.source, false).map_err(|error| error.to_string())?;
+        let size = source.len();
+        let mut source_reader = BufReader::new(&mut source.file);
+        if let Some(index) = item.zip_index {
+            // Platforms without mandatory sharing protection reauthenticate the
+            // directory and names; metadata alone cannot prove a cached ZIP is unchanged.
+            let entries = archive_read::entries_from_reader(&mut source_reader)
+                .map_err(|error| error.to_string())?;
+            let (names, _) =
+                archive_read::inspect_names_from_reader(&mut source_reader, &session.key, &entries)
+                    .map_err(|error| error.to_string())?;
+            if names.get(index) != Some(&item.name) {
+                return Err("The encrypted ZIP changed. Close and reopen the sandbox.".into());
+            }
+            let entry = entries.get(index).ok_or("The encrypted ZIP changed.")?;
+            writer.reserve_ciphertext(entry.size);
+            let mut reader = archive_read::entry_reader(&mut source_reader, entry, None)
+                .map_err(|error| error.to_string())?;
+            crypto::sandbox_decrypt_entry(&session.key, &mut reader, &mut writer)
+                .map_err(|error| error.to_string())?;
+        } else {
+            writer.reserve_ciphertext(size);
+            let mut reader = &mut source_reader;
+            if crypto::sandbox_name(&session.key, &item.source, &mut reader)
+                .map_err(|error| error.to_string())?
+                != item.name
+            {
+                return Err("The encrypted file changed. Close and reopen the sandbox.".into());
+            }
+            crypto::sandbox_decrypt(&session.key, &mut reader, &mut writer)
+                .map_err(|error| error.to_string())?;
+        }
+        drop(source_reader);
+        source.check().map_err(|error| error.to_string())?;
     }
-    source.check().map_err(|error| error.to_string())?;
     if kind == "text" && std::str::from_utf8(&writer.bytes).is_err() {
         return Err("This text file is not UTF-8 and cannot be previewed.".into());
     }
@@ -567,9 +671,25 @@ pub async fn read_sandbox_file(
 }
 
 #[tauri::command]
-pub async fn check_sandbox(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
+pub async fn check_sandbox(
+    app: tauri::AppHandle,
+    session_id: String,
+    fresh: Option<bool>,
+) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        current(app.state::<AppState>().inner(), &session_id).map(|_| ())
+        let state = app.state::<AppState>();
+        if fresh.unwrap_or(false) {
+            return current(&state, &session_id).map(|_| ());
+        }
+        let session = lock(&state.sandbox).current.clone().ok_or(LOCKED)?;
+        if session.id != session_id {
+            return Err(LOCKED.into());
+        }
+        if let Err(error) = session.validate_monitored(&state) {
+            revoke_session(&state, &session);
+            return Err(error);
+        }
+        Ok(())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -929,7 +1049,7 @@ pub(crate) fn start_monitor(app: tauri::AppHandle) {
         let state = app.state::<AppState>();
         let session = lock(&state.sandbox).current.clone();
         if let Some(session) = session {
-            if session.validate(&state).is_err() {
+            if session.validate_monitored(&state).is_err() {
                 revoke_session(&state, &session);
                 let _ = app.emit("sandbox-locked", &session.id);
             }
@@ -943,6 +1063,66 @@ mod tests {
     use super::*;
     use crate::{archive, crypto::JobOptions, test_support::TestDir};
     use std::fs;
+
+    #[test]
+    fn monitored_checks_require_a_recent_read_for_the_current_key_revision() {
+        let (dir, state, key_path, key) = fixture();
+        let path = encrypted(&dir, "private.txt", b"private contents", &key);
+        let catalog = open(&state, vec![path]).unwrap();
+        let session = current(&state, &catalog.session_id).unwrap();
+        session.validate_monitored(&state).unwrap();
+        // A completed old read cannot mask a blocked/disconnected drive forever.
+        lock(&state.key_file_observation)
+            .as_mut()
+            .unwrap()
+            .checked_at -= Duration::from_millis(1501);
+        assert!(session.validate_monitored(&state).is_err());
+        session.validate(&state).unwrap();
+        state.key_revision.fetch_add(1, Ordering::AcqRel);
+        assert!(session.validate_monitored(&state).is_err());
+        session.validate(&state).unwrap();
+        fs::remove_file(key_path).unwrap();
+        assert!(session.validate(&state).is_err());
+    }
+
+    #[test]
+    fn preview_buffers_fit_small_files_and_grow_without_losing_plaintext() {
+        let revoked = AtomicBool::new(false);
+        let mut writer = MemoryWriter {
+            bytes: Zeroizing::new(Vec::new()),
+            limit: 1024,
+            revoked: &revoked,
+            cancelled: None,
+        };
+        writer.reserve_ciphertext(40);
+        assert_eq!(writer.bytes.capacity(), 40);
+        writer.write_all(&[7; 32]).unwrap();
+        writer.write_all(&[8; 80]).unwrap();
+        assert_eq!(&writer.bytes[..32], &[7; 32]);
+        assert_eq!(&writer.bytes[32..], &[8; 80]);
+        assert!(writer.bytes.capacity() < 1024);
+        assert!(writer.write_all(&[0; 1024]).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cached_zip_is_pinned_and_revocation_releases_its_source_handle() {
+        let (dir, state, _, key) = fixture();
+        let input = dir.0.join("note.txt");
+        fs::write(&input, b"private contents").unwrap();
+        let zip = archive::encrypt_to_zip(&key, &[input], &options())
+            .unwrap()
+            .path;
+        let catalog = open(&state, vec![zip.display().to_string()]).unwrap();
+        assert!(fs::write(&zip, b"replacement").is_err());
+        assert!(fs::remove_file(&zip).is_err());
+        for _ in 0..2 {
+            let content = read(&state, &catalog.session_id, 0).unwrap();
+            assert_eq!(STANDARD.decode(&content.data).unwrap(), b"private contents");
+        }
+        revoke(&state);
+        fs::remove_file(zip).unwrap();
+    }
 
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         let mut output = Cursor::new(Vec::new());

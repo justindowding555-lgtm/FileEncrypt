@@ -156,7 +156,7 @@ async function loadPrivatePreview(direction = 0) {
     updatePrivatePreviewToolbar(info);
     content = await previewInvoke("read_sandbox_preview");
     if (previewWindow.closed || generation !== previewWindow.generation) return;
-    await previewDeadline(previewInvoke("check_sandbox", { sessionId: info.sessionId }));
+    await previewDeadline(previewInvoke("check_sandbox", { sessionId: info.sessionId, fresh: true }));
     if (previewWindow.closed || generation !== previewWindow.generation) return;
     updatePrivatePreviewToolbar(info, content.kind);
     const frame = createSandboxFrame(content, info.item.name);
@@ -171,7 +171,7 @@ async function loadPrivatePreview(direction = 0) {
     if (previewWindow.closed || generation !== previewWindow.generation) return;
     clearTimeout(previewWindow.decoded.timer);
     previewWindow.decoded = null;
-    await previewDeadline(previewInvoke("check_sandbox", { sessionId: info.sessionId }));
+    await previewDeadline(previewInvoke("check_sandbox", { sessionId: info.sessionId, fresh: true }));
     if (previewWindow.closed || generation !== previewWindow.generation) return;
     previewElement("preview-content").removeAttribute("aria-hidden");
     previewElement("preview-content").classList.remove("is-preparing");

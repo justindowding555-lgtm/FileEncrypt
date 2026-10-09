@@ -100,6 +100,26 @@ fn digest(file: &File, callback: Option<&ProgressCallback<'_>>) -> io::Result<[u
 }
 #[cfg(windows)]
 impl Receipt {
+    pub(crate) fn from_stream(
+        file: &File,
+        path: &Path,
+        fingerprint: crate::stream_hash::Fingerprint,
+    ) -> io::Result<Self> {
+        let identity = file_guard::identity(file)?;
+        let size = file.metadata()?.len();
+        if size != fingerprint.len {
+            return Err(io::Error::other(
+                "stream length changed before receipt capture",
+            ));
+        }
+        file_guard::check_path(file, path, identity, size)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            identity,
+            size,
+            digest: fingerprint.digest,
+        })
+    }
     pub fn capture(
         file: &File,
         path: &Path,
@@ -181,7 +201,7 @@ pub fn remove(
                 .iter()
                 .map(|output| output.receipt(callback))
                 .collect::<io::Result<Vec<_>>>()?;
-            let original = Arc::new(Receipt::capture(&source.file, &path, callback)?);
+            let original = Arc::new(source.receipt(callback)?);
             source.check()?;
             for output in outputs {
                 output.check()?;

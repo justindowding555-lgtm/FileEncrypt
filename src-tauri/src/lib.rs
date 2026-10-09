@@ -11,6 +11,7 @@ mod key_protection;
 mod publication;
 mod sandbox;
 mod source;
+mod stream_hash;
 #[cfg(test)]
 mod test_support;
 mod verification;

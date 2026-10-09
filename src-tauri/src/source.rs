@@ -1,8 +1,11 @@
 //! Pin source identity and reject source links at the opened-handle boundary.
 use crate::file_guard::{self, Identity};
+use crate::stream_hash::HashingReader;
 use std::fs::{File, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::sync::{Arc, Mutex};
 
 pub struct Source {
     pub file: File,
@@ -13,6 +16,8 @@ pub struct Source {
     delete_error: Option<i32>,
     #[cfg(windows)]
     deletable: bool,
+    #[cfg(windows)]
+    read_hash: Option<Arc<Mutex<crate::stream_hash::ReadHash>>>,
 }
 
 impl Source {
@@ -42,6 +47,9 @@ impl Source {
             deletable: can_delete,
             #[cfg(windows)]
             delete_error,
+            #[cfg(windows)]
+            read_hash: deletable
+                .then(|| Arc::new(Mutex::new(crate::stream_hash::ReadHash::default()))),
         };
         source.check()?;
         Ok(source)
@@ -49,6 +57,36 @@ impl Source {
 
     pub fn len(&self) -> u64 {
         self.initial.len()
+    }
+
+    pub fn reader(&self) -> io::Result<HashingReader<File>> {
+        #[cfg(windows)]
+        let hash = self.read_hash.clone();
+        #[cfg(not(windows))]
+        let hash = None;
+        HashingReader::new(self.file.try_clone()?, hash)
+    }
+
+    #[cfg(windows)]
+    pub fn receipt(
+        &self,
+        callback: Option<&crate::crypto::ProgressCallback<'_>>,
+    ) -> io::Result<crate::deletion::Receipt> {
+        self.check()?;
+        if let Some(hash) = &self.read_hash {
+            if crate::commands::lock(hash)
+                .fingerprint(self.len())
+                .is_none()
+            {
+                self.reader()?.finish(self.len(), callback)?;
+            }
+            let fingerprint = crate::commands::lock(hash)
+                .fingerprint(self.len())
+                .ok_or_else(|| io::Error::other("source hash is incomplete"))?;
+            self.check()?;
+            return crate::deletion::Receipt::from_stream(&self.file, &self.path, fingerprint);
+        }
+        crate::deletion::Receipt::capture(&self.file, &self.path, callback)
     }
     #[cfg(windows)]
     pub fn can_delete(&self) -> bool {

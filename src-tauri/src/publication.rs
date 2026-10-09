@@ -88,6 +88,16 @@ pub fn write(
     callback: Option<&ProgressCallback<'_>>,
     produce: impl FnOnce(&mut dyn Write) -> Result<(), CryptoError>,
 ) -> Result<PublishedFile, CryptoError> {
+    write_with_receipt(output, overwrite, callback, false, produce)
+}
+
+pub fn write_with_receipt(
+    output: &Path,
+    overwrite: bool,
+    callback: Option<&ProgressCallback<'_>>,
+    receipt: bool,
+    produce: impl FnOnce(&mut dyn Write) -> Result<(), CryptoError>,
+) -> Result<PublishedFile, CryptoError> {
     if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
@@ -102,9 +112,13 @@ pub fn write(
     };
     let result = (|| {
         let file = partial.file.as_ref().unwrap();
-        let mut writer = BufWriter::new(file.try_clone()?);
+        let mut writer = crate::stream_hash::HashingWriter::new(
+            BufWriter::new(file.try_clone()?),
+            receipt && cfg!(windows),
+        );
         produce(&mut writer)?;
         writer.flush()?;
+        let fingerprint = writer.fingerprint();
         drop(writer);
         file.sync_all()?;
         if let Some(callback) = callback {
@@ -131,7 +145,18 @@ pub fn write(
         let details = (|| -> io::Result<_> {
             file.sync_all()?;
             file_guard::sync_parent(output)?;
-            Ok((file_guard::identity(file)?, file.metadata()?.len()))
+            let identity = file_guard::identity(file)?;
+            let size = file.metadata()?.len();
+            #[cfg(windows)]
+            let receipt = fingerprint
+                .map(|hash| Receipt::from_stream(file, output, hash).map(Arc::new))
+                .transpose()?;
+            #[cfg(not(windows))]
+            let receipt = {
+                let _ = fingerprint;
+                None::<()>
+            };
+            Ok((identity, size, receipt))
         })();
         details.map_err(|error| CryptoError::PublicationUncertain {
             output: output.display().to_string(),
@@ -139,13 +164,13 @@ pub fn write(
         })
     })();
     match result {
-        Ok((identity, size)) => Ok(PublishedFile {
+        Ok((identity, size, _receipt)) => Ok(PublishedFile {
             path: output.to_path_buf(),
             file: partial.file.take().unwrap(),
             identity,
             size,
             #[cfg(windows)]
-            receipt: Mutex::new(None),
+            receipt: Mutex::new(_receipt),
         }),
         Err(error) => {
             if !partial.published {

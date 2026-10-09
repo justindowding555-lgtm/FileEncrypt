@@ -154,40 +154,46 @@ pub fn encrypt_to_zip_with_progress(
     // modified or replaced in the interval between encrypting it and removing it.
     let mut held = Vec::new();
     let bundle = binding(inputs.len());
-    let published = publication::write(&archive, false, progress, |writer| {
-        let mut zip = ZipWriter::new(writer);
-        for (index, input) in inputs.iter().enumerate() {
-            check(progress)?;
+    let published = publication::write_with_receipt(
+        &archive,
+        false,
+        progress,
+        options.remove_original,
+        |writer| {
+            let mut zip = ZipWriter::new(writer);
+            for (index, input) in inputs.iter().enumerate() {
+                check(progress)?;
+                if let Some(on_entry) = on_entry {
+                    on_entry(index, input);
+                }
+                let source = Source::open(input, options.remove_original)?;
+                let name = crypto::opaque_file_name().to_string_lossy().into_owned();
+                zip.entry(&name, |sink| {
+                    crypto::encrypt_bundle_reader(
+                        key,
+                        &source,
+                        &names[index],
+                        compress,
+                        bundle,
+                        sink,
+                        progress,
+                    )
+                })?;
+                if options.remove_original {
+                    held.push(source);
+                }
+            }
             if let Some(on_entry) = on_entry {
-                on_entry(index, input);
+                on_entry(inputs.len(), &archive);
             }
-            let source = Source::open(input, options.remove_original)?;
-            let name = crypto::opaque_file_name().to_string_lossy().into_owned();
-            zip.entry(&name, |sink| {
-                crypto::encrypt_bundle_reader(
-                    key,
-                    &source,
-                    &names[index],
-                    compress,
-                    bundle,
-                    sink,
-                    progress,
-                )
-            })?;
-            if options.remove_original {
-                held.push(source);
+            check(progress)?;
+            for source in &held {
+                source.check()?;
             }
-        }
-        if let Some(on_entry) = on_entry {
-            on_entry(inputs.len(), &archive);
-        }
-        check(progress)?;
-        for source in &held {
-            source.check()?;
-        }
-        zip.finish(key, bundle)?;
-        check(progress)
-    })?;
+            zip.finish(key, bundle)?;
+            check(progress)
+        },
+    )?;
     let removals = if options.remove_original {
         held.into_iter()
             .map(|source| deletion::remove(source, std::slice::from_ref(&published), progress))
@@ -226,30 +232,38 @@ pub fn rotate_zip_with_deletion(
     let mut file = source.file.try_clone()?;
     let entries = archive_read::entries_from_reader(&mut file)?;
     let authenticated = archive_read::inspect_names_from_reader(&mut file, old_key, &entries)?.1;
+    drop(file);
+    let mut file = std::io::BufReader::new(source.reader()?);
     let output = destination(input, options)?;
     crypto::ensure_distinct(input, &output, options.key_file.as_deref())?;
     let bundle = binding(entries.len());
-    let published = publication::write(&output, false, progress, |writer| {
-        let mut zip = ZipWriter::new(writer);
-        for entry in &entries {
-            check(progress)?;
-            let mut reader = archive_read::entry_reader(&mut file, entry, progress)?;
-            let name = crypto::opaque_file_name().to_string_lossy().into_owned();
-            zip.entry(&name, |sink| {
-                crypto::rotate_named_reader(
-                    old_key,
-                    new_key,
-                    &mut reader,
-                    sink,
-                    Some(bundle),
-                    progress,
-                )
-            })?;
-        }
-        source.check()?;
-        zip.finish(new_key, bundle)?;
-        check(progress)
-    })?;
+    let published = publication::write_with_receipt(
+        &output,
+        false,
+        progress,
+        options.remove_original,
+        |writer| {
+            let mut zip = ZipWriter::new(writer);
+            for entry in &entries {
+                check(progress)?;
+                let mut reader = archive_read::entry_reader(&mut file, entry, progress)?;
+                let name = crypto::opaque_file_name().to_string_lossy().into_owned();
+                zip.entry(&name, |sink| {
+                    crypto::rotate_named_reader(
+                        old_key,
+                        new_key,
+                        &mut reader,
+                        sink,
+                        Some(bundle),
+                        progress,
+                    )
+                })?;
+            }
+            source.check()?;
+            zip.finish(new_key, bundle)?;
+            check(progress)
+        },
+    )?;
     drop(file);
     let removal = if options.remove_original && authenticated {
         deletion::remove(source, std::slice::from_ref(&published), progress)

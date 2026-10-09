@@ -74,14 +74,14 @@ fn write_selection(
     revision: u64,
     selection: FileSelection,
 ) -> Result<(), String> {
+    let mut latest = lock(&store.revision);
+    if revision <= *latest {
+        return Ok(());
+    }
     let selection = selection.normalize()?;
     let bytes = serde_json::to_vec(&selection).map_err(|error| error.to_string())?;
     if bytes.len() > MAX_SAVED_BYTES {
         return Err("The file selection is too large to remember.".into());
-    }
-    let mut latest = lock(&store.revision);
-    if revision <= *latest {
-        return Ok(());
     }
     // Async IPC calls can arrive out of order. Never let an older selection
     // undo a newer Remove or Clear list, even if its write fails.
