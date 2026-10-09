@@ -13,6 +13,8 @@ npm run tauri dev
 
 Windows needs the WebView2 runtime, which is already present on Windows 11, and the Visual Studio C++ build tools. The Tauri command initializes the installed MSVC compiler when clang-cl is unavailable. This setup is local to the command process.
 
+Building requires Rust 1.98 or newer. Sandbox identifiers use the standard library's buffered integer formatting API introduced in 1.98; Rust 1.99 is supported.
+
 The app icon is drawn in `src/icon.svg` and used in the window header. Desktop PNG, ICO, and ICNS sizes in `src-tauri/icons/` are generated from that source with `npm run tauri -- icon src/icon.svg -o src-tauri/icons`.
 
 ## What the window does
