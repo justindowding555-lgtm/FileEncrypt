@@ -278,6 +278,25 @@
             <p class="sub">The old key file remains available for other encrypted files.</p>
           </div>
           <button type="button" class="specific-key-link" id="open-specific-key">Use a specific key <span aria-hidden="true">→</span></button>
+          <details class="emergency-options">
+            <summary>Emergency controls</summary>
+            <div class="emergency-shortcuts">
+              <div><span>Lock key access</span><kbd>Ctrl + Shift + F12</kbd></div>
+              <div><span>Unlock and check key</span><kbd>Ctrl + Shift + F11</kbd></div>
+            </div>
+            <p class="sub">The lock survives restarting the app. Reconnecting the drive keeps showing a read error until you unlock. Protected keys need their passphrase here before unlocking.</p>
+            <div class="emergency-deletion">
+              <label class="check"><input id="enable-emergency-deletion" type="checkbox" /> Enable emergency key deletion for this session</label>
+              <p class="sub">Deletes only the armed key file. Without a backup, its encrypted files may become permanently inaccessible. This is file deletion, not secure erasure.</p>
+              <p id="emergency-deletion-path" class="emergency-key-path" hidden></p>
+              <div class="row emergency-actions">
+                <button type="button" id="arm-emergency-deletion" disabled>Arm key deletion</button>
+                <button type="button" id="disarm-emergency-deletion" hidden>Disarm</button>
+              </div>
+              <p class="sub">After arming, remove the key drive, then hold <kbd>Ctrl + Alt + Shift + D</kbd> while reconnecting it. The first reconnection consumes the arm. Changing keys or closing the app disarms it.</p>
+              <p id="emergency-deletion-status" class="sub" role="status"></p>
+            </div>
+          </details>
         </div>
         <div id="specific-key-view" class="dialog-view" hidden>
           <button type="button" class="text-button back-button" id="back-to-key-options">← Back to key options</button>
@@ -302,15 +321,18 @@
         </div>
         <div class="startup-key-body">
           <div class="recovery-location">
-            <span class="field-label">Saved key location</span>
-            <p id="startup-key-path" class="startup-key-path"></p>
+            <span class="field-label">Saved key file</span>
+            <div class="recovery-file">
+              <span id="startup-key-file-icon" class="recovery-file-icon" aria-hidden="true"></span>
+              <p id="startup-key-path" class="startup-key-path"></p>
+            </div>
           </div>
           <p id="startup-key-instructions" class="sub">For protected keys, enter your passphrase in Key options.</p>
           <p id="key-recovery-sandbox" class="sub" hidden>Your sandbox is waiting. It will reload automatically when the same key is loaded.</p>
           <p id="key-recovery-alert" class="alert" role="alert" hidden></p>
         </div>
         <div class="startup-key-footer">
-          <button type="button" id="choose-recovery-key">Back to files</button>
+          <button type="button" class="primary" id="choose-recovery-key">Back to files</button>
         </div>
       </dialog>
       <footer>

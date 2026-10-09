@@ -1,10 +1,10 @@
 //! Read-only previews. Plaintext is bounded, authenticated in memory, and never
 //! passed to a filesystem writer or an external application.
 use std::collections::{HashMap, HashSet};
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
@@ -20,6 +20,11 @@ use crate::{archive_read, crypto, key_file, source::Source};
 const MAX_ITEMS: usize = 10_000;
 const MAX_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_IMAGE_PIXELS: u64 = 40_000_000;
+const MAX_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_PREVIEW_MEMORY: usize = 512 * 1024 * 1024;
+const MAX_PREVIEW_WINDOWS: usize = 8;
+const CANCELLED: &str = "Preview cancelled.";
 const LOCKED: &str =
     "Sandbox locked. The loaded key or its readable key file is no longer available.";
 
@@ -28,6 +33,7 @@ pub(crate) struct Registry {
     revision: u64,
     current: Option<Arc<Session>>,
     previews: HashMap<String, PreviewTarget>,
+    next_preview: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -35,6 +41,29 @@ pub(crate) struct Registry {
 struct PreviewTarget {
     session_id: String,
     item_id: usize,
+    #[serde(skip)]
+    cancelled: Arc<AtomicBool>,
+    #[serde(skip)]
+    memory_bytes: usize,
+}
+
+impl PreviewTarget {
+    fn new(session_id: String, item_id: usize) -> Self {
+        Self {
+            session_id,
+            item_id,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            memory_bytes: 0,
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err(CANCELLED.into())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -50,6 +79,15 @@ struct ClosedPreview {
 pub struct PreviewInfo {
     session_id: String,
     item: CatalogItem,
+    navigation: ImageNavigation,
+}
+
+#[derive(Default, Serialize)]
+struct ImageNavigation {
+    previous: bool,
+    next: bool,
+    index: usize,
+    total: usize,
 }
 
 struct Session {
@@ -129,6 +167,9 @@ pub(crate) fn revoke(state: &AppState) {
     if let Some(session) = registry.current.take() {
         session.revoked.store(true, Ordering::Release);
     }
+    for target in registry.previews.values() {
+        target.cancelled.store(true, Ordering::Release);
+    }
 }
 
 fn revoke_session(state: &AppState, session: &Session) {
@@ -142,11 +183,19 @@ fn revoke_session(state: &AppState, session: &Session) {
         registry.current = None;
         registry.revision = registry.revision.wrapping_add(1);
     }
+    for target in registry
+        .previews
+        .values()
+        .filter(|target| target.session_id == session.id)
+    {
+        target.cancelled.store(true, Ordering::Release);
+    }
 }
 
 impl Session {
     fn validate(&self, state: &AppState) -> Result<(), String> {
-        if self.revoked.load(Ordering::Acquire)
+        if state.emergency_locked.load(Ordering::Acquire)
+            || self.revoked.load(Ordering::Acquire)
             || lock(&state.key).as_deref() != Some(&*self.key)
             || lock(&state.key_path).as_ref() != Some(&self.key_path)
             || *lock(&state.key_file_hash) != Some(self.file_hash)
@@ -273,10 +322,17 @@ struct MemoryWriter<'a> {
     bytes: Zeroizing<Vec<u8>>,
     limit: usize,
     revoked: &'a AtomicBool,
+    cancelled: Option<&'a AtomicBool>,
 }
 
 impl Write for MemoryWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self
+            .cancelled
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+        {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, CANCELLED));
+        }
         if self.revoked.load(Ordering::Acquire) {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, LOCKED));
         }
@@ -298,6 +354,18 @@ impl Write for MemoryWriter<'_> {
 }
 
 fn read(state: &AppState, id: &str, item_id: usize) -> Result<Content, String> {
+    read_controlled(state, id, item_id, None)
+}
+
+fn read_controlled(
+    state: &AppState,
+    id: &str,
+    item_id: usize,
+    preview: Option<(&str, &PreviewTarget)>,
+) -> Result<Content, String> {
+    if let Some((_, target)) = preview {
+        target.check()?;
+    }
     let session = current(state, id)?;
     if session
         .reading
@@ -328,6 +396,7 @@ fn read(state: &AppState, id: &str, item_id: usize) -> Result<Content, String> {
         bytes: Zeroizing::new(Vec::with_capacity(limit)),
         limit,
         revoked: &session.revoked,
+        cancelled: preview.map(|(_, target)| target.cancelled.as_ref()),
     };
     let mut source = Source::open(&item.source, false).map_err(|error| error.to_string())?;
     if let Some(index) = item.zip_index {
@@ -359,7 +428,23 @@ fn read(state: &AppState, id: &str, item_id: usize) -> Result<Content, String> {
     if kind == "text" && std::str::from_utf8(&writer.bytes).is_err() {
         return Err("This text file is not UTF-8 and cannot be previewed.".into());
     }
+    let image_pixels = if kind == "image" {
+        image_dimensions(&writer.bytes, mime)?
+    } else {
+        0
+    };
     current(state, id)?;
+    if let Some((label, target)) = preview {
+        target.check()?;
+        // Conservative accounting for base64/IPC copies and two RGBA surfaces.
+        // Browser/process memory itself is controlled by the webview.
+        let cost = writer
+            .bytes
+            .len()
+            .saturating_mul(8)
+            .saturating_add((image_pixels as usize).saturating_mul(8));
+        reserve_preview_memory(state, label, target, cost)?;
+    }
     // Only return bytes after the final authentication tag, source checks, and
     // a fresh key-file read have all succeeded.
     Ok(Content {
@@ -367,6 +452,93 @@ fn read(state: &AppState, id: &str, item_id: usize) -> Result<Content, String> {
         mime,
         data: STANDARD.encode(writer.bytes.as_slice()),
     })
+}
+
+fn image_dimensions(bytes: &[u8], mime: &str) -> Result<u64, String> {
+    let format = match mime {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        "image/gif" => image::ImageFormat::Gif,
+        "image/webp" => image::ImageFormat::WebP,
+        "image/bmp" => image::ImageFormat::Bmp,
+        "image/x-icon" => image::ImageFormat::Ico,
+        _ => return Err("Unsupported image format.".into()),
+    };
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_PREVIEW_MEMORY as u64);
+    reader.limits(limits);
+    let (width, height) = reader.into_dimensions().map_err(|_| {
+        "This image is damaged, unsupported, or exceeds the safe image dimensions.".to_string()
+    })?;
+    let pixels = u64::from(width) * u64::from(height);
+    if width == 0
+        || height == 0
+        || width > MAX_IMAGE_DIMENSION
+        || height > MAX_IMAGE_DIMENSION
+        || pixels > MAX_IMAGE_PIXELS
+    {
+        return Err(
+            "This image exceeds the preview limit of 40 megapixels or 16,384 pixels per side."
+                .into(),
+        );
+    }
+    Ok(pixels)
+}
+
+fn reserve_preview_memory(
+    state: &AppState,
+    label: &str,
+    target: &PreviewTarget,
+    cost: usize,
+) -> Result<(), String> {
+    target.check()?;
+    let mut registry = lock(&state.sandbox);
+    let stored = registry.previews.get(label).ok_or(CANCELLED)?;
+    stored.check()?;
+    if !Arc::ptr_eq(&stored.cancelled, &target.cancelled) {
+        return Err(CANCELLED.into());
+    }
+    let used: usize = registry
+        .previews
+        .iter()
+        .filter(|(other, _)| other.as_str() != label)
+        .map(|(_, entry)| entry.memory_bytes)
+        .sum();
+    if used.saturating_add(cost) > MAX_PREVIEW_MEMORY {
+        return Err(
+            "The sandbox preview memory budget is full. Close another preview and try again."
+                .into(),
+        );
+    }
+    registry
+        .previews
+        .get_mut(label)
+        .ok_or(CANCELLED)?
+        .memory_bytes = cost;
+    Ok(())
+}
+
+fn preview_read_turn<'a>(
+    session: &'a Session,
+    target: &PreviewTarget,
+) -> Result<MutexGuard<'a, ()>, String> {
+    loop {
+        target.check()?;
+        if session.revoked.load(Ordering::Acquire) {
+            return Err(LOCKED.into());
+        }
+        match session.preview_read.try_lock() {
+            Ok(turn) => {
+                target.check()?;
+                return Ok(turn);
+            }
+            Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }
 
 #[tauri::command]
@@ -424,7 +596,9 @@ fn preview_target(state: &AppState, label: &str) -> Result<PreviewTarget, String
 }
 
 pub(crate) fn forget_preview(state: &AppState, label: &str) {
-    lock(&state.sandbox).previews.remove(label);
+    if let Some(target) = lock(&state.sandbox).previews.remove(label) {
+        target.cancelled.store(true, Ordering::Release);
+    }
 }
 
 pub(crate) fn preview_closed(app: &tauri::AppHandle, label: &str) {
@@ -434,6 +608,7 @@ pub(crate) fn preview_closed(app: &tauri::AppHandle, label: &str) {
 fn take_closed_preview(state: &AppState, label: &str, locked: bool) -> Option<ClosedPreview> {
     let mut registry = lock(&state.sandbox);
     let target = registry.previews.remove(label)?;
+    target.cancelled.store(true, Ordering::Release);
     // A native close may race the key monitor. Losing the session must not be
     // mistaken for a manual dismissal of the file we need to restore.
     let locked = locked
@@ -453,7 +628,7 @@ fn notify_preview_closed(app: &tauri::AppHandle, label: &str, locked: bool) {
     }
 }
 
-fn close_invalid_previews(app: &tauri::AppHandle) {
+pub(crate) fn close_invalid_previews(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
     let labels = {
         let mut registry = lock(&state.sandbox);
@@ -469,7 +644,9 @@ fn close_invalid_previews(app: &tauri::AppHandle) {
             .map(|(label, _)| label.clone())
             .collect();
         for label in &labels {
-            registry.previews.remove(label);
+            if let Some(target) = registry.previews.remove(label) {
+                target.cancelled.store(true, Ordering::Release);
+            }
         }
         labels
     };
@@ -496,18 +673,16 @@ pub async fn open_sandbox_preview(
         let session = current(&state, &session_id)?;
         let item = session.items.get(item_id).ok_or("Unknown sandbox file.")?;
         let name = item.name.rsplit(['/', '\\']).next().unwrap_or(&item.name);
-        let label = format!("sandbox-preview-{}-{}", session.id, item_id);
-        if let Some(existing) = app.get_webview_window(&label) {
+        let existing_label = lock(&state.sandbox)
+            .previews
+            .iter()
+            .find(|(_, target)| target.session_id == session.id && target.item_id == item_id)
+            .map(|(label, _)| label.clone());
+        if let Some(existing) = existing_label.and_then(|label| app.get_webview_window(&label)) {
             let _ = existing.unminimize();
             return existing.set_focus().map_err(|error| error.to_string());
         }
-        lock(&state.sandbox).previews.insert(
-            label.clone(),
-            PreviewTarget {
-                session_id: session_id.clone(),
-                item_id,
-            },
-        );
+        let label = register_preview(&state, session_id.clone(), item_id)?;
         let builder = tauri::WebviewWindowBuilder::new(
             &app,
             &label,
@@ -560,18 +735,7 @@ pub async fn sandbox_preview_info(
         let state = app.state::<AppState>();
         let target = preview_target(&state, &label)?;
         let session = current(&state, &target.session_id)?;
-        let item = session
-            .items
-            .get(target.item_id)
-            .ok_or("Unknown sandbox file.")?;
-        Ok(PreviewInfo {
-            session_id: target.session_id,
-            item: CatalogItem {
-                id: target.item_id,
-                name: item.name.clone(),
-                kind: format(&item.name).0,
-            },
-        })
+        preview_info(&session, target.item_id)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -589,8 +753,137 @@ pub async fn read_sandbox_preview(
         let session = current(&state, &target.session_id)?;
         // Native windows may open together. Serialize their bounded reads so a
         // second preview waits instead of showing a spurious "already loading".
-        let _turn = lock(&session.preview_read);
-        read(&state, &target.session_id, target.item_id)
+        let _turn = preview_read_turn(&session, &target)?;
+        read_controlled(
+            &state,
+            &target.session_id,
+            target.item_id,
+            Some((&label, &target)),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn image_items(session: &Session) -> Vec<usize> {
+    session
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| format(&item.name).0 == "image")
+        .map(|(id, _)| id)
+        .collect()
+}
+
+fn register_preview(
+    state: &AppState,
+    session_id: String,
+    item_id: usize,
+) -> Result<String, String> {
+    let mut registry = lock(&state.sandbox);
+    if registry.previews.len() >= MAX_PREVIEW_WINDOWS {
+        return Err(
+            "Up to 8 preview windows can be open. Close a preview before opening another.".into(),
+        );
+    }
+    registry.next_preview = registry.next_preview.wrapping_add(1);
+    let label = format!(
+        "sandbox-preview-{}-{}-{}",
+        session_id, item_id, registry.next_preview
+    );
+    registry
+        .previews
+        .insert(label.clone(), PreviewTarget::new(session_id, item_id));
+    Ok(label)
+}
+
+fn preview_info(session: &Session, item_id: usize) -> Result<PreviewInfo, String> {
+    let item = session.items.get(item_id).ok_or("Unknown sandbox file.")?;
+    let images = image_items(session);
+    let navigation = images
+        .iter()
+        .position(|id| *id == item_id)
+        .map(|index| ImageNavigation {
+            previous: index > 0,
+            next: index + 1 < images.len(),
+            index: index + 1,
+            total: images.len(),
+        })
+        .unwrap_or_default();
+    Ok(PreviewInfo {
+        session_id: session.id.clone(),
+        item: CatalogItem {
+            id: item_id,
+            name: item.name.clone(),
+            kind: format(&item.name).0,
+        },
+        navigation,
+    })
+}
+
+fn reset_preview_target(
+    state: &AppState,
+    label: &str,
+    item_id: Option<usize>,
+) -> Result<PreviewTarget, String> {
+    let mut registry = lock(&state.sandbox);
+    let old = registry.previews.get(label).ok_or(CANCELLED)?;
+    old.cancelled.store(true, Ordering::Release);
+    let target = PreviewTarget::new(old.session_id.clone(), item_id.unwrap_or(old.item_id));
+    registry.previews.insert(label.to_string(), target.clone());
+    Ok(target)
+}
+
+#[tauri::command]
+pub fn cancel_sandbox_preview_read(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    reset_preview_target(&app.state::<AppState>(), window.label(), None).map(|_| ())
+}
+
+#[tauri::command]
+pub async fn navigate_sandbox_preview(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    direction: i32,
+) -> Result<PreviewInfo, String> {
+    if !matches!(direction, -1 | 1) {
+        return Err("Choose the previous or next image.".into());
+    }
+    let label = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let target = preview_target(&state, &label)?;
+        let session = current(&state, &target.session_id)?;
+        let images = image_items(&session);
+        let index = images
+            .iter()
+            .position(|id| *id == target.item_id)
+            .ok_or("Image navigation is only available for images.")?;
+        let next = index
+            .checked_add_signed(direction as isize)
+            .and_then(|index| images.get(index))
+            .copied()
+            .ok_or("There are no more images in that direction.")?;
+        reset_preview_target(&state, &label, Some(next))?;
+        let info = preview_info(&session, next)?;
+        current(&state, &target.session_id)?;
+        if let Some(window) = app.get_webview_window(&label) {
+            let name = info
+                .item
+                .name
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&info.item.name);
+            let _ = window.set_title(&format!("{name} - FileEncrypt"));
+        }
+        let _ = app.emit_to(
+            "main",
+            "sandbox-preview-navigated",
+            PreviewTarget::new(target.session_id, next),
+        );
+        Ok(info)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -634,15 +927,127 @@ mod tests {
     use crate::{archive, crypto::JobOptions, test_support::TestDir};
     use std::fs;
 
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut output = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(width, height)
+            .write_to(&mut output, image::ImageFormat::Png)
+            .unwrap();
+        output.into_inner()
+    }
+
+    #[test]
+    fn image_dimensions_are_checked_before_exporting_to_the_webview() {
+        let bytes = png_bytes(12, 8);
+        assert_eq!(image_dimensions(&bytes, "image/png").unwrap(), 96);
+        assert!(image_dimensions(b"damaged image", "image/png").is_err());
+        for (width, height) in [(20_000u32, 1u32), (10_000, 10_000)] {
+            let mut oversized = bytes.clone();
+            oversized[16..20].copy_from_slice(&width.to_be_bytes());
+            oversized[20..24].copy_from_slice(&height.to_be_bytes());
+            let crc = crc32fast::hash(&oversized[12..29]);
+            oversized[29..33].copy_from_slice(&crc.to_be_bytes());
+            assert!(image_dimensions(&oversized, "image/png").is_err());
+        }
+    }
+
+    #[test]
+    fn preview_budget_is_aggregate_and_released_when_a_window_closes() {
+        let state = AppState::default();
+        let first = register_preview(&state, "1".into(), 0).unwrap();
+        let second = register_preview(&state, "1".into(), 1).unwrap();
+        let first_target = preview_target(&state, &first).unwrap();
+        let second_target = preview_target(&state, &second).unwrap();
+        reserve_preview_memory(&state, &first, &first_target, MAX_PREVIEW_MEMORY / 2).unwrap();
+        assert!(reserve_preview_memory(
+            &state,
+            &second,
+            &second_target,
+            MAX_PREVIEW_MEMORY / 2 + 1
+        )
+        .is_err());
+        forget_preview(&state, &first);
+        assert!(first_target.check().is_err());
+        reserve_preview_memory(&state, &second, &second_target, MAX_PREVIEW_MEMORY).unwrap();
+        reset_preview_target(&state, &second, Some(2)).unwrap();
+        assert!(reserve_preview_memory(&state, &second, &second_target, 1).is_err());
+        assert_eq!(preview_target(&state, &second).unwrap().memory_bytes, 0);
+    }
+
+    #[test]
+    fn preview_window_count_is_bounded_and_labels_do_not_collide_after_navigation() {
+        let state = AppState::default();
+        let mut labels = Vec::new();
+        for item in 0..MAX_PREVIEW_WINDOWS {
+            labels.push(register_preview(&state, "1".into(), item).unwrap());
+        }
+        assert!(register_preview(&state, "1".into(), 20).is_err());
+        forget_preview(&state, &labels[0]);
+        let replacement = register_preview(&state, "1".into(), 0).unwrap();
+        assert!(!labels.contains(&replacement));
+    }
+
+    #[test]
+    fn closing_a_queued_preview_cancels_without_waiting_for_the_active_read() {
+        let (dir, state, _, key) = fixture();
+        let path = encrypted(&dir, "private.txt", b"private contents", &key);
+        let catalog = open(&state, vec![path]).unwrap();
+        let session = current(&state, &catalog.session_id).unwrap();
+        let target = PreviewTarget::new(catalog.session_id, 0);
+        let queued = target.clone();
+        let held = lock(&session.preview_read);
+        let other_session = session.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result = preview_read_turn(&other_session, &queued).err();
+            send.send(result).unwrap();
+        });
+        target.cancelled.store(true, Ordering::Release);
+        let result = receive.recv_timeout(Duration::from_millis(500));
+        drop(held);
+        thread.join().unwrap();
+        assert_eq!(result.unwrap().as_deref(), Some(CANCELLED));
+    }
+
+    #[test]
+    fn cancellation_stops_chunk_writes_and_navigation_skips_non_images() {
+        let revoked = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(true);
+        let mut writer = MemoryWriter {
+            bytes: Zeroizing::new(Vec::new()),
+            limit: 1024,
+            revoked: &revoked,
+            cancelled: Some(&cancelled),
+        };
+        assert_eq!(
+            writer.write_all(b"plaintext").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(writer.bytes.is_empty());
+        let (dir, state, _, key) = fixture();
+        let first = encrypted(&dir, "first.png", &png_bytes(12, 8), &key);
+        let text = encrypted(&dir, "notes.txt", b"notes", &key);
+        let second = encrypted(&dir, "second.png", &png_bytes(8, 12), &key);
+        let catalog = open(&state, vec![first, text, second]).unwrap();
+        let session = current(&state, &catalog.session_id).unwrap();
+        assert_eq!(image_items(&session), vec![0, 2]);
+        let navigation = preview_info(&session, 0).unwrap().navigation;
+        assert!(!navigation.previous && navigation.next);
+        assert_eq!((navigation.index, navigation.total), (1, 2));
+        assert_eq!(preview_info(&session, 1).unwrap().navigation.total, 0);
+        let label = register_preview(&state, catalog.session_id.clone(), 0).unwrap();
+        let target = preview_target(&state, &label).unwrap();
+        read_controlled(&state, &catalog.session_id, 0, Some((&label, &target))).unwrap();
+        assert!(preview_target(&state, &label).unwrap().memory_bytes > 0);
+        reset_preview_target(&state, &label, Some(2)).unwrap();
+        assert!(target.check().is_err());
+    }
+
     #[test]
     fn preview_targets_are_bound_to_registered_windows() {
         let state = AppState::default();
         lock(&state.sandbox).previews.insert(
             "sandbox-preview-1-4".into(),
-            PreviewTarget {
-                session_id: "1".into(),
-                item_id: 4,
-            },
+            PreviewTarget::new("1".into(), 4),
         );
         let target = preview_target(&state, "sandbox-preview-1-4").unwrap();
         assert_eq!(target.session_id, "1");
@@ -693,10 +1098,7 @@ mod tests {
             let label = format!("sandbox-preview-{}-0", catalog.session_id);
             lock(&state.sandbox).previews.insert(
                 label.clone(),
-                PreviewTarget {
-                    session_id: catalog.session_id.clone(),
-                    item_id: 0,
-                },
+                PreviewTarget::new(catalog.session_id.clone(), 0),
             );
             if revoke_before_close {
                 revoke(&state);

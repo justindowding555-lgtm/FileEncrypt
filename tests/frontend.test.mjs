@@ -4,7 +4,7 @@ import fs from "node:fs";
 import vm from "node:vm";
 import { createHash } from "node:crypto";
 
-function fixture(invoke, script = "main", automaticVerification = false) {
+function fixture(invoke, script = "main", automaticVerification = false, automaticDecode = true) {
   let created = 0;
   let nextTimer = 0;
   const timers = new Map();
@@ -12,8 +12,14 @@ function fixture(invoke, script = "main", automaticVerification = false) {
   const events = new Map();
   function element(fragment = false) {
     return { fragment, children: [], handlers: new Map(), attributes: new Map(), value: "", checked: false, style: {}, offsetWidth: 220, offsetHeight: 120,
-      classList: { toggle() {} },
-      append(...items) { for (const item of items) this.children.push(...(item.fragment ? item.children : [item])); },
+      classList: { toggle() {}, add() {}, remove() {} },
+      append(...items) { for (const item of items) {
+        this.children.push(...(item.fragment ? item.children : [item]));
+        if (automaticDecode && item.contentWindow && script === "sandbox-preview") queueMicrotask(() => {
+          context.testFrame = item;
+          vm.runInContext('handlePrivatePreviewMessage({source:testFrame.contentWindow,origin:"null",data:{channel:"fileencrypt-preview",type:"ready",kind:previewWindow.kind}})', context);
+        });
+      } },
       replaceChildren(...items) { this.children = []; this.append(...items); },
       setAttribute(name, value) { this.attributes.set(name, value); }, removeAttribute(name) { this.attributes.delete(name); },
       addEventListener(name, callback) { this.handlers.set(name, callback); }, focus() { document.activeElement = this; },
@@ -24,7 +30,7 @@ function fixture(invoke, script = "main", automaticVerification = false) {
   }
   const document = { readyState: "loading", addEventListener() {},
     getElementById(id) { if (!refs.has(id)) refs.set(id, element()); return refs.get(id); },
-    createElement() { created++; return element(); }, createDocumentFragment() { return element(true); },
+    createElement(tag) { created++; const item = element(); if (tag === "iframe") item.contentWindow = { messages: [], postMessage(data) { this.messages.push(data); } }; return item; }, createDocumentFragment() { return element(true); },
   };
   const context = vm.createContext({ document, atob, TextDecoder, Error, window: { addEventListener() {}, __TAURI__: {
     core: { invoke(command, args) {
@@ -37,7 +43,7 @@ function fixture(invoke, script = "main", automaticVerification = false) {
     setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
   });
-  for (const file of ["explorer-icons.js", "sandbox-content.js", `${script}.js`]) {
+  for (const file of ["explorer-icons.js", "sandbox-viewer.js", "sandbox-content.js", `${script}.js`]) {
     vm.runInContext(fs.readFileSync(new URL(`../src/${file}`, import.meta.url), "utf8"), context);
   }
   return { context, refs, timers, events, count: () => created, evaluate: (code) => vm.runInContext(code, context),
@@ -649,6 +655,136 @@ async function recoveryFixture() {
   };
 }
 
+test("emergency locking closes the explorer, cancels recovery, and keeps selected paths", async () => {
+  const { ui, change, calls } = await recoveryFixture();
+  ui.evaluate('$("key-text").value="secret"; $("key-passphrase").value="secret"');
+  const paths = ui.evaluate("JSON.stringify(state.files)");
+  change({ ...savedKeyStatus, keyRevision: 2, keyLoaded: false, fingerprint: null,
+    emergencyLocked: true, startupKeyUnavailable: true, sandboxAvailable: false });
+  assert.equal(ui.refs.get("sandbox-dialog").open, false);
+  assert.equal(ui.evaluate("sandbox.recovery"), null);
+  assert.equal(ui.evaluate("JSON.stringify(state.files)"), paths);
+  assert.equal(ui.refs.get("key-text").value, "");
+  assert.equal(ui.refs.get("key-passphrase").value, "");
+  assert.equal(ui.refs.get("startup-key-heading").textContent, "Key unavailable");
+  assert.equal(ui.refs.get("startup-key-description").textContent, "The saved key file could not be opened.");
+  assert.equal(ui.refs.get("startup-key-instructions").hidden, true);
+  ui.refs.get("choose-recovery-key").handlers.get("click")();
+  for (let revision = 3; revision < 6; revision++) {
+    change({ ...savedKeyStatus, keyRevision: revision, emergencyLocked: true });
+    assert.equal(ui.evaluate("state.keyLoaded"), false);
+    assert.equal(ui.refs.get("key-message").textContent, "Unable to read the saved key.");
+  }
+  change({ ...savedKeyStatus, keyRevision: 6, emergencyLocked: false });
+  await settle();
+  assert.equal(ui.refs.get("sandbox-dialog").open, false);
+  assert.equal(calls.filter(({ command }) => command === "open_sandbox_preview").length, 1);
+});
+
+test("emergency shortcuts ignore repeat, extra modifiers, and native-handled keys", async () => {
+  const calls = [];
+  const ui = fixture(async (command) => {
+    calls.push(command);
+    return { ...savedKeyStatus, emergencyLocked: true, keyLoaded: false };
+  });
+  ui.evaluate('state.emergencyShortcutsNative=true; handleEmergencyShortcut({key:"F12",ctrlKey:true,shiftKey:true,preventDefault(){}})');
+  ui.evaluate('state.emergencyShortcutsNative=false; handleEmergencyShortcut({key:"F12",ctrlKey:true,shiftKey:true,repeat:true,preventDefault(){}})');
+  ui.evaluate('handleEmergencyShortcut({key:"F12",ctrlKey:true,shiftKey:true,altKey:true,preventDefault(){}})');
+  ui.evaluate('handleEmergencyShortcut({key:"F10",ctrlKey:true,shiftKey:true,preventDefault(){}})');
+  assert.deepEqual(calls, []);
+  await ui.evaluate('handleEmergencyShortcut({key:"F12",ctrlKey:true,shiftKey:true,preventDefault(){}})');
+  assert.deepEqual(calls, ["emergency_lock"]);
+});
+
+test("Browse and load remains usable during emergency lock and reports the fake read error", async () => {
+  const calls = [];
+  const locked = { ...savedKeyStatus, keyLoaded: false, emergencyLocked: true,
+    emergencyShortcutsNative: true, startupKeyUnavailable: true, sandboxAvailable: false };
+  const ui = fixture(async (command) => {
+    calls.push(command);
+    if (command === "get_status") return locked;
+    if (command === "browse_key") throw "Unable to read the saved key.";
+  });
+  await ui.evaluate("init()");
+  ui.refs.get("choose-recovery-key").handlers.get("click")();
+  const browse = ui.refs.get("browse-load");
+  assert.equal(browse.disabled, false);
+  browse.handlers.get("click")();
+  await settle();
+  assert.equal(calls.filter((command) => command === "browse_key").length, 1);
+  assert.equal(ui.refs.get("startup-key-dialog").open, true);
+  assert.equal(ui.refs.get("startup-key-description").textContent, "The saved key file could not be opened.");
+  assert.equal(ui.refs.get("alert").hidden, true);
+  assert.equal(ui.refs.get("key-recovery-alert").hidden, true);
+  assert.equal(ui.evaluate("state.emergencyLocked"), true);
+  assert.equal(ui.evaluate("state.keyLoaded"), false);
+  assert.equal(browse.disabled, false);
+  ui.refs.get("choose-recovery-key").handlers.get("click")();
+  browse.handlers.get("click")();
+  await settle();
+  assert.equal(ui.refs.get("startup-key-dialog").open, true);
+  assert.equal(ui.refs.get("key-recovery-alert").hidden, true);
+  ui.refs.get("choose-recovery-key").handlers.get("click")();
+  ui.evaluate('openKeyOptions(); showAlert("Unable to read  the saved key.")');
+  assert.equal(ui.refs.get("key-dialog").open, false);
+  assert.equal(ui.refs.get("startup-key-dialog").open, true);
+  assert.equal(ui.refs.get("key-dialog-alert").hidden, true);
+});
+
+test("protected emergency unlock clears each submitted passphrase and stays locked after failure", async () => {
+  const calls = [];
+  const locked = { ...savedKeyStatus, keyRevision: 1, keyLoaded: false, emergencyLocked: true,
+    emergencyShortcutsNative: true, startupKeyUnavailable: true, sandboxAvailable: false };
+  const ui = fixture(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "get_status") return locked;
+    if (command === "emergency_unlock") {
+      if (args.passphrase !== "correct") throw "This key file needs its passphrase.";
+      return { ...savedKeyStatus, keyRevision: 2, emergencyLocked: false, emergencyShortcutsNative: true };
+    }
+  });
+  await ui.evaluate("init()");
+  await ui.events.get("emergency-unlock-requested")();
+  assert.equal(ui.evaluate("state.emergencyLocked"), true);
+  assert.equal(ui.refs.get("key-dialog").open, true);
+  assert.equal(ui.refs.get("startup-key-dialog").open, false);
+  assert.match(ui.refs.get("key-dialog-alert").textContent, /passphrase/);
+  ui.refs.get("key-passphrase").value = "correct";
+  await ui.events.get("emergency-unlock-requested")();
+  assert.equal(ui.refs.get("key-passphrase").value, "");
+  assert.equal(ui.evaluate("state.emergencyLocked"), false);
+  assert.equal(ui.evaluate("state.keyLoaded"), true);
+  assert.equal(calls.filter(({ command }) => command === "emergency_unlock").length, 2);
+});
+
+test("key deletion cannot be armed until explicitly enabled and can be disarmed", async () => {
+  const calls = [];
+  const ui = fixture(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "get_status") return { ...savedKeyStatus, emergencyShortcutsNative: true };
+    if (command === "arm_emergency_deletion") return { ...savedKeyStatus, emergencyShortcutsNative: true,
+      emergencyDeletionArmed: args.enabled, emergencyDeletionPath: args.enabled ? "C:/saved.key" : null };
+  });
+  await ui.evaluate("init()");
+  const arm = ui.refs.get("arm-emergency-deletion");
+  assert.equal(arm.disabled, true);
+  arm.handlers.get("click")();
+  assert.equal(calls.some(({ command }) => command === "arm_emergency_deletion"), false);
+  const enable = ui.refs.get("enable-emergency-deletion");
+  enable.checked = true;
+  enable.handlers.get("change")();
+  assert.equal(arm.disabled, false);
+  arm.handlers.get("click")();
+  await settle();
+  assert.equal(ui.evaluate("state.emergencyDeletionArmed"), true);
+  assert.equal(enable.disabled, true);
+  assert.equal(ui.refs.get("emergency-deletion-path").textContent, "C:/saved.key");
+  ui.refs.get("disarm-emergency-deletion").handlers.get("click")();
+  await settle();
+  assert.equal(ui.evaluate("state.emergencyDeletionArmed"), false);
+  assert.equal(ui.refs.get("disarm-emergency-deletion").hidden, true);
+});
+
 test("reconnecting the same key opens a fresh sandbox and restores the previous preview", async () => {
   const { ui, calls, change } = await recoveryFixture();
   ui.evaluate('showAlert("An unrelated file error")');
@@ -970,7 +1106,7 @@ test("sandbox control requires a saved key even when a session key is loaded", (
   assert.match(ui.refs.get("key-message").textContent, /Could not save preferences/);
 });
 
-test("native preview uses an isolated inert frame and never invokes disk decryption", async () => {
+test("native preview isolates file content and permits only the fixed viewer script", async () => {
   const calls = [];
   const content = textPreview('<script>parent.stolen=true</script><img src="https://example.com/leak">');
   const ui = fixture(async (command, args) => {
@@ -980,26 +1116,31 @@ test("native preview uses an isolated inert frame and never invokes disk decrypt
   }, "sandbox-preview");
   await ui.evaluate("initPrivatePreview()");
   const frame = ui.refs.get("preview-content").children[0];
-  assert.equal(frame.attributes.get("sandbox"), "");
+  assert.equal(frame.attributes.get("sandbox"), "allow-scripts");
   assert.equal(frame.attributes.get("referrerpolicy"), "no-referrer");
   assert.match(frame.srcdoc, /&lt;script&gt;/);
-  assert.doesNotMatch(frame.srcdoc, /<script>|<img src="https:/);
+  assert.doesNotMatch(frame.srcdoc, /<script>parent.stolen|<img src="https:/);
+  assert.equal((frame.srcdoc.match(/<script>/g) || []).length, 1);
+  assert.ok(frame.srcdoc.includes(ui.evaluate("SANDBOX_VIEWER_SCRIPT")));
   assert.match(frame.srcdoc, /default-src 'none'/);
   assert.match(frame.srcdoc, /img-src data:; media-src data:/);
   assert.equal(content.data, "");
-  assert.ok(calls.every(({ command }) => ["sandbox_preview_info", "read_sandbox_preview", "check_sandbox"].includes(command)));
+  assert.ok(calls.every(({ command }) => ["sandbox_preview_info", "read_sandbox_preview", "check_sandbox", "cancel_sandbox_preview_read"].includes(command)));
   ui.evaluate("closePrivatePreview()");
   assert.equal(ui.refs.get("preview-content").children.length, 0);
   assert.equal(ui.evaluate("document.title"), "Private preview - FileEncrypt");
   assert.equal(ui.timers.size, 0);
 });
 
-test("sandbox preview style is allowed by the exact CSP hash without allowing inline scripts", () => {
+test("sandbox preview allows only the exact style and trusted script hashes", () => {
   const ui = fixture();
   const hash = "sha256-" + createHash("sha256").update(ui.evaluate("SANDBOX_STYLE")).digest("base64");
   assert.equal(ui.evaluate("SANDBOX_STYLE_HASH"), hash);
   const config = JSON.parse(fs.readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
   assert.ok(config.app.security.csp.includes(`'${hash}'`));
+  const scriptHash = "sha256-" + createHash("sha256").update(ui.evaluate("SANDBOX_VIEWER_SCRIPT")).digest("base64");
+  assert.equal(ui.evaluate("SANDBOX_VIEWER_SCRIPT_HASH"), scriptHash);
+  assert.ok(config.app.security.csp.includes(`script-src 'self' '${scriptHash}'`));
   assert.ok(!config.app.security.csp.includes("unsafe-inline"));
   assert.ok(!config.app.security.csp.includes("unsafe-eval"));
 });
@@ -1012,6 +1153,182 @@ test("media stays inside the isolated document and active image formats are refu
   assert.equal(ui.context.content.data, "");
   ui.context.content = { kind: "image", mime: "image/svg+xml", data: "cHJpdmF0ZQ==" };
   assert.throws(() => ui.evaluate("sandboxDocument(content)"), /Unsupported preview format/);
+});
+
+test("image viewer uses the trusted gesture script without same-origin or network access", () => {
+  const ui = fixture();
+  ui.context.content = { kind: "image", mime: "image/png", data: "cHJpdmF0ZQ==" };
+  const frame = ui.evaluate('createSandboxFrame(content, "photo.png")');
+  assert.equal(frame.attributes.get("sandbox"), "allow-scripts");
+  assert.equal(frame.attributes.get("referrerpolicy"), "no-referrer");
+  assert.match(frame.srcdoc, /<body data-kind="image">/);
+  assert.match(frame.srcdoc, /tabindex="0" aria-label="Image preview\. Pinch to zoom; scroll to pan\."/);
+  assert.equal((frame.srcdoc.match(/data:image\/png;base64,/g) || []).length, 1);
+  assert.doesNotMatch(frame.srcdoc, /\son\w+=|allow-same-origin|unsafe-inline/);
+  assert.equal(ui.context.content.data, "");
+  ui.context.content = { kind: "video", mime: "video/mp4", data: "cHJpdmF0ZQ==" };
+  assert.doesNotMatch(ui.evaluate("sandboxDocument(content)"), /<select|<main id="preview-stage"/);
+});
+
+test("key loss discards the entire image viewer including its zoom controls", async () => {
+  let available = true;
+  const content = { kind: "image", mime: "image/png", data: "cHJpdmF0ZQ==" };
+  const ui = fixture(async (command) => {
+    if (command === "sandbox_preview_info") return { sessionId: "1", item: { id: 0, name: "photo.png" } };
+    if (command === "read_sandbox_preview") return content;
+    if (command === "check_sandbox" && !available) throw new Error("Key file unavailable");
+  }, "sandbox-preview");
+  await ui.evaluate("initPrivatePreview()");
+  assert.match(ui.refs.get("preview-content").children[0].srcdoc, /<main id="preview-stage"/);
+  assert.equal(content.data, "");
+  available = false;
+  await ui.fireTimer();
+  assert.equal(ui.evaluate("previewWindow.closed"), true);
+  assert.equal(ui.refs.get("preview-content").children.length, 0);
+  assert.equal(ui.refs.get("preview-content").hidden, true);
+  assert.equal(ui.refs.get("preview-image-toolbar").hidden, true);
+  assert.equal(ui.refs.get("preview-image-name").textContent, "");
+  assert.equal(ui.evaluate("previewWindow.scale"), null);
+  assert.equal(ui.timers.size, 0);
+});
+
+function viewerFixture(kind = "image") {
+  const sent = [], handlers = new Map(), mediaHandlers = new Map(), stageHandlers = new Map();
+  const parent = { postMessage(data) { sent.push(data); } };
+  const stage = { clientWidth: 640, clientHeight: 480, scrollLeft: 0, scrollTop: 0,
+    addEventListener(name, action, options) { stageHandlers.set(name, { action, options }); },
+    getBoundingClientRect() { return { left: 0, top: 0 }; },
+  };
+  const media = { naturalWidth: 800, naturalHeight: 400, complete: true, readyState: 1, style: {},
+    addEventListener(name, action) { mediaHandlers.set(name, action); },
+    getBoundingClientRect() { return { left: 24 - stage.scrollLeft, top: 24 - stage.scrollTop }; },
+  };
+  const context = vm.createContext({ parent, window: { addEventListener(name, action) { handlers.set(name, action); } },
+    document: { body: { dataset: { kind } }, getElementById(id) { return id === "preview-media" ? media : stage; },
+      addEventListener(name, action) { handlers.set(name, action); } },
+    ResizeObserver: class { observe() {} },
+  });
+  const source = fs.readFileSync(new URL("../src/sandbox-viewer.js", import.meta.url), "utf8");
+  const script = vm.runInNewContext(source + "; SANDBOX_VIEWER_SCRIPT");
+  vm.runInContext(script, context);
+  return { sent, parent, handlers, media, mediaHandlers, stageHandlers };
+}
+
+test("pinch zoom changes image scale, clamps extreme gestures, and preserves normal scrolling", () => {
+  const viewer = viewerFixture();
+  const wheel = viewer.stageHandlers.get("wheel");
+  assert.equal(wheel.options.passive, false);
+  assert.equal(viewer.sent.at(-1).type, "ready");
+  const before = Number.parseFloat(viewer.media.style.width);
+  let prevented = 0;
+  wheel.action({ ctrlKey: false, deltaY: -30, deltaMode: 0, preventDefault() { prevented++; } });
+  assert.equal(Number.parseFloat(viewer.media.style.width), before);
+  assert.equal(prevented, 0);
+  wheel.action({ ctrlKey: true, deltaY: -30, deltaMode: 0, clientX: 200, clientY: 180, preventDefault() { prevented++; } });
+  assert.ok(Number.parseFloat(viewer.media.style.width) > before);
+  assert.equal(prevented, 1);
+  assert.equal(viewer.sent.at(-1).fit, false);
+  for (let i = 0; i < 20; i++) wheel.action({ ctrlKey: true, deltaY: -1000, deltaMode: 0, clientX: 200, clientY: 180, preventDefault() {} });
+  assert.equal(viewer.sent.at(-1).scale, 4);
+  assert.equal(viewerFixture("video").stageHandlers.has("wheel"), false);
+  assert.equal(viewerFixture("audio").stageHandlers.has("gesturestart"), false);
+});
+
+test("viewer forwards Escape and media errors, and rejects zoom messages from other windows", () => {
+  const viewer = viewerFixture();
+  const message = { data: { channel: "fileencrypt-preview", type: "zoom", value: 2 } };
+  const before = viewer.media.style.width;
+  viewer.handlers.get("message")({ ...message, source: {} });
+  assert.equal(viewer.media.style.width, before);
+  viewer.handlers.get("message")({ ...message, source: viewer.parent });
+  assert.equal(viewer.media.style.width, "1600px");
+  viewer.handlers.get("keydown")({ key: "Escape", preventDefault() {} });
+  assert.equal(viewer.sent.at(-1).type, "close");
+  const video = viewerFixture("video");
+  video.mediaHandlers.get("error")();
+  assert.equal(video.sent.at(-1).type, "error");
+  video.handlers.get("keydown")({ key: "Escape", preventDefault() {} });
+  assert.equal(video.sent.at(-1).type, "close");
+});
+
+test("image navigation reuses the window and clears the previous image before loading the next", async () => {
+  const calls = [];
+  let current = 0;
+  const info = () => ({ sessionId: "1", item: { id: current, name: `photo-${current}.png`, kind: "image" },
+    navigation: { previous: current > 0, next: current < 1, index: current + 1, total: 2 } });
+  const ui = fixture(async (command, args) => {
+    calls.push(command);
+    if (command === "sandbox_preview_info") return info();
+    if (command === "navigate_sandbox_preview") { current += args.direction; return info(); }
+    if (command === "read_sandbox_preview") return { kind: "image", mime: "image/png", data: "cHJpdmF0ZQ==" };
+  }, "sandbox-preview");
+  await ui.evaluate("initPrivatePreview()");
+  const first = ui.refs.get("preview-content").children[0];
+  assert.equal(ui.refs.get("preview-previous-image").disabled, true);
+  const moving = ui.evaluate("navigatePrivatePreview(1)");
+  assert.equal(ui.refs.get("preview-content").children.length, 0);
+  await moving;
+  assert.notEqual(ui.refs.get("preview-content").children[0], first);
+  assert.equal(ui.refs.get("preview-image-position").textContent, "2 / 2");
+  assert.equal(ui.refs.get("preview-next-image").disabled, true);
+  assert.equal(ui.refs.get("preview-previous-image").disabled, false);
+  assert.ok(calls.includes("cancel_sandbox_preview_read"));
+  assert.ok(!calls.includes("open_sandbox_preview"));
+});
+
+test("only the active opaque frame can report decoder failures or request closing", async () => {
+  const ui = fixture(async (command) => {
+    if (command === "sandbox_preview_info") return { sessionId: "1", item: { id: 0, name: "photo.png", kind: "image" } };
+    if (command === "read_sandbox_preview") return { kind: "image", mime: "image/png", data: "cHJpdmF0ZQ==" };
+  }, "sandbox-preview");
+  await ui.evaluate("initPrivatePreview()");
+  const frame = ui.refs.get("preview-content").children[0];
+  ui.context.activeFrame = frame;
+  ui.evaluate('handlePrivatePreviewMessage({source:{},origin:"null",data:{channel:"fileencrypt-preview",type:"close"}})');
+  ui.evaluate('handlePrivatePreviewMessage({source:activeFrame.contentWindow,origin:"https://example.com",data:{channel:"fileencrypt-preview",type:"close"}})');
+  assert.equal(ui.evaluate("previewWindow.closed"), false);
+  ui.evaluate('handlePrivatePreviewMessage({source:activeFrame.contentWindow,origin:"null",data:{channel:"fileencrypt-preview",type:"error",kind:"image"}})');
+  await settle();
+  assert.equal(ui.refs.get("preview-content").children.length, 0);
+  assert.match(ui.refs.get("preview-message-detail").textContent, /damaged/);
+  ui.evaluate('handlePrivatePreviewMessage({source:activeFrame.contentWindow,origin:"null",data:{channel:"fileencrypt-preview",type:"close"}})');
+  assert.equal(ui.evaluate("previewWindow.closed"), false);
+});
+
+test("a missing decoder response times out without revealing the frame", async () => {
+  const ui = fixture(async (command) => {
+    if (command === "sandbox_preview_info") return { sessionId: "1", item: { id: 0, name: "photo.png", kind: "image" } };
+    if (command === "read_sandbox_preview") return { kind: "image", mime: "image/png", data: "cHJpdmF0ZQ==" };
+  }, "sandbox-preview", false, false);
+  const loading = ui.evaluate("loadPrivatePreview()");
+  await settle();
+  const timer = [...ui.timers.values()].find((timer) => timer.delay === 15000);
+  assert.ok(timer);
+  timer.callback();
+  await loading;
+  assert.equal(ui.refs.get("preview-content").children.length, 0);
+  assert.match(ui.refs.get("preview-message-detail").textContent, /decoded in time/);
+});
+
+test("retrying a failed preview reloads its file instead of treating the click as navigation", async () => {
+  let fail = true;
+  const calls = [];
+  const ui = fixture(async (command) => {
+    calls.push(command);
+    if (command === "sandbox_preview_info") return { sessionId: "1", item: { id: 0, name: "photo.png", kind: "image" } };
+    if (command === "read_sandbox_preview") {
+      if (fail) throw new Error("Image unavailable");
+      return { kind: "image", mime: "image/png", data: "cHJpdmF0ZQ==" };
+    }
+  }, "sandbox-preview");
+  await ui.evaluate("initPrivatePreview()");
+  assert.equal(ui.refs.get("retry-private-preview").hidden, false);
+  assert.equal(ui.refs.get("retry-private-preview").disabled, false);
+  fail = false;
+  await ui.refs.get("retry-private-preview").handlers.get("click")({ type: "click" });
+  assert.equal(ui.refs.get("preview-content").children.length, 1);
+  assert.equal(ui.refs.get("preview-message").hidden, true);
+  assert.ok(!calls.includes("navigate_sandbox_preview"));
 });
 
 test("loss of key-file access clears already displayed plaintext despite a cached key", async () => {

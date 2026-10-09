@@ -28,6 +28,9 @@ pub struct AppState {
     pub(crate) key: Mutex<Option<Zeroizing<[u8; 32]>>>,
     pub(crate) key_path: Mutex<Option<PathBuf>>,
     pub(crate) key_file_hash: Mutex<Option<[u8; 32]>>,
+    pub(crate) emergency_locked: AtomicBool,
+    pub(crate) emergency_delete_held: AtomicBool,
+    pub(crate) emergency: Mutex<crate::emergency::Controls>,
     pub(crate) sandbox: Mutex<crate::sandbox::Registry>,
     output_dir: Mutex<Option<PathBuf>>,
     message: Mutex<String>,
@@ -45,6 +48,9 @@ impl Default for AppState {
             key: Mutex::new(None),
             key_path: Mutex::new(None),
             key_file_hash: Mutex::new(None),
+            emergency_locked: AtomicBool::new(false),
+            emergency_delete_held: AtomicBool::new(false),
+            emergency: Mutex::new(crate::emergency::Controls::default()),
             sandbox: Mutex::new(crate::sandbox::Registry::default()),
             output_dir: Mutex::new(None),
             message: Mutex::new(String::new()),
@@ -59,6 +65,11 @@ impl Default for AppState {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppStatus {
+    emergency_locked: bool,
+    emergency_deletion_armed: bool,
+    emergency_deletion_path: Option<String>,
+    emergency_deletion_message: Option<String>,
+    emergency_shortcuts_native: bool,
     key_revision: u64,
     key_loaded: bool,
     key_path: Option<String>,
@@ -356,7 +367,7 @@ pub async fn retry_deletion(
         }
             .ok_or("This deletion receipt is no longer available. Receipts last until new results replace them or the app closes.")?;
         let callback = |_| -> io::Result<()> {
-            if state.cancelled.load(Ordering::Acquire) {
+            if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire) {
                 Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"))
             } else { Ok(()) }
         };
@@ -455,7 +466,7 @@ fn restore_saved_settings(state: &AppState, settings: Settings) {
     restore_saved_key_from_path(state, &path);
 }
 
-fn restore_saved_key_from_path(state: &AppState, path: &Path) {
+pub(crate) fn restore_saved_key_from_path(state: &AppState, path: &Path) {
     let _key_change = lock(&state.key_change);
     state.key_revision.fetch_add(1, Ordering::AcqRel);
     state
@@ -464,6 +475,11 @@ fn restore_saved_key_from_path(state: &AppState, path: &Path) {
     *lock(&state.key_path) = Some(path.to_path_buf());
     *lock(&state.key) = None;
     *lock(&state.key_file_hash) = None;
+    if crate::emergency::ensure_unlocked(state).is_err() {
+        state.startup_key_unavailable.store(true, Ordering::Release);
+        set_message(state, crate::emergency::UNAVAILABLE);
+        return;
+    }
     match key_file::read_key_snapshot(path).and_then(|bytes| {
         let key = key_file::parse_key_snapshot(path, &bytes, None)?;
         use sha2::Digest;
@@ -491,18 +507,20 @@ fn restore_saved_key_from_path(state: &AppState, path: &Path) {
 
 /// Watch saved file keys in both directions. Session-only and explicitly
 /// unloaded keys are excluded; a delayed read cannot replace a newer key.
-fn refresh_key_file(state: &AppState) -> bool {
+pub(crate) fn refresh_key_file(state: &AppState) -> bool {
+    let deletion_changed = crate::emergency::check_deletion(state);
     let check = {
         let _key_change = lock(&state.key_change);
+        if crate::emergency::ensure_unlocked(state).is_err() { return deletion_changed; }
         let loaded = lock(&state.key).is_some();
         if !loaded
             && (!state.startup_key_unavailable.load(Ordering::Acquire)
                 || state.running.load(Ordering::Acquire))
         {
-            return false;
+            return deletion_changed;
         }
         let Some(path) = lock(&state.key_path).clone() else {
-            return false;
+            return deletion_changed;
         };
         KeyFileCheck {
             revision: state.key_revision.load(Ordering::Acquire),
@@ -514,7 +532,7 @@ fn refresh_key_file(state: &AppState) -> bool {
     // Read outside the state lock: an unavailable removable or network drive
     // must not block manual key changes or app shutdown.
     let snapshot = key_file::read_key_snapshot(&check.path);
-    finish_key_file_check(state, check, snapshot)
+    finish_key_file_check(state, check, snapshot) || deletion_changed
 }
 
 struct KeyFileCheck {
@@ -536,6 +554,7 @@ fn finish_key_file_check(
 ) -> bool {
     let _key_change = lock(&state.key_change);
     if state.key_revision.load(Ordering::Acquire) != check.revision
+        || crate::emergency::ensure_unlocked(state).is_err()
         || (!check.loaded && state.running.load(Ordering::Acquire))
     {
         return false;
@@ -593,10 +612,11 @@ fn finish_key_file_check(
 
 // Caller holds key_change. Keep only the non-secret file digest on disconnect
 // so reconnecting a different file at the same path cannot silently switch keys.
-fn deactivate_file_key(state: &AppState, disconnected: bool, message: String) {
+pub(crate) fn deactivate_file_key(state: &AppState, disconnected: bool, message: String) {
     crate::sandbox::revoke(state);
     *lock(&state.key) = None;
     if !disconnected {
+        lock(&state.emergency).disarm();
         *lock(&state.key_file_hash) = None;
     }
     if state.running.load(Ordering::Acquire) {
@@ -611,12 +631,14 @@ fn deactivate_file_key(state: &AppState, disconnected: bool, message: String) {
 
 pub(crate) fn start_key_monitor(app: tauri::AppHandle) {
     std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(1));
+        let armed = lock(&app.state::<AppState>().emergency).armed_path().is_some();
+        std::thread::sleep(if armed { Duration::from_millis(250) } else { Duration::from_secs(1) });
         if app.get_webview_window("main").is_none() {
             break;
         }
         let state = app.state::<AppState>();
         if refresh_key_file(&state) {
+            crate::sandbox::close_invalid_previews(&app);
             let _ = app.emit("key-status-changed", status(&state));
         }
     });
@@ -634,6 +656,7 @@ pub async fn recheck_key_file(app: tauri::AppHandle) -> Result<AppStatus, String
         let changed = refresh_key_file(&state);
         let current = status(&state);
         if changed {
+            crate::sandbox::close_invalid_previews(&app);
             let _ = app.emit("key-status-changed", &current);
         }
         current
@@ -780,6 +803,7 @@ pub async fn generate_key(
     path: String,
     passphrase: Option<String>,
 ) -> Result<AppStatus, String> {
+    crate::emergency::ensure_unlocked(&state)?;
     let passphrase = passphrase.map(Zeroizing::new);
     let Some(path) = resolve_save_path(&app, &path)? else {
         set_message(&state, "Key file was not created.");
@@ -801,7 +825,7 @@ pub async fn generate_key(
     written.map_err(|err| err.to_string())?;
     let hash =
         key_file::checked_file_hash(&path, &key, passphrase.as_deref().map(String::as_str)).ok();
-    let extra = remember_key(&app, &state, path, key, hash);
+    let extra = remember_key(&app, &state, path, key, hash)?;
     set_message(&state, format!("New key generated and saved.{extra}"));
     Ok(status(&state))
 }
@@ -814,6 +838,7 @@ pub async fn save_typed_key(
     mut key_text: String,
     passphrase: Option<String>,
 ) -> Result<AppStatus, String> {
+    crate::emergency::ensure_unlocked(&state)?;
     let passphrase = passphrase.map(Zeroizing::new);
     let parsed = key_file::parse_key_material(&key_text);
     key_text.zeroize();
@@ -837,7 +862,7 @@ pub async fn save_typed_key(
     written.map_err(|err| err.to_string())?;
     let hash =
         key_file::checked_file_hash(&path, &key, passphrase.as_deref().map(String::as_str)).ok();
-    let extra = remember_key(&app, &state, path, key, hash);
+    let extra = remember_key(&app, &state, path, key, hash)?;
     set_message(&state, format!("Key written to the file.{extra}"));
     Ok(status(&state))
 }
@@ -864,6 +889,8 @@ fn activate_session_key(
     key: Zeroizing<[u8; 32]>,
     settings_path: &Path,
 ) -> Result<(), String> {
+    let _key_change = lock(&state.key_change);
+    crate::emergency::ensure_unlocked(state)?;
     // Remember only preferences and clear the old file path before activating
     // this key, so a later launch cannot silently restore a previous file key.
     let settings = Settings {
@@ -871,7 +898,7 @@ fn activate_session_key(
         output_dir: lock(&state.output_dir).clone(),
     };
     write_settings_file(settings_path, &settings)?;
-    let _key_change = lock(&state.key_change);
+    lock(&state.emergency).disarm();
     crate::sandbox::revoke(state);
     *lock(&state.key) = Some(key);
     *lock(&state.key_path) = None;
@@ -894,6 +921,7 @@ pub async fn load_key(
     path: String,
     passphrase: Option<String>,
 ) -> Result<AppStatus, String> {
+    crate::emergency::ensure_unlocked(&state)?;
     let passphrase = passphrase.map(Zeroizing::new);
     let path = path.trim().to_string();
     if path.is_empty() {
@@ -914,7 +942,7 @@ pub async fn browse_key(
     passphrase: Option<String>,
 ) -> Result<AppStatus, String> {
     let passphrase = passphrase.map(Zeroizing::new);
-    let Some(path) = pick_open(&app)? else {
+    let Some(path) = pick_key_for_load(&state, || pick_open(&app))? else {
         set_message(&state, "No key file was opened.");
         return Ok(status(&state));
     };
@@ -926,12 +954,26 @@ pub async fn browse_key(
     )
 }
 
+fn pick_key_for_load(
+    state: &AppState,
+    picker: impl FnOnce() -> Result<Option<PathBuf>, String>,
+) -> Result<Option<PathBuf>, String> {
+    // A locked app still behaves like an ordinary file picker. Reject the
+    // selection before reading any bytes or changing the remembered key path.
+    let picked = picker()?;
+    if picked.is_some() {
+        crate::emergency::ensure_unlocked(state)?;
+    }
+    Ok(picked)
+}
+
 #[tauri::command]
 pub async fn backup_key(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     passphrase: Option<String>,
 ) -> Result<AppStatus, String> {
+    crate::emergency::ensure_unlocked(&state)?;
     let passphrase = passphrase.map(Zeroizing::new);
     let source = lock(&state.key_path)
         .clone()
@@ -1004,6 +1046,7 @@ pub async fn check_key_backup(
     state: tauri::State<'_, AppState>,
     passphrase: Option<String>,
 ) -> Result<AppStatus, String> {
+    crate::emergency::ensure_unlocked(&state)?;
     let passphrase = passphrase.map(Zeroizing::new);
     let current = lock(&state.key).clone().ok_or("Load a key first.")?;
     let Some(path) = pick_open(&app)? else {
@@ -1033,6 +1076,7 @@ pub fn unload_key(state: tauri::State<'_, AppState>) -> AppStatus {
 
 fn unload_key_from_memory(state: &AppState) {
     let _key_change = lock(&state.key_change);
+    lock(&state.emergency).disarm();
     crate::sandbox::revoke(state);
     *lock(&state.key) = None;
     *lock(&state.key_file_hash) = None;
@@ -1045,6 +1089,7 @@ fn unload_key_from_memory(state: &AppState) {
 
 pub fn clear_key_on_close(state: &AppState) {
     let _key_change = lock(&state.key_change);
+    lock(&state.emergency).disarm();
     crate::sandbox::revoke(state);
     state.cancelled.store(true, Ordering::Release);
     lock(&state.deletions).clear();
@@ -1184,11 +1229,11 @@ pub async fn rotate_key(
         let mut results = Vec::with_capacity(paths.len());
         let batch = DeletionBatch::new(&state);
         for (index, path) in paths.into_iter().enumerate() {
-            if state.cancelled.load(Ordering::Acquire) { break; }
+            if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire) { break; }
             let input = PathBuf::from(&path);
             *lock(&last_emit)=Instant::now()-Duration::from_secs(1);
             let progress = |bytes: u64| -> io::Result<()> {
-                if state.cancelled.load(Ordering::Acquire) {
+                if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire) {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"));
                 }
                 let done = processed.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
@@ -1216,7 +1261,7 @@ pub async fn rotate_key(
         let success = results.len() == seen.len() && results.iter().all(|item| item.ok);
         if success {
             let hash = key_file::checked_file_hash(&new_path, &new_key, passphrase.as_deref().map(String::as_str)).ok();
-            let extra = remember_key(&app, &state, new_path.clone(), new_key, hash);
+            let extra = remember_key(&app, &state, new_path.clone(), new_key, hash)?;
             set_message(&state, format!("Selected files rotated. New key: {}. Keep the old key for any files you did not select.{extra}", new_path.display()));
         } else {
             set_message(&state, format!("Rotation was incomplete. The old key remains loaded. The new key file is at {} for any successful outputs.", new_path.display()));
@@ -1257,6 +1302,7 @@ fn bundle_root(request: &JobRequest) -> Option<PathBuf> {
 }
 
 fn plan_job(state: &AppState, request: &JobRequest) -> Result<JobPreview, String> {
+    crate::emergency::ensure_unlocked(state)?;
     if !matches!(request.operation.as_str(), "encrypt" | "decrypt" | "verify") {
         return Err("Unknown operation.".into());
     }
@@ -1482,7 +1528,7 @@ fn zip_outcomes(
     let mut all_ok = true;
     let mut protected = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
-        let result = if state.cancelled.load(Ordering::Acquire) {
+        let result = if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire) {
             Err(CryptoError::Io(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "Not processed: job cancelled",
@@ -1578,6 +1624,7 @@ fn execute_job(
     request: JobRequest,
     preview: JobPreview,
 ) -> Result<Vec<FileOutcome>, String> {
+    crate::emergency::ensure_unlocked(state)?;
     let key = lock(&state.key).clone().ok_or("Load a key first.")?;
     let output_dir = output_directory(&request.output_dir)?;
     store_output_dir(app, state, output_dir.clone());
@@ -1609,7 +1656,7 @@ fn execute_job(
         }
     };
     let progress = |bytes: u64| -> io::Result<()> {
-        if state.cancelled.load(Ordering::Acquire) {
+        if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire) {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"));
         }
         processed.fetch_add(bytes, Ordering::Relaxed);
@@ -1659,7 +1706,7 @@ fn execute_job(
         return Ok(outcomes);
     }
     for path in request.paths {
-        if state.cancelled.load(Ordering::Acquire) {
+        if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire) {
             break;
         }
         let input = PathBuf::from(&path);
@@ -1740,7 +1787,7 @@ fn execute_job(
             preview_index += 1;
         }
     }
-    if state.cancelled.load(Ordering::Acquire) {
+    if state.cancelled.load(Ordering::Acquire) || state.emergency_locked.load(Ordering::Acquire) {
         for item in preview.items.iter().skip(preview_index) {
             outcomes.push(FileOutcome {
                 deletion: None,
@@ -1762,17 +1809,18 @@ fn finish_load(
     path: PathBuf,
     passphrase: Option<&str>,
 ) -> Result<AppStatus, String> {
+    crate::emergency::ensure_unlocked(state)?;
     let bytes = key_file::read_key_snapshot(&path).map_err(|err| err.to_string())?;
     let key =
         key_file::parse_key_snapshot(&path, &bytes, passphrase).map_err(|err| err.to_string())?;
     use sha2::Digest;
     let hash = sha2::Sha256::digest(bytes.as_slice()).into();
-    let extra = remember_key(app, state, path, key, Some(hash));
+    let extra = remember_key(app, state, path, key, Some(hash))?;
     set_message(state, format!("Key loaded.{extra}"));
     Ok(status(state))
 }
 
-fn status(state: &AppState) -> AppStatus {
+pub(crate) fn status(state: &AppState) -> AppStatus {
     let _key_change = lock(&state.key_change);
     let (key_loaded, fingerprint) = {
         let key = lock(&state.key);
@@ -1788,8 +1836,16 @@ fn status(state: &AppState) -> AppStatus {
     let output_dir = lock(&state.output_dir)
         .as_ref()
         .map(|path| path.display().to_string());
-    let message = lock(&state.message).clone();
+    let emergency_locked = state.emergency_locked.load(Ordering::Acquire);
+    let message = if emergency_locked { crate::emergency::UNAVAILABLE.into() } else { lock(&state.message).clone() };
+    let emergency = lock(&state.emergency);
+    let emergency_deletion_path = emergency.armed_path();
     AppStatus {
+        emergency_locked,
+        emergency_deletion_armed: emergency_deletion_path.is_some(),
+        emergency_deletion_path,
+        emergency_deletion_message: emergency.report.clone(),
+        emergency_shortcuts_native: cfg!(windows),
         key_revision: state.key_revision.load(Ordering::Acquire),
         key_loaded,
         key_path,
@@ -1797,7 +1853,7 @@ fn status(state: &AppState) -> AppStatus {
         output_dir,
         fingerprint,
         message,
-        startup_key_unavailable: state.startup_key_unavailable.load(Ordering::Acquire),
+        startup_key_unavailable: emergency_locked || state.startup_key_unavailable.load(Ordering::Acquire),
         updates_configured: updater_key().is_ok(),
     }
 }
@@ -1829,8 +1885,10 @@ fn remember_key(
     path: PathBuf,
     key: Zeroizing<[u8; 32]>,
     file_hash: Option<[u8; 32]>,
-) -> String {
+) -> Result<String, String> {
     let _key_change = lock(&state.key_change);
+    crate::emergency::ensure_unlocked(state)?;
+    lock(&state.emergency).disarm();
     crate::sandbox::revoke(state);
     *lock(&state.key) = Some(key);
     *lock(&state.key_path) = Some(path.clone());
@@ -1844,12 +1902,19 @@ fn remember_key(
     } else {
         ""
     };
-    match write_settings(app, state) {
+    Ok(match write_settings(app, state) {
         Ok(()) => sandbox_note.into(),
         Err(err) => {
             format!(" The path could not be remembered for next launch: {err}{sandbox_note}")
         }
-    }
+    })
+}
+
+// Caller holds key_change and has successfully removed the persistent lock.
+pub(crate) fn finish_emergency_unlock(state: &AppState) {
+    state.startup_key_unavailable.store(false, Ordering::Release);
+    state.key_revision.fetch_add(1, Ordering::AcqRel);
+    set_message(state, if lock(&state.key).is_some() { "Key loaded." } else { "Choose a key to get started." });
 }
 
 fn resolve_save_path(app: &tauri::AppHandle, path: &str) -> Result<Option<PathBuf>, String> {
@@ -1948,6 +2013,48 @@ fn read_settings(app: &tauri::AppHandle) -> Option<Settings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emergency_browse_opens_the_picker_but_rejects_selection_without_changing_keys() {
+        let state = AppState::default();
+        let saved = PathBuf::from("saved.key");
+        *lock(&state.key_path) = Some(saved.clone());
+        state.emergency_locked.store(true, Ordering::Release);
+        let mut picker_opened = false;
+        let result = pick_key_for_load(&state, || {
+            picker_opened = true;
+            Ok(Some(PathBuf::from("a-different-key-that-does-not-exist.key")))
+        });
+        assert!(picker_opened);
+        assert_eq!(result.unwrap_err(), crate::emergency::UNAVAILABLE);
+        assert_eq!(*lock(&state.key_path), Some(saved));
+        assert!(lock(&state.key).is_none());
+        assert!(state.emergency_locked.load(Ordering::Acquire));
+        assert!(pick_key_for_load(&state, || Ok(None)).unwrap().is_none());
+        assert!(state.emergency_locked.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn emergency_lock_rejects_typed_activation_and_delayed_key_snapshots() {
+        let dir = crate::test_support::TestDir::new();
+        let state = AppState::default();
+        let path = dir.0.join("saved.key");
+        key_file::write_key_file(&path, &[42; 32]).unwrap();
+        restore_saved_key_from_path(&state, &path);
+        let check = KeyFileCheck {
+            revision: state.key_revision.load(Ordering::Acquire), path: path.clone(),
+            loaded: false, expected_hash: *lock(&state.key_file_hash),
+        };
+        let snapshot = key_file::read_key_snapshot(&path);
+        state.emergency_locked.store(true, Ordering::Release);
+        deactivate_file_key(&state, true, crate::emergency::UNAVAILABLE.into());
+        assert!(!finish_key_file_check(&state, check, snapshot));
+        assert!(lock(&state.key).is_none());
+        let settings_path = dir.0.join("settings.json");
+        assert_eq!(activate_session_key(&state, Zeroizing::new([9; 32]), &settings_path).unwrap_err(), crate::emergency::UNAVAILABLE);
+        assert!(!settings_path.exists());
+        assert!(lock(&state.key).is_none());
+    }
 
     #[test]
     fn session_key_is_not_saved_or_restored_and_supports_file_jobs() {

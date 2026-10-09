@@ -3,6 +3,7 @@ mod archive_read;
 mod commands;
 mod crypto;
 mod deletion;
+mod emergency;
 mod file_guard;
 mod file_selection;
 mod key_file;
@@ -42,7 +43,9 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            emergency::restore(app.handle(), app.state::<commands::AppState>().inner())?;
             commands::restore_saved_key(app.handle(), app.state::<commands::AppState>().inner());
+            emergency::start_shortcuts(app.handle().clone());
             commands::start_key_monitor(app.handle().clone());
             sandbox::start_monitor(app.handle().clone());
             Ok(())
@@ -50,6 +53,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
             commands::recheck_key_file,
+            emergency::emergency_lock,
+            emergency::emergency_unlock,
+            emergency::arm_emergency_deletion,
             commands::pick_input_files,
             commands::pick_input_folder,
             commands::expand_dropped_paths,
@@ -82,6 +88,8 @@ pub fn run() {
             sandbox::open_sandbox_preview,
             sandbox::sandbox_preview_info,
             sandbox::read_sandbox_preview,
+            sandbox::cancel_sandbox_preview_read,
+            sandbox::navigate_sandbox_preview,
             sandbox::close_sandbox_preview,
         ])
         .build(tauri::generate_context!())

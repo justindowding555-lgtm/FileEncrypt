@@ -8,6 +8,11 @@ const state = {
   selectionBusy: false,
   keyLoaded: false,
   keyDisconnected: false,
+  emergencyLocked: false,
+  emergencyDeletionArmed: false,
+  emergencyDeletionPath: null,
+  emergencyDeletionMessage: "",
+  emergencyShortcutsNative: false,
   keyRevision: 0,
   keyHasFile: false,
   sandboxAvailable: false,
@@ -24,6 +29,7 @@ const $ = (id) => document.getElementById(id);
 const savedSelection = { revision: 0, ready: false, pending: true, restoring: false };
 const fileVerification = { ready: false, generation: 0, running: false, entries: new Map(), badges: new Map() };
 const KEY_DISCONNECTED_GUIDANCE = "Reconnect your key drive to continue.";
+const KEY_READ_ERROR = "Unable to read the saved key.";
 const ROUTINE_KEY_MESSAGES = new Set([
   "Key loaded.",
   "Key loaded from the saved location.",
@@ -61,6 +67,11 @@ function baseName(path) {
 }
 
 function showAlert(message) {
+  if (message.replace(/\s+/g, " ").trim() === KEY_READ_ERROR) {
+    clearAlert();
+    showKeyRecoveryDialog(true);
+    return;
+  }
   const alert = $("startup-key-dialog").open ? $("key-recovery-alert")
     : $("key-dialog").open ? $("key-dialog-alert") : $("alert");
   alert.hidden = false;
@@ -73,6 +84,27 @@ function clearAlert() {
     alert.hidden = true;
     alert.textContent = "";
   }
+}
+
+function updateKeyRecoveryDialog(readError = state.emergencyLocked) {
+  const dialog = $("startup-key-dialog");
+  dialog.classList.toggle("is-read-error", readError);
+  $("key-disconnected-icon").innerHTML = EXPLORER_ICONS[readError ? "disconnected" : "unplug"];
+  $("startup-key-file-icon").innerHTML = EXPLORER_ICONS.needsKey;
+  $("startup-key-heading").textContent = readError ? "Key unavailable" : "Key disconnected";
+  $("startup-key-description").textContent = readError
+    ? "The saved key file could not be opened." : KEY_DISCONNECTED_GUIDANCE;
+  $("startup-key-path").textContent = state.keyPath || "Location unavailable";
+  $("startup-key-path").title = state.keyPath || "";
+  $("startup-key-instructions").hidden = readError;
+}
+
+function showKeyRecoveryDialog(readError = state.emergencyLocked) {
+  $("key-recovery-alert").hidden = true;
+  updateKeyRecoveryDialog(readError);
+  if ($("key-dialog").open) $("key-dialog").close();
+  if (!$("startup-key-dialog").open) $("startup-key-dialog").showModal();
+  $("choose-recovery-key").focus();
 }
 
 function showSpecificKeyView(show) {
@@ -232,21 +264,33 @@ function applyStatus(status, updatePath) {
     state.keyRevision = status.keyRevision;
   }
   const wasDisconnected = state.keyDisconnected;
+  const wasEmergencyLocked = state.emergencyLocked;
+  state.emergencyLocked = Boolean(status.emergencyLocked);
+  state.emergencyDeletionArmed = Boolean(status.emergencyDeletionArmed);
+  state.emergencyDeletionPath = status.emergencyDeletionPath || null;
+  state.emergencyDeletionMessage = status.emergencyDeletionMessage || "";
+  state.emergencyShortcutsNative = Boolean(status.emergencyShortcutsNative);
   if (keyRevisionChanged || (state.keyFingerprint !== null && state.keyFingerprint !== status.fingerprint)) {
     invalidatePreview();
     resetFileVerification();
   }
   state.keyFingerprint = status.fingerprint;
   state.keyPath = status.keyPath || null;
-  state.keyLoaded = Boolean(status.keyLoaded);
-  state.keyDisconnected = !state.keyLoaded && Boolean(status.startupKeyUnavailable);
+  state.keyLoaded = !state.emergencyLocked && Boolean(status.keyLoaded);
+  state.keyDisconnected = !state.keyLoaded && (state.emergencyLocked || Boolean(status.startupKeyUnavailable));
   state.keyHasFile = state.keyLoaded && Boolean(status.keyPath);
   state.sandboxAvailable = state.keyHasFile && Boolean(status.sandboxAvailable);
   for (const path of fileVerification.badges.keys()) updateFileVerification(path);
   if (sandbox.paths.length && (!state.sandboxAvailable || state.keyFingerprint !== sandbox.fingerprint)) {
     lockSandbox(state.keyDisconnected
       ? "Sandbox locked because the key disconnected."
-      : "Sandbox locked because the loaded key changed.", state.keyDisconnected);
+      : "Sandbox locked because the loaded key changed.", state.keyDisconnected && !state.emergencyLocked);
+  }
+  if (state.emergencyLocked) {
+    cancelSandboxRecovery();
+    $("key-text").value = "";
+    $("key-passphrase").value = "";
+    if (!wasEmergencyLocked && $("key-dialog").open) $("key-dialog").close();
   }
   if (sandbox.recovery) {
     if (state.keyLoaded && state.keyFingerprint !== sandbox.recovery.fingerprint) {
@@ -282,26 +326,26 @@ function applyStatus(status, updatePath) {
   if (updatePath && typeof status.outputDir === "string") {
     $("output-dir").value = status.outputDir;
   }
-  $("fingerprint").textContent = status.keyLoaded
+  $("fingerprint").textContent = state.keyLoaded
     ? state.keyHasFile ? "Key loaded" : "Session key"
     : state.keyDisconnected
-      ? "Key disconnected"
+      ? state.emergencyLocked ? "Key unavailable" : "Key disconnected"
       : "No key loaded";
   const fingerprintDetails = state.keyLoaded && status.fingerprint ? `Fingerprint: ${status.fingerprint}` : "";
   $("fingerprint").title = fingerprintDetails;
   $("fingerprint").setAttribute("aria-label", fingerprintDetails
     ? `${$("fingerprint").textContent}. ${fingerprintDetails}` : $("fingerprint").textContent);
   const message = status.message || "";
-  $("key-message").textContent = state.keyDisconnected
-    ? KEY_DISCONNECTED_GUIDANCE
-    : state.keyLoaded
-      ? ROUTINE_KEY_MESSAGES.has(message) ? "" : message
-      : message || "Choose a key to get started.";
-  if (state.keyDisconnected && !wasDisconnected && !$("startup-key-dialog").open) {
-    $("key-recovery-alert").hidden = true;
-    $("startup-key-path").textContent = status.keyPath || "Unknown location";
-    $("startup-key-dialog").showModal();
-    $("choose-recovery-key").focus();
+  $("key-message").textContent = state.emergencyLocked
+    ? KEY_READ_ERROR
+    : state.keyDisconnected
+      ? KEY_DISCONNECTED_GUIDANCE
+      : state.keyLoaded
+        ? ROUTINE_KEY_MESSAGES.has(message) ? "" : message
+        : message || "Choose a key to get started.";
+  updateKeyRecoveryDialog();
+  if (state.keyDisconnected && (!wasDisconnected || state.emergencyLocked && !wasEmergencyLocked) && !$("startup-key-dialog").open) {
+    showKeyRecoveryDialog();
   } else if (!state.keyDisconnected && $("startup-key-dialog").open) {
     $("startup-key-dialog").close();
   }
@@ -402,6 +446,7 @@ function renderControls() {
   $("save-typed").disabled = busy;
   $("use-typed").disabled = busy;
   $("open-key-options").disabled = busy;
+  renderEmergencyControls();
   $("open-specific-key").disabled = busy;
   $("choose-output").disabled = busy;
   $("clear-output").disabled = busy || $("output-dir").value.trim() === "";
@@ -708,6 +753,43 @@ function openKeyOptions() {
   if (!$("key-dialog").open) $("key-dialog").showModal();
   if (sandbox.recovery?.waitingForUnlock) $("key-passphrase").focus();
   else $("close-key-options").focus();
+}
+
+function renderEmergencyControls() {
+  const enabled = $("enable-emergency-deletion");
+  enabled.disabled = !state.emergencyShortcutsNative || state.emergencyDeletionArmed;
+  $("arm-emergency-deletion").disabled = !enabled.checked || !state.emergencyShortcutsNative
+    || !state.keyHasFile || state.busy || state.emergencyLocked || state.emergencyDeletionArmed;
+  $("arm-emergency-deletion").textContent = state.emergencyDeletionArmed ? "Deletion armed" : "Arm key deletion";
+  $("disarm-emergency-deletion").hidden = !state.emergencyDeletionArmed;
+  const path = state.emergencyDeletionPath || state.keyPath;
+  $("emergency-deletion-path").hidden = !path;
+  $("emergency-deletion-path").textContent = path || "";
+  $("emergency-deletion-status").textContent = state.emergencyDeletionMessage
+    || (state.emergencyDeletionArmed ? "Armed for the next reconnection only."
+      : !state.emergencyShortcutsNative ? "Held deletion shortcuts are available on Windows." : "");
+}
+
+let emergencyUnlockPending = false;
+async function unlockEmergency() {
+  if (!state.emergencyLocked || emergencyUnlockPending) return;
+  emergencyUnlockPending = true;
+  try {
+    applyStatus(await invokeWithPassphrase("emergency_unlock"), true);
+    clearAlert();
+  } catch (error) {
+    if ($("startup-key-dialog").open) $("startup-key-dialog").close();
+    openKeyOptions();
+    showAlert(normalizeError(error));
+  } finally { emergencyUnlockPending = false; }
+}
+
+function handleEmergencyShortcut(event) {
+  if (!event.ctrlKey || !event.shiftKey || event.altKey || !["F11", "F12"].includes(event.key)) return;
+  event.preventDefault();
+  if (event.repeat || state.emergencyShortcutsNative) return;
+  if (event.key === "F11") return unlockEmergency();
+  return invoke("emergency_lock").then((status) => applyStatus(status, false)).catch((error) => showAlert(normalizeError(error)));
 }
 
 let keyFileCheck = null;
@@ -1168,6 +1250,7 @@ async function checkSandboxRecovery() {
 }
 
 function maybeResumeSandbox() {
+  if (state.emergencyLocked) return;
   const recovery = sandbox.recovery;
   if (!recovery?.ready || state.busy || state.selectionBusy || !state.sandboxAvailable
       || $("key-dialog").open || $("startup-key-dialog").open) return;
@@ -1254,12 +1337,15 @@ async function openSandbox(options = {}) {
 }
 
 async function init() {
+  document.addEventListener("keydown", handleEmergencyShortcut, true);
   $("current-key-icon").innerHTML = EXPLORER_ICONS.needsKey;
   $("key-disconnected-icon").innerHTML = EXPLORER_ICONS.unplug;
   try {
     await window.__TAURI__?.event?.listen("key-status-changed", ({ payload }) => {
       applyStatus(payload, false);
     });
+    await window.__TAURI__?.event?.listen("emergency-unlock-requested", unlockEmergency);
+    await window.__TAURI__?.event?.listen("emergency-action-failed", ({ payload }) => showAlert(payload));
     await window.__TAURI__?.event?.listen("sandbox-locked", ({ payload }) => {
       if (payload === sandbox.sessionId) lockSandbox();
     });
@@ -1267,6 +1353,9 @@ async function init() {
       if (payload.sessionId !== sandbox.sessionId) return;
       if (payload.locked) lockSandbox();
       else if (payload.itemId === sandbox.openedItemId) sandbox.openedItemId = null;
+    });
+    await window.__TAURI__?.event?.listen("sandbox-preview-navigated", ({ payload }) => {
+      if (payload.sessionId === sandbox.sessionId) sandbox.openedItemId = payload.itemId;
     });
     await window.__TAURI__?.event?.listen("job-progress", ({ payload }) => {
       const { processedBytes, totalBytes, currentFile, fileIndex, fileCount, stage } = payload;
@@ -1284,6 +1373,14 @@ async function init() {
     showAlert(normalizeError(error));
   }
   $("open-key-options").addEventListener("click", openKeyOptions);
+  $("enable-emergency-deletion").addEventListener("change", renderEmergencyControls);
+  $("arm-emergency-deletion").addEventListener("click", () => {
+    if (!$("enable-emergency-deletion").checked || $("arm-emergency-deletion").disabled) return;
+    run(() => invoke("arm_emergency_deletion", { enabled: true }), false);
+  });
+  $("disarm-emergency-deletion").addEventListener("click", () => {
+    run(() => invoke("arm_emergency_deletion", { enabled: false }), false);
+  });
   $("sandbox-key-options").addEventListener("click", openKeyOptions);
   $("close-key-options").addEventListener("click", () => $("key-dialog").close());
   $("startup-key-dialog").addEventListener("cancel", (event) => event.preventDefault());

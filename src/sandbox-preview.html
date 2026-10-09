@@ -8,17 +8,41 @@
     <script src="theme.js"></script>
     <link rel="stylesheet" href="styles.css" />
     <script src="explorer-icons.js"></script>
+    <script src="sandbox-viewer.js"></script>
     <script src="sandbox-content.js"></script>
     <script type="module" src="sandbox-preview.js"></script>
   </head>
   <body class="private-preview">
+    <div id="preview-image-toolbar" class="preview-image-toolbar" hidden>
+      <div class="preview-image-navigation" role="group" aria-label="Image navigation">
+        <button id="preview-previous-image" type="button" aria-label="Previous image" title="Previous image (Left arrow)">&#x2039;</button>
+        <span id="preview-image-position"></span>
+        <button id="preview-next-image" type="button" aria-label="Next image" title="Next image (Right arrow)">&#x203a;</button>
+      </div>
+      <span id="preview-image-name" class="preview-image-name"></span>
+      <div class="preview-image-zoom" role="group" aria-label="Image zoom">
+        <button id="preview-zoom-out" type="button" aria-label="Zoom out" title="Zoom out (-)">&#x2212;</button>
+        <select id="preview-image-zoom" aria-label="Image zoom" title="Pinch to zoom; scroll to pan"></select>
+        <button id="preview-zoom-in" type="button" aria-label="Zoom in" title="Zoom in (+)">+</button>
+      </div>
+    </div>
     <main class="private-preview-content">
       <div id="preview-content" hidden></div>
-      <div id="preview-message" class="private-preview-message" role="status">
-        <span id="preview-message-icon" aria-hidden="true"></span>
-        <h2 id="preview-message-title">Preparing your preview</h2>
-        <p id="preview-message-detail">Authenticating and opening this file in memory.</p>
-        <button type="button" id="retry-private-preview" hidden>Try preview again</button>
+      <div id="preview-message" class="private-preview-message" data-state="loading">
+        <section class="private-preview-card" aria-labelledby="preview-message-title">
+          <div class="private-preview-emblem" aria-hidden="true">
+            <span class="private-preview-orbit"></span>
+            <span id="preview-message-icon">
+              <img class="private-preview-app-icon" src="icon.svg" width="76" height="76" alt="" />
+              <span id="preview-state-icon"></span>
+            </span>
+          </div>
+          <div class="private-preview-copy" role="status" aria-live="polite" aria-atomic="true">
+            <h2 id="preview-message-title">Preparing your file</h2>
+            <p id="preview-message-detail"></p>
+          </div>
+          <button type="button" id="retry-private-preview" hidden>Try preview again</button>
+        </section>
       </div>
     </main>
   </body>

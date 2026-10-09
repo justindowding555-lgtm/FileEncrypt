@@ -28,6 +28,7 @@ pub struct VerificationResult {
 
 fn check(state: &AppState, revision: u64) -> io::Result<()> {
     if state.key_revision.load(Ordering::Acquire) != revision
+        || state.emergency_locked.load(Ordering::Acquire)
         || state.running.load(Ordering::Acquire)
     {
         return Err(io::Error::new(
