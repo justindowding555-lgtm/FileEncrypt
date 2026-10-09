@@ -429,10 +429,10 @@ fn read_controlled(
     if kind == "text" && std::str::from_utf8(&writer.bytes).is_err() {
         return Err("This text file is not UTF-8 and cannot be previewed.".into());
     }
-    let image_pixels = if kind == "image" {
-        image_dimensions(&writer.bytes, mime)?
+    let (mime, image_pixels) = if kind == "image" {
+        image_info(&writer.bytes)?
     } else {
-        0
+        (mime, 0)
     };
     current(state, id)?;
     if let Some((label, target)) = preview {
@@ -455,14 +455,18 @@ fn read_controlled(
     })
 }
 
-fn image_dimensions(bytes: &[u8], mime: &str) -> Result<u64, String> {
-    let format = match mime {
-        "image/png" => image::ImageFormat::Png,
-        "image/jpeg" => image::ImageFormat::Jpeg,
-        "image/gif" => image::ImageFormat::Gif,
-        "image/webp" => image::ImageFormat::WebP,
-        "image/bmp" => image::ImageFormat::Bmp,
-        "image/x-icon" => image::ImageFormat::Ico,
+fn image_info(bytes: &[u8]) -> Result<(&'static str, u64), String> {
+    // Detect only after authentication. An image's extension may not match its
+    // bytes, and both dimension checks and the webview must use the real format.
+    let format = image::guess_format(bytes)
+        .map_err(|_| "This image's format could not be recognized.".to_string())?;
+    let mime = match format {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Gif => "image/gif",
+        image::ImageFormat::WebP => "image/webp",
+        image::ImageFormat::Bmp => "image/bmp",
+        image::ImageFormat::Ico => "image/x-icon",
         _ => return Err("Unsupported image format.".into()),
     };
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
@@ -486,7 +490,7 @@ fn image_dimensions(bytes: &[u8], mime: &str) -> Result<u64, String> {
                 .into(),
         );
     }
-    Ok(pixels)
+    Ok((mime, pixels))
 }
 
 fn reserve_preview_memory(
@@ -951,15 +955,44 @@ mod tests {
     #[test]
     fn image_dimensions_are_checked_before_exporting_to_the_webview() {
         let bytes = png_bytes(12, 8);
-        assert_eq!(image_dimensions(&bytes, "image/png").unwrap(), 96);
-        assert!(image_dimensions(b"damaged image", "image/png").is_err());
+        assert_eq!(image_info(&bytes).unwrap(), ("image/png", 96));
+        assert!(image_info(b"damaged image").is_err());
+        // A recognized signature must still belong to a supported format.
+        assert!(image_info(b"II\x2a\x00\x08\x00\x00\x00").is_err());
+        assert!(image_info(b"\xff\xd8\xff").is_err());
         for (width, height) in [(20_000u32, 1u32), (10_000, 10_000)] {
             let mut oversized = bytes.clone();
             oversized[16..20].copy_from_slice(&width.to_be_bytes());
             oversized[20..24].copy_from_slice(&height.to_be_bytes());
             let crc = crc32fast::hash(&oversized[12..29]);
             oversized[29..33].copy_from_slice(&crc.to_be_bytes());
-            assert!(image_dimensions(&oversized, "image/png").is_err());
+            assert!(image_info(&oversized).is_err());
+        }
+    }
+
+    #[test]
+    fn image_preview_uses_content_format_when_the_extension_is_wrong() {
+        let mut output = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(12, 8)
+            .write_to(&mut output, image::ImageFormat::Jpeg)
+            .unwrap();
+        let jpeg = output.into_inner();
+        assert_eq!(image_info(&jpeg).unwrap(), ("image/jpeg", 96));
+        for (name, bytes, mime) in [
+            ("IMG_4753.PNG", jpeg, "image/jpeg"),
+            ("renamed.jpg", png_bytes(12, 8), "image/png"),
+        ] {
+            let (dir, state, _, key) = fixture();
+            let path = encrypted(&dir, name, &bytes, &key);
+            let before = files(&dir);
+            let catalog = open(&state, vec![path]).unwrap();
+            assert_eq!(catalog.items[0].kind, "image");
+            assert_eq!(catalog.items[0].name, name);
+            let content = read(&state, &catalog.session_id, 0).unwrap();
+            assert_eq!(content.kind, "image");
+            assert_eq!(content.mime, mime);
+            assert_eq!(STANDARD.decode(&content.data).unwrap(), bytes);
+            assert_eq!(files(&dir), before);
         }
     }
 
