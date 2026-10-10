@@ -131,6 +131,8 @@ Before the first public update, generate an updater signing key **outside this r
 
 The script prompts for the signing key password without putting it in the command line, supplies the public key to the compiled app, enables signed updater artifacts, and builds NSIS. Increment the matching versions in `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` before building. Then create `latest.json` from the generated installer and `.sig`:
 
+On the release computer, the replacement signing key is stored outside Git at `%LOCALAPPDATA%\FileEncrypt\updater\signing.key`. Its password is saved beside it as `signing.key.password.dpapi`, encrypted for the current Windows user. The release script loads that password automatically when using this key. This password file works only with the original Windows account on this computer; a portable backup must include the encrypted private key and its password in a password manager or another secure location. Installations signed with the older key need a manual upgrade to 0.1.1 once.
+
 ```powershell
 .\scripts\create-update-manifest.ps1 -Version 0.2.0 -InstallerPath <path-to-setup.exe>
 ```

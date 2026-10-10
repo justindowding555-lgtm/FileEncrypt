@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$PrivateKeyPath,
-    [Parameter(Mandatory = $true)][string]$PublicKeyPath
+    [Parameter(Mandatory = $true)][string]$PublicKeyPath,
+    [string]$PasswordFilePath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,7 +33,14 @@ $env:FILEENCRYPT_UPDATER_PUBKEY = $public
 Push-Location $projectRoot
 try {
     if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
-        $protected = Read-Host 'Enter the updater signing key password' -AsSecureString
+        if (-not $PasswordFilePath -and (Test-Path -LiteralPath "$private.password.dpapi" -PathType Leaf)) {
+            $PasswordFilePath = "$private.password.dpapi"
+        }
+        $protected = if ($PasswordFilePath) {
+            Get-Content -LiteralPath $PasswordFilePath -Raw | ConvertTo-SecureString
+        } else {
+            Read-Host 'Enter the updater signing key password' -AsSecureString
+        }
         $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($protected)
         try {
             $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
