@@ -4,6 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.fileencrypt.desktop",
   "build": {
+    "beforeDevCommand": "node scripts/build-csp.mjs --watch",
+    "beforeBuildCommand": "node scripts/build-csp.mjs",
     "frontendDist": "../src"
   },
   "app": {
@@ -19,7 +21,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; media-src data:; frame-src 'self'; object-src 'none'; base-uri 'self'; style-src 'self' 'sha256-WoisBQe0FAesjdVAjzZrTC4cTxcvlcXlPzCdXwxtD1k='; script-src 'self' 'sha256-Bt0FPLgbpL9zAITJCQO7E2fWsyPp4YUgOzcHFM9wlb8='"
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; media-src data:; frame-src 'self'; object-src 'none'; base-uri 'self'; style-src 'self'; script-src 'self'"
     }
   },
   "plugins": {

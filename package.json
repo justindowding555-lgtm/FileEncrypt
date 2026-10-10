@@ -4,6 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "csp": "node scripts/build-csp.mjs",
+    "pretest": "npm run csp",
     "lint": "node scripts/lint.mjs",
     "icons": "node scripts/explorer-icons.mjs",
     "tauri": "node scripts/tauri.mjs",

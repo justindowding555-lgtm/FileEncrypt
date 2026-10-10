@@ -1,5 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { buildSandboxCsp } from "./build-csp.mjs";
+
+// Generate before the CLI reads its configuration (hooks run after that read).
+if (["dev", "build", "bundle"].includes(process.argv[2])) buildSandboxCsp();
 
 const cli = fileURLToPath(new URL("../node_modules/@tauri-apps/cli/tauri.js", import.meta.url));
 const args = [cli, ...process.argv.slice(2)];

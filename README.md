@@ -11,6 +11,8 @@ npm install
 npm run tauri dev
 ```
 
+Sandbox CSS and script SHA-256 hashes are generated automatically before these Tauri commands and refreshed when their source changes during development. The generated `src/sandbox-hashes.generated.js` and `src-tauri/tauri.{windows,linux,macos}.conf.json` files are Git-ignored, so hash changes never modify tracked configuration. Those platform configurations are reserved for generated CSP; keep shared settings in `tauri.conf.json` and release settings in `tauri.release.conf.json`. Use `npm run tauri` for development/builds so hashes exist before Tauri reads its configuration. `npm test` also generates them; `npm run csp` regenerates them on demand.
+
 Windows needs the WebView2 runtime, which is already present on Windows 11, and the Visual Studio C++ build tools. The Tauri command initializes the installed MSVC compiler when clang-cl is unavailable. This setup is local to the command process.
 
 Building requires Rust 1.98 or newer. Sandbox identifiers use the standard library's buffered integer formatting API introduced in 1.98; Rust 1.99 is supported.

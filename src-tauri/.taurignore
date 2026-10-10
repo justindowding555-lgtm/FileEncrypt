@@ -1,0 +1,4 @@
+# Watch generated CSP configs even though Git ignores them.
+!tauri.windows.conf.json
+!tauri.linux.conf.json
+!tauri.macos.conf.json

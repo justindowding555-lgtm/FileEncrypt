@@ -43,7 +43,7 @@ function fixture(invoke, script = "main", automaticVerification = false, automat
     setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
   });
-  for (const file of ["explorer-icons.js", "sandbox-viewer.js", "sandbox-content.js", `${script}.js`]) {
+  for (const file of ["explorer-icons.js", "sandbox-viewer.js", "sandbox-hashes.generated.js", "sandbox-content.js", `${script}.js`]) {
     vm.runInContext(fs.readFileSync(new URL(`../src/${file}`, import.meta.url), "utf8"), context);
   }
   return { context, refs, timers, events, count: () => created, evaluate: (code) => vm.runInContext(code, context),
@@ -1285,7 +1285,7 @@ test("sandbox preview allows only the exact style and trusted script hashes", ()
   const ui = fixture();
   const hash = "sha256-" + createHash("sha256").update(ui.evaluate("SANDBOX_STYLE")).digest("base64");
   assert.equal(ui.evaluate("SANDBOX_STYLE_HASH"), hash);
-  const config = JSON.parse(fs.readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+  const config = JSON.parse(fs.readFileSync(new URL("../src-tauri/tauri.windows.conf.json", import.meta.url), "utf8"));
   assert.ok(config.app.security.csp.includes(`'${hash}'`));
   const scriptHash = "sha256-" + createHash("sha256").update(ui.evaluate("SANDBOX_VIEWER_SCRIPT")).digest("base64");
   assert.equal(ui.evaluate("SANDBOX_VIEWER_SCRIPT_HASH"), scriptHash);
@@ -1302,6 +1302,77 @@ test("media stays inside the isolated document and active image formats are refu
   assert.equal(ui.context.content.data, "");
   ui.context.content = { kind: "image", mime: "image/svg+xml", data: "cHJpdmF0ZQ==" };
   assert.throws(() => ui.evaluate("sandboxDocument(content)"), /Unsupported preview format/);
+});
+
+test("audio preview uses a private player and keeps the file inside the frame", () => {
+  const ui = fixture();
+  ui.context.content = { kind: "audio", mime: "audio/mpeg", data: "cHJpdmF0ZQ==" };
+  const frame = ui.evaluate('createSandboxFrame(content, "C:/Music/demo & live.mp3")');
+  assert.equal(frame.attributes.get("sandbox"), "allow-scripts");
+  assert.match(frame.srcdoc, /<body data-kind="audio">/);
+  assert.match(frame.srcdoc, /<main class="player"/);
+  assert.match(frame.srcdoc, /<audio id="preview-media" src="data:audio\/mpeg;base64,cHJpdmF0ZQ=="/);
+  assert.doesNotMatch(frame.srcdoc, /<audio[^>]*\scontrols\b/);
+  assert.match(frame.srcdoc, />demo &amp; live\.mp3</);
+  assert.doesNotMatch(frame.srcdoc, /Music\/demo|controls controlslist|\son\w+=|allow-same-origin|unsafe-inline/);
+  assert.equal((frame.srcdoc.match(/data:audio\/mpeg;base64,/g) || []).length, 1);
+  assert.equal((frame.srcdoc.match(/<rect x="\d+" y="56" width="4" height="0"/g) || []).length, 56);
+  assert.equal(ui.context.content.data, "");
+  ui.context.content = { kind: "audio", mime: "audio/wav", data: "cHJpdmF0ZQ==" };
+  const hostile = ui.evaluate('sandboxDocument(content, "<img src=x onerror=alert(1)>")');
+  assert.match(hostile, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.doesNotMatch(hostile, /<img src=x/);
+  ui.context.content = { kind: "video", mime: "video/mp4", data: "cHJpdmF0ZQ==" };
+  assert.match(ui.evaluate("sandboxDocument(content)"), /<video[^>]* controls /);
+});
+
+test("audio player seeks, changes volume, and toggles playback from its controls", () => {
+  const viewer = viewerFixture("audio");
+  const play = viewer.elements.get("player-play");
+  const seek = viewer.elements.get("player-seek");
+  const rate = viewer.elements.get("player-rate");
+  const volume = viewer.elements.get("player-volume");
+  const player = viewer.elements.get("player");
+  assert.equal(viewer.elements.get("player-duration").textContent, "3:00");
+  assert.equal(viewer.elements.get("player-buffer").style.width, "25%");
+  assert.equal(viewer.stageHandlers.has("gesturestart"), false);
+  play.handlers.get("click")();
+  assert.equal(viewer.media.paused, false);
+  assert.equal(play.attributes["aria-label"], "Pause");
+  assert.equal(player.classList.classes.has("is-playing"), true);
+  viewer.elements.get("player-forward").handlers.get("click")();
+  assert.equal(viewer.media.currentTime, 10);
+  viewer.elements.get("player-back").handlers.get("click")();
+  assert.equal(viewer.media.currentTime, 0);
+  seek.value = "500";
+  seek.handlers.get("input")();
+  assert.equal(viewer.media.currentTime, 90);
+  assert.equal(viewer.elements.get("player-current").textContent, "1:30");
+  volume.value = "40";
+  volume.handlers.get("input")();
+  assert.equal(viewer.media.volume, 0.4);
+  viewer.elements.get("player-mute").handlers.get("click")();
+  assert.equal(viewer.media.muted, true);
+  assert.equal("hidden" in viewer.elements.get("player-volume-on").attributes, true);
+  rate.handlers.get("click")();
+  assert.equal(viewer.media.playbackRate, 1.25);
+  assert.equal(rate.textContent, "1.25×");
+  let prevented = 0;
+  const key = (value, target) => viewer.handlers.get("keydown")({ key: value, target, preventDefault() { prevented++; } });
+  key("ArrowRight");
+  assert.equal(viewer.media.currentTime, 95);
+  key(" ", { tagName: "BUTTON" });
+  assert.equal(viewer.media.paused, false);
+  key(" ");
+  assert.equal(viewer.media.paused, true);
+  key("ArrowLeft", { tagName: "INPUT" });
+  assert.equal(viewer.media.currentTime, 95);
+  assert.equal(prevented, 2);
+  viewer.media.ended = true;
+  viewer.media.paused = true;
+  play.handlers.get("click")();
+  assert.equal(viewer.media.currentTime, 0);
+  assert.equal(viewer.media.paused, false);
 });
 
 test("image viewer uses the trusted gesture script without same-origin or network access", () => {
@@ -1341,27 +1412,246 @@ test("key loss discards the entire image viewer including its zoom controls", as
   assert.equal(ui.timers.size, 0);
 });
 
-function viewerFixture(kind = "image") {
-  const sent = [], handlers = new Map(), mediaHandlers = new Map(), stageHandlers = new Map();
+function viewerControl() {
+  const handlers = new Map();
+  return {
+    classList: { classes: new Set(), toggle(name, on) { this.classes[on ? "add" : "delete"](name); }, add(name) { this.classes.add(name); }, remove(name) { this.classes.delete(name); } },
+    style: {}, hidden: false, disabled: false, textContent: "", value: "0", attributes: {}, handlers,
+    setAttribute(name, value) { this.attributes[name] = value; },
+    toggleAttribute(name, force) { if (force) this.attributes[name] = ""; else delete this.attributes[name]; },
+    addEventListener(name, action) { handlers.set(name, action); },
+  };
+}
+
+function viewerFixture(kind = "image", environment = {}) {
+  const sent = [], handlers = new Map(), mediaHandlers = new Map(), stageHandlers = new Map(), elements = new Map();
   const parent = { postMessage(data) { sent.push(data); } };
   const stage = { clientWidth: 640, clientHeight: 480, scrollLeft: 0, scrollTop: 0,
     addEventListener(name, action, options) { stageHandlers.set(name, { action, options }); },
     getBoundingClientRect() { return { left: 0, top: 0 }; },
   };
-  const media = { naturalWidth: 800, naturalHeight: 400, complete: true, readyState: 1, style: {},
+  const media = { naturalWidth: 800, naturalHeight: 400, complete: true, readyState: kind === "audio" ? 4 : 1, style: {},
+    paused: true, ended: false, currentTime: 0, duration: 180, volume: 1, muted: false, playbackRate: 1,
+    buffered: { length: 1, end() { return 45; } },
+    play() { this.paused = false; this.ended = false; return Promise.resolve(); },
+    pause() { this.paused = true; },
     addEventListener(name, action) { mediaHandlers.set(name, action); },
     getBoundingClientRect() { return { left: 24 - stage.scrollLeft, top: 24 - stage.scrollTop }; },
   };
-  const context = vm.createContext({ parent, window: { addEventListener(name, action) { handlers.set(name, action); } },
-    document: { body: { dataset: { kind } }, getElementById(id) { return id === "preview-media" ? media : stage; },
-      addEventListener(name, action) { handlers.set(name, action); } },
+  const context = vm.createContext({ parent, window: { addEventListener(name, action) { handlers.set(name, action); }, ...environment.window },
+    document: { body: { dataset: { kind } }, getElementById(id) {
+      if (id === "preview-media") return media;
+      if (id === "preview-stage") return stage;
+      if (!elements.has(id)) {
+        const control = viewerControl();
+        if (id === "player-wave") control.children = environment.bars || [];
+        elements.set(id, control);
+      }
+      return elements.get(id);
+    }, addEventListener(name, action) { handlers.set(name, action); } },
     ResizeObserver: class { observe() {} },
   });
   const source = fs.readFileSync(new URL("../src/sandbox-viewer.js", import.meta.url), "utf8");
   const script = vm.runInNewContext(source + "; SANDBOX_VIEWER_SCRIPT");
   vm.runInContext(script, context);
-  return { sent, parent, handlers, media, mediaHandlers, stageHandlers };
+  return { sent, parent, handlers, media, mediaHandlers, stageHandlers, elements, context };
 }
+
+function audioVisualizerFixture(reducedMotion = false) {
+  const frames = new Map(), connections = [], motion = { matches: reducedMotion, addEventListener(name, action) { this.changed = action; } };
+  const bars = Array.from({ length: 56 }, (_, index) => {
+    const bar = viewerControl();
+    bar.attributes.x = String(index * 6 + 1);
+    return bar;
+  });
+  let nextFrame = 0, contexts = 0, closed = false, disconnected = false, signal = 0, lastSignal = 0;
+  const analyser = { fftSize: 4096, frequencyBinCount: 2048,
+    getByteFrequencyData(data) { data.fill(0); data[5] = signal; data[1000] = lastSignal; },
+    disconnect() { disconnected = true; },
+  };
+  const viewer = viewerFixture("audio", { bars, window: {
+    matchMedia() { return motion; },
+    requestAnimationFrame(callback) { frames.set(++nextFrame, callback); return nextFrame; },
+    cancelAnimationFrame(id) { frames.delete(id); },
+    AudioContext: class {
+      constructor() { contexts++; this.state = "running"; this.sampleRate = 44100; this.destination = {}; }
+      createAnalyser() { return analyser; }
+      createMediaElementSource(media) { assert.equal(media, viewer.media); return { connect(node) { connections.push(node); }, disconnect() { disconnected = true; } }; }
+      close() { closed = true; return Promise.resolve(); }
+    },
+  } });
+  return { ...viewer, bars, frames, connections, motion,
+    contexts: () => contexts, closed: () => closed, disconnected: () => disconnected,
+    signal(value, last = 0) { signal = value; lastSignal = last; },
+    tick() { const [id, callback] = frames.entries().next().value; frames.delete(id); callback(); },
+  };
+}
+
+test("audio visualizer pulses stationary frequency bars without mirroring and is zero when inactive", () => {
+  const viewer = audioVisualizerFixture();
+  const play = viewer.elements.get("player-play");
+  assert.equal(viewer.contexts(), 0, "opening a preview must not start the audio engine");
+  assert.ok(viewer.bars.every((bar) => Number(bar.attributes.height) === 0));
+  play.handlers.get("click")();
+  assert.equal(viewer.contexts(), 1);
+  assert.equal(viewer.connections.length, 2, "playback and analysis have separate connections");
+  viewer.tick();
+  assert.ok(viewer.bars.every((bar) => Number(bar.attributes.height) === 0), "silence must not produce artificial pulses");
+  viewer.signal(255);
+  for (let index = 0; index < 12; index++) viewer.tick();
+  const lowBars = viewer.bars.map((bar, index) => Number(bar.attributes.height) > 0 ? index : -1).filter((index) => index >= 0);
+  assert.equal(lowBars.length, 1, "a frequency must feed one distinct bar");
+  assert.ok(lowBars[0] < 28, "bass stays on the left");
+  assert.ok(Number(viewer.bars[lowBars[0]].attributes.height) > 30);
+  assert.equal(Number(viewer.bars[55 - lowBars[0]].attributes.height), 0, "the opposite half must not reflect the signal");
+  assert.ok(viewer.bars.every((bar, index) => bar.attributes.x === String(index * 6 + 1)), "bars never travel sideways");
+  assert.ok(viewer.bars.every((bar) => Math.abs(Number(bar.attributes.y) + Number(bar.attributes.height) / 2 - 56) < 0.02));
+  viewer.signal(0, 255);
+  for (let index = 0; index < 40; index++) viewer.tick();
+  const highBars = viewer.bars.map((bar, index) => Number(bar.attributes.height) > 0 ? index : -1).filter((index) => index >= 0);
+  assert.equal(highBars.length, 1);
+  assert.ok(highBars[0] >= 28, "treble stays on the right");
+  viewer.signal(0);
+  for (let index = 0; index < 40; index++) viewer.tick();
+  assert.ok(viewer.bars.every((bar) => Number(bar.attributes.height) === 0));
+  viewer.signal(255, 64);
+  viewer.tick();
+  viewer.elements.get("player-mute").handlers.get("click")();
+  assert.equal(viewer.frames.size, 0);
+  assert.ok(viewer.bars.every((bar) => Number(bar.attributes.height) === 0));
+  assert.equal(viewer.elements.get("player-state").textContent, "Muted");
+  viewer.elements.get("player-mute").handlers.get("click")();
+  viewer.tick();
+  assert.ok(viewer.bars.some((bar) => Number(bar.attributes.height) > 0));
+  play.handlers.get("click")();
+  assert.equal(viewer.frames.size, 0);
+  assert.ok(viewer.bars.every((bar) => Number(bar.attributes.height) === 0));
+  play.handlers.get("click")();
+  assert.equal(viewer.contexts(), 1, "resuming must reuse the media source");
+  assert.equal(viewer.frames.size, 1);
+});
+
+test("audio play, pause, replay, and mute icons change their actual SVG attributes", () => {
+  const viewer = viewerFixture("audio");
+  const play = viewer.elements.get("player-play");
+  const playIcon = viewer.elements.get("player-play-icon");
+  const pauseIcon = viewer.elements.get("player-pause-icon");
+  const label = viewer.elements.get("player-play-label");
+  assert.equal("hidden" in playIcon.attributes, false);
+  assert.equal("hidden" in pauseIcon.attributes, true);
+  assert.equal(label.textContent, "Play");
+  play.handlers.get("click")();
+  assert.equal("hidden" in playIcon.attributes, true);
+  assert.equal("hidden" in pauseIcon.attributes, false);
+  assert.equal(label.textContent, "Pause");
+  assert.equal(play.attributes.title, "Pause (Space)");
+  viewer.elements.get("player-mute").handlers.get("click")();
+  assert.equal("hidden" in viewer.elements.get("player-volume-on").attributes, true);
+  assert.equal("hidden" in viewer.elements.get("player-volume-off").attributes, false);
+  assert.equal(viewer.elements.get("player-mute").attributes.title, "Unmute (M)");
+  play.handlers.get("click")();
+  assert.equal(label.textContent, "Play");
+  assert.equal(viewer.elements.get("player-state").textContent, "Paused");
+  viewer.media.ended = true;
+  viewer.mediaHandlers.get("ended")();
+  assert.equal(label.textContent, "Replay");
+  assert.equal("hidden" in pauseIcon.attributes, true);
+});
+
+test("audio buffering and seeking stop the waveform until playback resumes", () => {
+  const viewer = audioVisualizerFixture();
+  viewer.elements.get("player-play").handlers.get("click")();
+  viewer.signal(255);
+  viewer.tick();
+  viewer.mediaHandlers.get("waiting")();
+  assert.equal(viewer.elements.get("player-state").textContent, "Buffering…");
+  assert.equal(viewer.elements.get("player-play-label").textContent, "Pause", "buffering playback must still be cancellable");
+  assert.equal(viewer.frames.size, 0);
+  assert.ok(viewer.bars.every((bar) => Number(bar.attributes.height) === 0));
+  viewer.mediaHandlers.get("timeupdate")();
+  assert.equal(viewer.frames.size, 0);
+  viewer.mediaHandlers.get("playing")();
+  assert.equal(viewer.frames.size, 1);
+  viewer.tick();
+  viewer.media.seeking = true;
+  viewer.mediaHandlers.get("seeking")();
+  assert.equal(viewer.frames.size, 0);
+  assert.ok(viewer.bars.every((bar) => Number(bar.attributes.height) === 0));
+  viewer.media.seeking = false;
+  viewer.mediaHandlers.get("seeked")();
+  assert.equal(viewer.frames.size, 1);
+  viewer.media.ended = true;
+  viewer.mediaHandlers.get("ended")();
+  assert.equal(viewer.frames.size, 0);
+  assert.ok(viewer.bars.every((bar) => Number(bar.attributes.height) === 0));
+});
+
+test("cancelled seek gestures release scrubbing and skip controls reflect timeline boundaries", () => {
+  const viewer = viewerFixture("audio");
+  const seek = viewer.elements.get("player-seek");
+  const back = viewer.elements.get("player-back");
+  const forward = viewer.elements.get("player-forward");
+  assert.equal(back.disabled, true);
+  assert.equal(forward.disabled, false);
+  seek.handlers.get("pointerdown")();
+  seek.value = "500";
+  seek.handlers.get("input")();
+  seek.handlers.get("pointercancel")();
+  viewer.media.currentTime = 100;
+  viewer.mediaHandlers.get("timeupdate")();
+  assert.equal(viewer.elements.get("player-current").textContent, "1:40");
+  assert.equal(back.disabled, false);
+  viewer.media.currentTime = 180;
+  viewer.mediaHandlers.get("timeupdate")();
+  assert.equal(forward.disabled, true);
+});
+
+test("rejected playback restores the play control and clears the waveform", async () => {
+  const viewer = audioVisualizerFixture();
+  viewer.media.play = function () { this.paused = false; return Promise.reject(new Error("Playback denied")); };
+  viewer.elements.get("player-play").handlers.get("click")();
+  await settle();
+  assert.equal(viewer.media.paused, true);
+  assert.equal(viewer.elements.get("player-play-label").textContent, "Play");
+  assert.equal(viewer.elements.get("player-state").textContent, "Could not start playback. Try again.");
+  assert.equal(viewer.frames.size, 0);
+  assert.ok(viewer.bars.every((bar) => Number(bar.attributes.height) === 0));
+});
+
+test("audio visualizer respects reduced motion, stops when hidden, and releases resources on close", () => {
+  const viewer = audioVisualizerFixture(true);
+  viewer.elements.get("player-play").handlers.get("click")();
+  assert.equal(viewer.media.paused, false);
+  assert.equal(viewer.contexts(), 0);
+  assert.equal(viewer.frames.size, 0);
+  viewer.motion.matches = false;
+  viewer.motion.changed();
+  assert.equal(viewer.frames.size, 1);
+  viewer.context.document.hidden = true;
+  viewer.handlers.get("visibilitychange")();
+  assert.equal(viewer.frames.size, 0);
+  assert.equal(viewer.media.paused, false);
+  viewer.context.document.hidden = false;
+  viewer.handlers.get("visibilitychange")();
+  assert.equal(viewer.frames.size, 1);
+  viewer.handlers.get("pagehide")();
+  assert.equal(viewer.frames.size, 0);
+  assert.equal(viewer.media.paused, true);
+  assert.equal(viewer.closed(), true);
+  assert.equal(viewer.disconnected(), true);
+  viewer.motion.changed();
+  assert.equal(viewer.frames.size, 0);
+});
+
+test("audio preview uses the selected app theme without adding unchecked attributes", () => {
+  const ui = fixture();
+  ui.context.document.documentElement = { dataset: { theme: "dark" } };
+  ui.context.content = { kind: "audio", mime: "audio/wav", data: "cHJpdmF0ZQ==" };
+  assert.match(ui.evaluate("sandboxDocument(content)"), /<html data-theme="dark">/);
+  ui.context.document.documentElement.dataset.theme = 'dark" onload="alert(1)';
+  ui.context.content = { kind: "audio", mime: "audio/wav", data: "cHJpdmF0ZQ==" };
+  assert.doesNotMatch(ui.evaluate("sandboxDocument(content)"), /onload=|<html data-theme=/);
+});
 
 test("pinch zoom changes image scale, clamps extreme gestures, and preserves normal scrolling", () => {
   const viewer = viewerFixture();

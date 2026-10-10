@@ -16,6 +16,12 @@ fuzz/coverage
 fuzz/target
 *.local
 
+# Sandbox CSP hashes are regenerated before dev/build and frontend tests.
+src/sandbox-hashes.generated.js
+src-tauri/tauri.windows.conf.json
+src-tauri/tauri.linux.conf.json
+src-tauri/tauri.macos.conf.json
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
