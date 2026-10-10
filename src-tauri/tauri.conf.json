@@ -6,7 +6,10 @@
   "build": {
     "beforeDevCommand": "node scripts/build-csp.mjs --watch",
     "beforeBuildCommand": "node scripts/build-csp.mjs",
-    "frontendDist": "../src"
+    "frontendDist": "../src",
+    "windows": {
+      "staticVCRuntime": true
+    }
   },
   "app": {
     "withGlobalTauri": true,
