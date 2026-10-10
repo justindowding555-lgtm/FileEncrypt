@@ -43,8 +43,13 @@
 
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-/* Keep the workspace centered at the same width when modal scroll locking changes. */
-html:has(.app) { scrollbar-gutter: stable both-edges; }
+/* Reserve scrollbar space inside the page so modal backdrops cover the viewport. */
+html:has(.app) { overflow: hidden; }
+body:has(.app) {
+  height: 100dvh;
+  overflow: auto;
+  scrollbar-gutter: stable both-edges;
+}
 html:has(.key-dialog[open]),
 body:has(.key-dialog[open]) { overflow: hidden; }
 body {

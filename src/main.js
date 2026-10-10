@@ -229,6 +229,7 @@ async function startAutomaticVerification() {
     }
   } finally {
     fileVerification.running = false;
+    renderControls();
     if (generation !== fileVerification.generation || !paused) startAutomaticVerification();
   }
 }
@@ -455,6 +456,22 @@ function selectionBlocked() {
   return emergencyUnlockPending || state.accessSetupRequired || state.selectionBusy || (state.busy && state.keyLoaded);
 }
 
+function selectionActionHint() {
+  const counts = { plain: 0, verified: 0, pending: 0, failed: 0 };
+  for (const path of state.files) {
+    const status = /\.(fenc|zip)$/i.test(path)
+      ? fileVerification.entries.get(path)?.state : "plain";
+    counts[status === "plain" || status === "verified" || status === "failed" ? status : "pending"]++;
+  }
+  const files = (count) => `${count} ${count === 1 ? "file" : "files"}`;
+  const parts = [];
+  if (counts.plain) parts.push(`${files(counts.plain)} ready to encrypt.`);
+  if (counts.verified) parts.push(`${files(counts.verified)} verified and ready to view or decrypt.`);
+  if (counts.pending) parts.push(`${files(counts.pending)} awaiting verification.`);
+  if (counts.failed) parts.push(`${files(counts.failed)} failed verification.`);
+  return parts.join(" ");
+}
+
 function renderControls() {
   const busy = state.busy || state.selectionBusy || emergencyUnlockPending;
   for (const button of fileRemoveButtons) button.disabled = selectionBlocked();
@@ -517,7 +534,7 @@ function renderControls() {
           ? "Load a key to continue."
           : noFiles
             ? "Add files to continue."
-            : `${state.files.length} ${state.files.length === 1 ? "file" : "files"} ready to encrypt, view, or decrypt. Encrypted files are verified automatically.`;
+            : selectionActionHint();
   renderOutputHint();
 }
 

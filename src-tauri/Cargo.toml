@@ -1,6 +1,6 @@
 [package]
 name = "file-encrypt"
-version = "0.1.1"
+version = "0.1.2"
 description = "Encrypt files with a key stored on disk"
 edition = "2021"
 rust-version = "1.98"

@@ -73,12 +73,14 @@ test("added encrypted files and folder ZIPs verify with an icon before the filen
   assert.equal(rows[0].children[0].children.length, 1);
   assert.equal(rows[2].children[0].children[0].children.length, 2);
   assert.match(rows[2].children[0].children[0].children[0].className, /is-unencrypted/);
+  assert.equal(ui.refs.get("action-hint").textContent, "1 file ready to encrypt. 2 files awaiting verification.");
   const before = ui.count();
   finish(calls[0].args.paths.map((input) => ({ input, state: "verified", complete: true })));
   await settle();
   assert.match(heading.children[0].className, /is-verified/);
   assert.match(heading.children[0].innerHTML, /<circle/);
   assert.equal(ui.count(), before);
+  assert.equal(ui.refs.get("action-hint").textContent, "1 file ready to encrypt. 2 files verified and ready to view or decrypt.");
   assert.equal(ui.refs.get("result-summary").textContent, "1 succeeded, 0 failed");
   assert.equal(ui.refs.has("verify"), false);
   assert.doesNotMatch(fs.readFileSync(new URL("../src/main.js", import.meta.url), "utf8"), /Expected result/);
@@ -95,6 +97,7 @@ test("automatic verification handles large selections in bounded batches", async
   await settle();
   assert.deepEqual(batches, [32, 32, 6]);
   assert.equal(ui.evaluate('[...fileVerification.entries.values()].every(result=>result.state==="verified")'), true);
+  assert.equal(ui.refs.get("action-hint").textContent, "70 files verified and ready to view or decrypt.");
   assert.equal(ui.evaluate("state.busy"), false);
 });
 
@@ -116,6 +119,7 @@ test("key changes invalidate checkmarks and ignore verification from the previou
   requests[1].resolve([{ input: "C:/private.fenc", state: "failed", message: "Authentication failed" }]);
   await settle();
   assert.match(ui.refs.get("file-list").children[0].children[0].children[0].children[0].title, /Authentication failed/);
+  assert.equal(ui.refs.get("action-hint").textContent, "1 file failed verification.");
 });
 
 test("removing and adding the same file ignores the previous verification result", async () => {
