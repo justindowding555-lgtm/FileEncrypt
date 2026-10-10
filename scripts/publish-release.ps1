@@ -35,7 +35,8 @@ try {
     # Confirm the exact release commit is already on GitHub.
     $remoteCommit = Invoke-RestMethod -Uri "$api/commits/$commit" -Headers $headers
     if ($remoteCommit.sha -ne $commit) { throw 'Release commit is not available on GitHub.' }
-    $release = @(Invoke-RestMethod -Uri "$api/releases" -Headers $headers) | Where-Object { $_.tag_name -eq $tag } | Select-Object -First 1
+    $releases = Invoke-RestMethod -Uri "$api/releases" -Headers $headers
+    $release = $releases | Where-Object { $_.tag_name -eq $tag } | Select-Object -First 1
     if ($release -and -not $release.draft) { throw "$tag is already published; use a new version." }
     if ($release -and $release.target_commitish -ne $commit) { throw 'The existing draft targets a different source commit. Inspect it before proceeding.' }
     if (-not $release) {
