@@ -12,7 +12,7 @@ $installer = Join-Path $artifactDirectory "FileEncrypt_${version}_x64-setup.exe"
 $manifestPath = Join-Path $artifactDirectory 'latest.json'
 node (Join-Path $PSScriptRoot 'verify-update.mjs') $installer $manifestPath
 if ($LASTEXITCODE -ne 0) { throw 'Release artifact validation failed.' }
-$notes = Get-Content -LiteralPath $NotesPath -Raw
+$notes = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $NotesPath).Path)
 Push-Location $projectRoot
 try {
     if (git status --porcelain) { throw 'Commit the release source before publishing.' }
