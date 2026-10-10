@@ -478,6 +478,8 @@ function renderControls() {
   for (const button of deletionButtons) button.disabled = busy;
   const noFiles = state.files.length === 0;
   const blocked = busy || state.accessSetupRequired || !state.keyLoaded || noFiles;
+  const encryptCount = state.files.filter((path) => !/\.(fenc|zip)$/i.test(path)).length;
+  $("encrypt").textContent = encryptCount === 1 ? "Encrypt file" : "Encrypt files";
   $("generate").classList.toggle("primary", !state.keyLoaded && !state.keyDisconnected);
   $("browse-load").classList.toggle("primary", state.keyDisconnected);
   $("encrypt").disabled = blocked;
