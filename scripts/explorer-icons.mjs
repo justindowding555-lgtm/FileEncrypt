@@ -10,7 +10,7 @@ const icons = {
   expand: "maximize-2", collapse: "minimize-2", close: "x", info: "info", eye: "scan-eye",
   verified: "circle-check", checking: "loader-circle", pending: "circle-dashed", failed: "circle-x",
   disconnected: "circle-minus", unplug: "unplug",
-  needsKey: "key-round", unencrypted: "shield",
+  needsKey: "key-round", unencrypted: "lock-open",
 };
 const bodies = await Promise.all(Object.entries(icons).map(async ([id, name]) => {
   const svg = await readFile(new URL(`../node_modules/lucide-static/icons/${name}.svg`, import.meta.url), "utf8");
