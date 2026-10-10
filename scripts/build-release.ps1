@@ -37,7 +37,7 @@ try {
             $PasswordFilePath = "$private.password.dpapi"
         }
         $protected = if ($PasswordFilePath) {
-            Get-Content -LiteralPath $PasswordFilePath -Raw | ConvertTo-SecureString
+            (Get-Content -LiteralPath $PasswordFilePath -Raw).Trim() | ConvertTo-SecureString
         } else {
             Read-Host 'Enter the updater signing key password' -AsSecureString
         }
