@@ -33,4 +33,6 @@ $manifest = @{
 $output = Join-Path ([IO.Path]::GetDirectoryName($installer)) 'latest.json'
 $json = $manifest | ConvertTo-Json -Depth 5
 [System.IO.File]::WriteAllText($output, $json, (New-Object System.Text.UTF8Encoding($false)))
+node (Join-Path $projectRoot 'scripts/verify-update.mjs') $installer $output $Repository
+if ($LASTEXITCODE -ne 0) { throw 'Updater signature or manifest verification failed. Do not publish this release.' }
 Write-Host "Created $output"

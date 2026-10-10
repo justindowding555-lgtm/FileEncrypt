@@ -137,6 +137,8 @@ The script prompts for the signing key password without putting it in the comman
 
 Create a GitHub Release tagged `v0.2.0` and attach the installer, its `.sig`, and `latest.json`. Publish the release after testing the installer and a recovery flow. This Tauri update signature verifies the app artifact; Windows publisher code signing is a separate step.
 
+Manifest creation verifies the installer's signature, signed version, and download URL before reporting success. After committing and pushing the matching release source, `scripts/publish-release.ps1 -NotesPath <release-notes.md>` uploads and verifies a draft using the existing GitHub login from Git Credential Manager. Add `-Publish` to publish the verified assets as the latest stable release.
+
 The generated public key is recorded in `src-tauri/tauri.release.conf.json`. If you generate a different keypair, update that value before building. Alternatively, set repository secrets `TAURI_SIGNING_PRIVATE_KEY` (the private key file's contents) and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, then run **Draft signed Windows release** in GitHub Actions. It reads the public key from the release configuration, builds the installer, and creates a draft release with all three assets. Inspect the draft and run the recovery smoke test before publishing it.
 
 ## File format
